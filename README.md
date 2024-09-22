@@ -1,32 +1,31 @@
 # Lazarev Cloud Scripts
 
-Welcome to the **Lazarev Cloud Scripts** repository! This collection of automation scripts is designed to help system administrators and IT professionals efficiently troubleshoot and resolve common errors in both **Windows** and **Linux** environments. By automating routine maintenance tasks, these scripts save time and reduce the potential for human error.
+Welcome to the **Lazarev Cloud Scripts** repository! This collection contains a variety of automation scripts designed to fix common errors in both **Windows** and **Linux** environments. These scripts aim to streamline troubleshooting processes, saving you time and effort.
 
 ## Table of Contents
 
 - [Lazarev Cloud Scripts](#lazarev-cloud-scripts)
   - [Table of Contents](#table-of-contents)
-  - [Features](#features)
   - [Repository Structure](#repository-structure)
   - [Windows Scripts](#windows-scripts)
-    - [Repairing System Files Using SFC and DISM](#repairing-system-files-using-sfc-and-dism)
-    - [Resetting Windows Firewall to Default Settings](#resetting-windows-firewall-to-default-settings)
-    - [Managing and Restarting a Problematic Service](#managing-and-restarting-a-problematic-service)
-    - [Enabling/Disabling Windows Features](#enablingdisabling-windows-features)
-    - [Cleaning Up Windows Update Cache](#cleaning-up-windows-update-cache)
-    - [Disk Cleanup with PowerShell](#disk-cleanup-with-powershell)
-    - [Re-registering Windows Store Apps](#re-registering-windows-store-apps)
-    - [Resetting Winsock and TCP/IP Stack](#resetting-winsock-and-tcpip-stack)
-    - [Restarting Graphics Driver](#restarting-graphics-driver)
-    - [Winget Troubleshooter](#winget-troubleshooter)
+    - [winget.ps1](#wingetps1)
+    - [Cleaning Up Windows Update Cache.ps1](#cleaning-up-windows-update-cacheps1)
+    - [Disk Cleanup with PowerShell.ps1](#disk-cleanup-with-powershellps1)
+    - [Enabling/Disabling Windows Features.ps1](#enablingdisabling-windows-featuresps1)
+    - [Managing and Restarting a Problematic Service.ps1](#managing-and-restarting-a-problematic-serviceps1)
+    - [Re-registering Windows Store Apps.ps1](#re-registering-windows-store-appsps1)
+    - [Repairing System Files Using SFC and DISM.ps1](#repairing-system-files-using-sfc-and-dismps1)
+    - [Resetting Windows Firewall to Default Settings.ps1](#resetting-windows-firewall-to-default-settingsps1)
+    - [Resetting Winsock and TCP/IP Stack.ps1](#resetting-winsock-and-tcpip-stackps1)
+    - [Restarting Graphics Driver.ps1](#restarting-graphics-driverps1)
   - [Linux Scripts](#linux-scripts)
-    - [Automated System Update and Upgrade](#automated-system-update-and-upgrade)
-    - [Fixing Package Manager Lock (APT)](#fixing-package-manager-lock-apt)
-    - [Fixing Package Manager Lock (DNF)](#fixing-package-manager-lock-dnf)
-    - [Fixing "Broken Packages" in APT](#fixing-broken-packages-in-apt)
-    - [Fixing "Permission Denied" Errors by Correcting Ownership](#fixing-permission-denied-errors-by-correcting-ownership)
-    - [Cleaning System Logs (Log Rotation Fix)](#cleaning-system-logs-log-rotation-fix)
-    - [Network Interface Down/Up](#network-interface-downup)
+    - [Automated System Update and Upgrade.sh](#automated-system-update-and-upgradesh)
+    - [Cleaning System Logs (Log Rotation Fix).sh](#cleaning-system-logs-log-rotation-fixsh)
+    - [Fixing "Broken Packages" in APT.sh](#fixing-broken-packages-in-aptsh)
+    - [Fixing "Permission Denied" Errors by Correcting Ownership.sh](#fixing-permission-denied-errors-by-correcting-ownershipsh)
+    - [Fixing Package Manager Lock (APT).sh](#fixing-package-manager-lock-aptsh)
+    - [Fixing Package Manager Lock (DNF).sh](#fixing-package-manager-lock-dnfsh)
+    - [Network Interface Down/Up.sh](#network-interface-downupsh)
   - [Universal Scripts](#universal-scripts)
   - [Installation](#installation)
   - [Usage](#usage)
@@ -34,20 +33,17 @@ Welcome to the **Lazarev Cloud Scripts** repository! This collection of automati
     - [Linux Scripts](#linux-scripts-1)
   - [Contributing](#contributing)
   - [License](#license)
-  - [Contact](#contact)
+  - [Support](#support)
 
-## Features
-
-- **Automated Troubleshooting**: Quickly resolve common system errors without manual intervention.
-- **Cross-Platform Support**: Scripts available for both Windows and Linux environments.
-- **Modular Design**: Each script addresses a specific issue, making it easy to use and maintain.
-- **User-Friendly**: Clear descriptions and usage instructions for each script.
-- **Open Source**: Free to use, modify, and distribute.
+---
 
 ## Repository Structure
 
 ```
 .
+├── .git
+├── .gitignore
+├── README.md
 ├── linux
 │   ├── Automated System Update and Upgrade.sh
 │   ├── Cleaning System Logs (Log Rotation Fix).sh
@@ -55,183 +51,41 @@ Welcome to the **Lazarev Cloud Scripts** repository! This collection of automati
 │   ├── Fixing "Permission Denied" Errors by Correcting Ownership.sh
 │   ├── Fixing Package Manager Lock (APT).sh
 │   ├── Fixing Package Manager Lock (DNF).sh
-│   └── Network Interface Down Up.sh
+│   └── Network Interface Down\Up.sh
 ├── universal scripts
-│   └── (Add universal scripts will be here)
+│   └── [Add universal scripts here]
 └── windows
     ├── Cleaning Up Windows Update Cache.ps1
     ├── Disk Cleanup with PowerShell.ps1
-    ├── Enabling Disabling Windows Features.ps1
+    ├── Enabling\Disabling Windows Features.ps1
     ├── Managing and Restarting a Problematic Service.ps1
     ├── Re-registering Windows Store Apps.ps1
     ├── Repairing System Files Using SFC and DISM.ps1
     ├── Resetting Windows Firewall to Default Settings.ps1
-    ├── Resetting Winsock and TCP/IP Stack.ps1
+    ├── Resetting Winsock and TCP\IP Stack.ps1
     ├── Restarting Graphics Driver.ps1
     └── winget.ps1
 ```
 
 ---
 
-*Happy Troubleshooting!*
-
----
-
 ## Windows Scripts
 
-### Repairing System Files Using SFC and DISM
+### winget.ps1
 
-**Script:** `windows/Repairing System Files Using SFC and DISM.ps1`
+**Description:**
 
-**Description:**  
-Automates the process of scanning and repairing corrupted system files using the System File Checker (SFC) and Deployment Image Servicing and Management (DISM) tools. Essential for maintaining system stability and performance.
+This script fixes common issues related to the Windows Package Manager (**winget**) by ensuring that its path is correctly added to the system's environment variables and registry. After fixing the path issues, it automatically upgrades all installed packages using winget.
 
-**Usage:**  
-Run the script with administrative privileges to initiate the repair process.
+**Key Features:**
 
-```powershell
-.\Repairing\ System\ Files\ Using\ SFC\ and\ DISM.ps1
-```
+- Adds the winget path to the current session environment variable if missing.
+- Updates the system-wide PATH in the registry to include the winget path.
+- Runs `winget upgrade --all` to update all packages silently.
 
----
+**Usage:**
 
-### Resetting Windows Firewall to Default Settings
-
-**Script:** `windows/Resetting Windows Firewall to Default Settings.ps1`
-
-**Description:**  
-Resets Windows Firewall to its default settings, ensuring that all firewall rules are restored and the firewall is enabled for all network profiles. Useful for resolving firewall-related connectivity issues.
-
-**Usage:**  
-Execute the script as an administrator.
-
-```powershell
-.\Resetting\ Windows\ Firewall\ to\ Default\ Settings.ps1
-```
-
----
-
-### Managing and Restarting a Problematic Service
-
-**Script:** `windows/Managing and Restarting a Problematic Service.ps1`
-
-**Description:**  
-Checks the status of a specified Windows service and restarts it if it's not running. Helps in maintaining essential services without manual intervention.
-
-**Usage:**  
-Provide the service name as a parameter when running the script.
-
-```powershell
-.\Managing\ and\ Restarting\ a\ Problematic\ Service.ps1 -ServiceName "Spooler"
-```
-
----
-
-### Enabling/Disabling Windows Features
-
-**Script:** `windows/Enabling Disabling Windows Features.ps1`
-
-**Description:**  
-Enables or disables specific Windows features based on user input. Facilitates the management of optional Windows components for troubleshooting or customization.
-
-**Usage:**  
-Specify the action (`Enable` or `Disable`) and the feature name when executing the script.
-
-```powershell
-.\Enabling\ Disabling\ Windows\ Features.ps1 -Action "Enable" -FeatureName "TelnetClient"
-```
-
----
-
-### Cleaning Up Windows Update Cache
-
-**Script:** `windows/Cleaning Up Windows Update Cache.ps1`
-
-**Description:**  
-Clears the Windows Update cache to resolve update-related issues caused by corrupted or incomplete downloads.
-
-**Usage:**  
-Run the script with administrative rights.
-
-```powershell
-.\Cleaning\ Up\ Windows\ Update\ Cache.ps1
-```
-
----
-
-### Disk Cleanup with PowerShell
-
-**Script:** `windows/Disk Cleanup with PowerShell.ps1`
-
-**Description:**  
-Deletes unnecessary temporary files and system junk to free up disk space and improve system performance.
-
-**Usage:**  
-Execute the script as an administrator.
-
-```powershell
-.\Disk\ Cleanup\ with\ PowerShell.ps1
-```
-
----
-
-### Re-registering Windows Store Apps
-
-**Script:** `windows/Re-registering Windows Store Apps.ps1`
-
-**Description:**  
-Re-registers all Windows Store apps to fix issues related to app functionality and installation problems.
-
-**Usage:**  
-Run the script with elevated privileges.
-
-```powershell
-.\Re-registering\ Windows\ Store\ Apps.ps1
-```
-
----
-
-### Resetting Winsock and TCP/IP Stack
-
-**Script:** `windows/Resetting Winsock and TCP/IP Stack.ps1`
-
-**Description:**  
-Resets the Winsock catalog and TCP/IP stack to resolve network connectivity issues such as "Limited Connectivity" or frequent disconnections.
-
-**Usage:**  
-Execute the script as an administrator.
-
-```powershell
-.\Resetting\ Winsock\ and\ TCP\IP\ Stack.ps1
-```
-
----
-
-### Restarting Graphics Driver
-
-**Script:** `windows/Restarting Graphics Driver.ps1`
-
-**Description:**  
-Restarts the Windows graphics driver to fix graphical issues like screen freezing, flickering, or resolution problems without needing a full system reboot.
-
-**Usage:**  
-Run the script with administrative privileges.
-
-```powershell
-.\Restarting\ Graphics\ Driver.ps1
-```
-
----
-
-### Winget Troubleshooter
-
-**Script:** `windows/winget.ps1`
-
-**Description:**  
-Fixes common issues related to the Windows Package Manager (WinGet) by ensuring its path is correctly set in both the current session and system-wide environment variables. Additionally, it upgrades all installed packages automatically.
-
-**Usage:**  
-Execute the script with administrative rights to fix WinGet path issues and upgrade packages.
+Run the script with administrative privileges:
 
 ```powershell
 .\winget.ps1
@@ -239,227 +93,459 @@ Execute the script with administrative rights to fix WinGet path issues and upgr
 
 ---
 
+### Cleaning Up Windows Update Cache.ps1
+
+**Description:**
+
+This script clears the Windows Update cache to resolve issues related to corrupted or incomplete updates. By deleting the contents of the `SoftwareDistribution\Download` folder, it forces Windows Update to download fresh files.
+
+**Key Features:**
+
+- Stops the Windows Update service.
+- Deletes cached update files.
+- Restarts the Windows Update service.
+
+**Usage:**
+
+Execute the script as an administrator:
+
+```powershell
+.\Cleaning Up Windows Update Cache.ps1
+```
+
+---
+
+### Disk Cleanup with PowerShell.ps1
+
+**Description:**
+
+Automates the process of cleaning up unnecessary files to free up disk space. The script removes temporary files, system junk, and other non-essential data.
+
+**Key Features:**
+
+- Deletes files from the Windows Temp directory.
+- Cleans up user-specific temporary files.
+- Removes leftover files from software distribution.
+
+**Usage:**
+
+Run with elevated permissions:
+
+```powershell
+.\Disk Cleanup with PowerShell.ps1
+```
+
+---
+
+### Enabling/Disabling Windows Features.ps1
+
+**Description:**
+
+Allows users to enable or disable specific Windows features using PowerShell commands. Useful for troubleshooting or customizing the system's functionality.
+
+**Key Features:**
+
+- Enables features using `Enable-WindowsOptionalFeature`.
+- Disables features using `Disable-WindowsOptionalFeature`.
+- Accepts parameters for action (`Enable` or `Disable`) and feature name.
+
+**Usage:**
+
+Provide the action and feature name when running the script:
+
+```powershell
+.\EnablingDisabling Windows Features.ps1 -Action Enable -FeatureName "TelnetClient"
+```
+
+---
+
+### Managing and Restarting a Problematic Service.ps1
+
+**Description:**
+
+Checks the status of a specified Windows service and restarts it if it's not running. This script helps in maintaining the health of critical services without manual intervention.
+
+**Key Features:**
+
+- Accepts the service name as a parameter.
+- Checks if the service exists and its current status.
+- Attempts to start the service if it's stopped.
+
+**Usage:**
+
+Run the script with the service name:
+
+```powershell
+.\Managing and Restarting a Problematic Service.ps1 -ServiceName "Spooler"
+```
+
+---
+
+### Re-registering Windows Store Apps.ps1
+
+**Description:**
+
+Fixes issues with Windows Store apps by re-registering them. This can resolve problems where apps fail to start or update.
+
+**Key Features:**
+
+- Re-registers all installed Windows Store apps.
+- Uses `Get-AppxPackage` and `Add-AppxPackage` cmdlets.
+
+**Usage:**
+
+Execute as administrator:
+
+```powershell
+.\Re-registering Windows Store Apps.ps1
+```
+
+---
+
+### Repairing System Files Using SFC and DISM.ps1
+
+**Description:**
+
+Automates the process of scanning and repairing corrupted system files using the System File Checker (SFC) and Deployment Image Servicing and Management (DISM) tools.
+
+**Key Features:**
+
+- Runs `sfc /scannow` to check and repair system files.
+- Uses `DISM /Online /Cleanup-Image /RestoreHealth` to repair the system image.
+- Provides status messages indicating the progress and results.
+
+**Usage:**
+
+Run with administrative privileges:
+
+```powershell
+.\Repairing System Files Using SFC and DISM.ps1
+```
+
+---
+
+### Resetting Windows Firewall to Default Settings.ps1
+
+**Description:**
+
+Resets the Windows Firewall to its default settings, which can resolve issues caused by misconfigured firewall rules.
+
+**Key Features:**
+
+- Resets firewall rules using `netsh advfirewall reset`.
+- Enables the firewall for all profiles (Domain, Private, Public).
+
+**Usage:**
+
+Execute as administrator:
+
+```powershell
+.\Resetting Windows Firewall to Default Settings.ps1
+```
+
+---
+
+### Resetting Winsock and TCP/IP Stack.ps1
+
+**Description:**
+
+Resets the network settings to fix connectivity issues such as "Limited Connectivity" or "No Internet Access."
+
+**Key Features:**
+
+- Uses `netsh winsock reset` to reset Winsock entries.
+- Runs `netsh int ip reset` to reset TCP/IP stack.
+
+**Usage:**
+
+Run the script with elevated permissions:
+
+```powershell
+.\Resetting Winsock and TCPIP Stack.ps1
+```
+
+---
+
+### Restarting Graphics Driver.ps1
+
+**Description:**
+
+Restarts the graphics driver to resolve display issues like freezing, flickering, or black screens without rebooting the system.
+
+**Key Features:**
+
+- Stops and restarts the Desktop Window Manager (`dwm.exe`).
+- Minimal disruption to the user session.
+
+**Usage:**
+
+Execute as administrator:
+
+```powershell
+.\Restarting Graphics Driver.ps1
+```
+
+---
+
 ## Linux Scripts
 
-### Automated System Update and Upgrade
+### Automated System Update and Upgrade.sh
 
-**Script:** `linux/Automated System Update and Upgrade.sh`
+**Description:**
 
-**Description:**  
-Automates the process of updating package lists and upgrading installed packages to ensure the system is up-to-date with the latest security patches and features.
+Automates the process of updating the package lists and upgrading all installed packages on Debian/Ubuntu systems.
 
-**Usage:**  
-Make the script executable and run it.
+**Key Features:**
+
+- Runs `sudo apt update` to refresh package lists.
+- Executes `sudo apt upgrade -y` to upgrade packages without prompts.
+
+**Usage:**
+
+Make the script executable and run it:
 
 ```bash
-chmod +x Automated\ System\ Update\ and\ Upgrade.sh
-./Automated\ System\ Update\ and\ Upgrade.sh
+chmod +x Automated System Update and Upgrade.sh
+sudo ./Automated System Update and Upgrade.sh
 ```
 
 ---
 
-### Fixing Package Manager Lock (APT)
+### Cleaning System Logs (Log Rotation Fix).sh
 
-**Script:** `linux/Fixing Package Manager Lock (APT).sh`
+**Description:**
 
-**Description:**  
-Resolves issues where the APT package manager is locked by removing lock files and reconfiguring packages, allowing for smooth package installations and updates.
+Cleans up old system logs and fixes issues with log rotation, which can consume excessive disk space.
 
-**Usage:**  
-Run the script with root privileges.
+**Key Features:**
+
+- Truncates log files in `/var/log/`.
+- Removes compressed log files (`*.gz`).
+
+**Usage:**
+
+Run the script with root privileges:
 
 ```bash
-sudo ./Fixing\ Package\ Manager\ Lock\ \(APT\).sh
+sudo ./Cleaning System Logs (Log Rotation Fix).sh
 ```
 
 ---
 
-### Fixing Package Manager Lock (DNF)
+### Fixing "Broken Packages" in APT.sh
 
-**Script:** `linux/Fixing Package Manager Lock (DNF).sh`
+**Description:**
 
-**Description:**  
-Addresses lock issues with the DNF package manager by removing lock files, enabling uninterrupted package management operations.
+Resolves issues with broken dependencies or packages in Debian/Ubuntu systems.
 
-**Usage:**  
-Execute the script as a superuser.
+**Key Features:**
+
+- Runs `sudo apt --fix-broken install`.
+- Executes `sudo dpkg --configure -a`.
+- Updates and upgrades packages.
+
+**Usage:**
+
+Execute with administrative rights:
 
 ```bash
-sudo ./Fixing\ Package\ Manager\ Lock\ \(DNF\).sh
+sudo ./Fixing "Broken Packages" in APT.sh
 ```
 
 ---
 
-### Fixing "Broken Packages" in APT
+### Fixing "Permission Denied" Errors by Correcting Ownership.sh
 
-**Script:** `linux/Fixing "Broken Packages" in APT.sh`
+**Description:**
 
-**Description:**  
-Automates the process of fixing broken dependencies and package issues in Debian/Ubuntu-based systems using APT commands.
+Fixes permission issues by correcting ownership and permissions of files and directories, especially in the user's home directory.
 
-**Usage:**  
-Run the script with administrative privileges.
+**Key Features:**
+
+- Changes ownership to the current user using `sudo chown`.
+- Adjusts directory permissions to `755` and file permissions to `644`.
+
+**Usage:**
+
+Run as root or with sudo:
 
 ```bash
-sudo ./Fixing\ \"Broken\ Packages\"\ in\ APT.sh
+sudo ./Fixing "Permission Denied" Errors by Correcting Ownership.sh
 ```
 
 ---
 
-### Fixing "Permission Denied" Errors by Correcting Ownership
+### Fixing Package Manager Lock (APT).sh
 
-**Script:** `linux/Fixing "Permission Denied" Errors by Correcting Ownership.sh`
+**Description:**
 
-**Description:**  
-Corrects file and directory ownership and permissions to resolve "Permission Denied" errors, ensuring users have the appropriate access rights.
+Removes lock files that prevent the APT package manager from functioning properly.
 
-**Usage:**  
-Execute the script with superuser permissions.
+**Key Features:**
+
+- Deletes lock files: `/var/lib/dpkg/lock-frontend` and `/var/lib/dpkg/lock`.
+- Runs `sudo dpkg --configure -a` to reconfigure packages.
+- Updates package lists with `sudo apt update`.
+
+**Usage:**
+
+Execute with sudo:
 
 ```bash
-sudo ./Fixing\ \"Permission\ Denied\"\ Errors\ by\ Correcting\ Ownership.sh
+sudo ./Fixing Package Manager Lock (APT).sh
 ```
 
 ---
 
-### Cleaning System Logs (Log Rotation Fix)
+### Fixing Package Manager Lock (DNF).sh
 
-**Script:** `linux/Cleaning System Logs (Log Rotation Fix).sh`
+**Description:**
 
-**Description:**  
-Cleans up old system logs and ensures proper log rotation, freeing up disk space and maintaining system performance.
+Removes lock files for the DNF package manager on Fedora/RHEL-based systems.
 
-**Usage:**  
-Run the script with root access.
+**Key Features:**
+
+- Deletes DNF lock files: `/var/run/yum.pid` and `/var/run/dnf.pid`.
+
+**Usage:**
+
+Run with root permissions:
 
 ```bash
-sudo ./Cleaning\ System\ Logs\ \(Log\ Rotation\ Fix\).sh
+sudo ./Fixing Package Manager Lock (DNF).sh
 ```
 
 ---
 
-### Network Interface Down/Up
+### Network Interface Down/Up.sh
 
-**Script:** `linux/Network Interface Down Up.sh`
+**Description:**
 
-**Description:**  
-Restarts a specified network interface to resolve connectivity issues without requiring a full system reboot.
+Restarts a network interface to resolve connectivity issues.
 
-**Usage:**  
-Provide the network interface name as a parameter when running the script.
+**Key Features:**
+
+- Uses `sudo ifconfig` to bring the interface down and up.
+- Replace `eth0` with your actual network interface name.
+
+**Usage:**
+
+Provide the network interface name when running the script:
 
 ```bash
-sudo ./Network\ Interface\ Down\ Up.sh eth0
+sudo ./Network Interface Down\Up.sh eth0
 ```
 
 ---
 
 ## Universal Scripts
 
-*Currently, there are no universal scripts. Future updates may include scripts that work across both Windows and Linux platforms.*
+*Currently, there are no universal scripts in the repository. Future updates may include cross-platform scripts.*
+
+---
 
 ## Installation
 
-1. **Clone the Repository**
+1. **Clone the Repository:**
 
    ```bash
    git clone https://github.com/Lazarev-Cloud/Scripts.git
    ```
 
-2. **Navigate to the Repository Directory**
+2. **Navigate to the Repository Directory:**
 
    ```bash
    cd Scripts
    ```
 
-3. **Review Scripts**
-
-   Explore the `windows` and `linux` directories to find scripts relevant to your operating system.
+---
 
 ## Usage
 
 ### Windows Scripts
 
-1. **Open PowerShell as Administrator**
+1. **Open PowerShell as Administrator.**
 
-2. **Navigate to the Windows Scripts Directory**
+2. **Navigate to the Windows Scripts Directory:**
 
    ```powershell
    cd .\windows\
    ```
 
-3. **Execute the Desired Script**
+3. **Run the Desired Script:**
 
-   For example, to reset the Windows Firewall:
+   For example, to repair system files:
 
    ```powershell
-   .\Resetting\ Windows\ Firewall\ to\ Default\ Settings.ps1
+   .\Repairing System Files Using SFC and DISM.ps1
    ```
 
 ### Linux Scripts
 
-1. **Open Terminal**
+1. **Open Terminal.**
 
-2. **Navigate to the Linux Scripts Directory**
+2. **Navigate to the Linux Scripts Directory:**
 
    ```bash
    cd ./linux/
    ```
 
-3. **Make the Script Executable (if not already)**
+3. **Make the Script Executable:**
 
    ```bash
-   chmod +x Fixing\ Package\ Manager\ Lock\ \(APT\).sh
+   chmod +x scriptname.sh
    ```
 
-4. **Run the Script with Appropriate Permissions**
-
-   For example, to fix APT lock issues:
+4. **Run the Script with Appropriate Permissions:**
 
    ```bash
-   sudo ./Fixing\ Package\ Manager\ Lock\ \(APT\).sh
+   sudo ./scriptname.sh
    ```
+
+---
 
 ## Contributing
 
-We welcome contributions from the community! To contribute:
+We welcome contributions! Please follow these steps:
 
-1. **Fork the Repository**
+1. **Fork the Repository.**
 
-2. **Create a Feature Branch**
+2. **Create a New Branch:**
 
    ```bash
    git checkout -b feature/YourFeature
    ```
 
-3. **Commit Your Changes**
+3. **Make Your Changes and Commit:**
 
    ```bash
-   git commit -m "Add Your Feature"
+   git commit -am "Add new feature"
    ```
 
-4. **Push to the Branch**
+4. **Push to Your Fork:**
 
    ```bash
    git push origin feature/YourFeature
    ```
 
-5. **Open a Pull Request**
-
-   Describe your changes and submit the pull request for review.
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
-
-
-## Contact
-
-For questions, suggestions, or support, please reach out to us:
-
-- **Email:** support@lazarev.cloud
-- **GitHub Issues:** [Open an Issue](https://github.com/Lazarev-Cloud/Scripts/issues)
+5. **Create a Pull Request.**
 
 ---
 
-*© 2024 Lazarev Cloud. All rights reserved.*
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Support
+
+For issues or questions, please open an issue on the GitHub repository or contact us at [support@lazarev.cloud](mailto:support@lazarev.cloud).
+
+---
+
+**Visit our GitHub repository for more information and access to all scripts: [Lazarev-Cloud/Scripts](https://github.com/Lazarev-Cloud/Scripts)**
+
+---
+
+*Happy scripting!*
