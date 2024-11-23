@@ -1,87 +1,108 @@
-# Winget Manager Script
+# Winget Troubleshooting and Optimization Script
 
 ## Overview
 
-The **Winget Manager Script** simplifies software management on Windows by leveraging the capabilities of the Windows Package Manager (`winget`). This script automates tasks such as searching, installing, upgrading, and removing applications, making it an essential tool for efficient system management.
+The **Winget Troubleshooting and Optimization Script** (`WingetFix.ps1`) is a PowerShell tool designed to fix common issues with the Windows Package Manager (`winget`). It ensures `winget` is properly installed, configured, and operational. Additionally, it provides functionality to streamline upgrades of all installed packages.
 
 ---
 
-## Basic Commands
+## Features
+
+| Feature | Description |
+| --- | --- |
+| **Path Validation** | Checks for the `winget` executable and ensures its directory is added to the system and session `PATH`. |
+| **Registry Configuration** | Fixes registry issues related to the `winget` installation path. |
+| **Package Upgrades** | Automates the upgrade process for all installed packages, handling unknown versions and accepting agreements. |
+| **User-Friendly Diagnostics** | Provides clear messages about the status and results of each operation. |
+
+---
+
+## Script Functions
+
+### 1. `Add-WinGetPath-Registry`
+- Locates the `winget` installation directory.
+- Adds the directory to the system’s registry to ensure persistent access.
+
+### 2. `Fix-WinGetPath`
+- Verifies the availability of `winget` in the system and session paths.
+- Calls `Add-WinGetPath` and `Add-WinGetPath-Registry` to resolve path-related issues.
+- Ensures `winget` is correctly configured for immediate use.
+
+### 3. `Upgrade-WinGetPackages`
+- Executes the `winget upgrade --all` command to update all installed packages.
+- Includes advanced options to:
+  - Handle unknown package versions.
+  - Accept package agreements automatically.
+  - Run non-interactively for batch operations.
+- Confirms successful completion of upgrades.
+
+---
+
+## Prerequisites
+
+1. **PowerShell 5.1 or Later**: Confirm your version by running:
+   ```powershell
+   $PSVersionTable.PSVersion
+   ```
+2. **Winget Installed**: Ensure `winget` is installed. If not, install it from [Microsoft's Winget Documentation](https://learn.microsoft.com/en-us/windows/package-manager/).
+
+---
+
+## How to Use
+
+### Download and Run the Script
+
+1. Save `WingetFix.ps1` to your computer.
+2. Open PowerShell as an administrator.
+3. Execute the script:
+   ```powershell
+   .\WingetFix.ps1
+   ```
+
+### Script Workflow
+
+1. **Fix Path Issues**:
+   The script checks and resolves path or registry problems with `winget`, ensuring it works as expected.
+
+2. **Upgrade Packages**:
+   Use the automated upgrade function to update all installed applications seamlessly.
+
+---
+
+## Example Workflow
+
+### Fixing `winget` Path Issues
+
+1. **Run the Script**:
+   ```powershell
+   .\WingetFix.ps1
+   ```
+2. The script will:
+   - Check for the `winget` executable.
+   - Add its directory to the system and session paths.
+   - Update the registry if needed.
+
+### Upgrading All Packages
+
+1. **Run the Upgrade Function**:
+   ```powershell
+   .\WingetFix.ps1
+   ```
+2. The script will:
+   - Identify all installed packages.
+   - Upgrade them with `winget upgrade --all`.
+
+---
+
+## Manual Winget Commands (For Reference)
 
 | Command | Description |
 | --- | --- |
-| `winget -?` | Show the Winget help menu |
-| `winget list` | List all installed applications |
-| `winget search <name>` | Search for a package in the repository |
-| `winget install <name>` | Install a package |
-| `winget upgrade <name>` | Upgrade a specific package |
-| `winget upgrade --all` | Upgrade all installed packages |
-| `winget uninstall <name>` | Uninstall a package |
-| `winget show <name>` | Show details of a package |
+| `winget list` | List all installed packages. |
+| `winget upgrade --all` | Upgrade all installed packages. |
+| `winget source reset` | Reset repositories to default. |
+| `winget validate <manifest>` | Validate a package manifest. |
 
 ---
 
-## Workflow Examples
-
-### Batch Installation
-
-1. **Export Installed Apps**
-   ```powershell
-   winget export -o apps-list.json
-   ```
-
-2. **Import and Install Apps**
-   ```powershell
-   winget import -i apps-list.json
-   ```
-
-3. **Upgrade All Apps**
-   ```powershell
-   winget upgrade --all
-   ```
-
----
-
-## Advanced Usage
-
-| Command | Description |
-| --- | --- |
-| `winget source list` | List available repositories |
-| `winget source add <name> <URL>` | Add a new repository |
-| `winget source remove <name>` | Remove a repository |
-| `winget settings` | Open the configuration settings file |
-| `winget validate <manifest>` | Validate a package manifest |
-| `winget export -o <file>` | Export the list of installed applications to a file |
-| `winget import -i <file>` | Install applications from an exported file |
-| `winget hash <file>` | Generate a SHA256 hash for a file |
-| `winget install <name> --silent` | Perform a silent installation |
-| `winget install <name> --scope <scope>` | Specify a scope (e.g., `user` or `machine`) for installation |
-| `winget install <name> --locale <locale>` | Install a package with a specific locale |
-| `winget install <name> --override "<custom-options>"` | Pass custom installer options |
-
----
-
-## Microsoft Store Integration
-
-| Command | Description |
-| --- | --- |
-| `winget search --source msstore` | Search for apps in the Microsoft Store |
-| `winget install <name> --source msstore` | Install a Microsoft Store app |
-
----
-
-## Script Usage
-
-To run the script:
-
-1. **Download the Script**
-   Save `WingetManager.ps1` to your local system.
-
-2. **Execute the Script**
-   Open PowerShell and run:
-   ```powershell
-   .\WingetManager.ps1
-   ```
-
-3. **Modify Parameters**
-   Adjust script settings to specify custom applications, use silent installs, or apply additional options.
+This script ensures `winget` remains functional and efficient, resolving common issues while automating upgrades. Use it regularly to maintain a smooth and optimized system environment.
