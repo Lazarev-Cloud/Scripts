@@ -110,15 +110,11 @@ P.S.
    ```powershell
    winget export -o apps-list.json
    ```
-2. **Import and Install Apps**
+**Import and Install Apps**
    ```powershell
    winget import -i apps-list.json
    ```
-3. **Upgrade All Apps**
+**Upgrade All Apps**
    ```powershell
    winget upgrade --all
    ```
-
----
-
-This script ensures `winget` remains functional and efficient, resolving common issues while automating upgrades. Use it regularly to maintain a smooth and optimized system environment.
