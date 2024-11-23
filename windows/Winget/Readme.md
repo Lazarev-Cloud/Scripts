@@ -1,7 +1,8 @@
-# Winget Cheat-Sheet
+# Winget Manager Script
 
 ## Overview
-Winget (Windows Package Manager) simplifies the management of software on Windows by providing commands to search, install, upgrade, remove, and configure applications.
+
+The **Winget Manager Script** simplifies software management on Windows by leveraging the capabilities of the Windows Package Manager (`winget`). This script automates tasks such as searching, installing, upgrading, and removing applications, making it an essential tool for efficient system management.
 
 ---
 
@@ -20,17 +21,28 @@ Winget (Windows Package Manager) simplifies the management of software on Window
 
 ---
 
-## Search and Installation Examples
+## Workflow Examples
 
-| Example | Description |
-| --- | --- |
-| `winget search vscode` | Search for Visual Studio Code in the repository |
-| `winget install vscode` | Install Visual Studio Code |
-| `winget install --id Microsoft.VisualStudioCode -e` | Install a specific app by its ID (exact match) |
+### Batch Installation
+
+1. **Export Installed Apps**
+   ```powershell
+   winget export -o apps-list.json
+   ```
+
+2. **Import and Install Apps**
+   ```powershell
+   winget import -i apps-list.json
+   ```
+
+3. **Upgrade All Apps**
+   ```powershell
+   winget upgrade --all
+   ```
 
 ---
 
-## Package Management
+## Advanced Usage
 
 | Command | Description |
 | --- | --- |
@@ -39,16 +51,8 @@ Winget (Windows Package Manager) simplifies the management of software on Window
 | `winget source remove <name>` | Remove a repository |
 | `winget settings` | Open the configuration settings file |
 | `winget validate <manifest>` | Validate a package manifest |
-
----
-
-## Advanced Usage
-
-| Command | Description |
-| --- | --- |
 | `winget export -o <file>` | Export the list of installed applications to a file |
 | `winget import -i <file>` | Install applications from an exported file |
-| `winget features` | Show experimental features |
 | `winget hash <file>` | Generate a SHA256 hash for a file |
 | `winget install <name> --silent` | Perform a silent installation |
 | `winget install <name> --scope <scope>` | Specify a scope (e.g., `user` or `machine`) for installation |
@@ -57,7 +61,7 @@ Winget (Windows Package Manager) simplifies the management of software on Window
 
 ---
 
-## Windows Store Integration
+## Microsoft Store Integration
 
 | Command | Description |
 | --- | --- |
@@ -66,21 +70,18 @@ Winget (Windows Package Manager) simplifies the management of software on Window
 
 ---
 
-## Example Workflow
+## Script Usage
 
-1. **Export installed apps:**
-   ```
-   winget export -o apps-list.json
-   ```
-2. **Import and reinstall:**
-   ```
-   winget import -i apps-list.json
-   ```
-3. **Upgrade all apps:**
-   ```
-   winget upgrade --all
+To run the script:
+
+1. **Download the Script**
+   Save `WingetManager.ps1` to your local system.
+
+2. **Execute the Script**
+   Open PowerShell and run:
+   ```powershell
+   .\WingetManager.ps1
    ```
 
----
-
-This cheat-sheet summarizes common Winget commands and examples for quick reference. Use `winget -?` for more details on available options and syntax.
+3. **Modify Parameters**
+   Adjust script settings to specify custom applications, use silent installs, or apply additional options.
