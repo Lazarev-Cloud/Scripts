@@ -103,6 +103,22 @@ The **Winget Troubleshooting and Optimization Script** (`WingetFix.ps1`) is a Po
 | `winget source reset` | Reset repositories to default. |
 | `winget validate <manifest>` | Validate a package manifest. |
 
+
+P.S.
+
+**Export Installed Apps**
+   ```powershell
+   winget export -o apps-list.json
+   ```
+2. **Import and Install Apps**
+   ```powershell
+   winget import -i apps-list.json
+   ```
+3. **Upgrade All Apps**
+   ```powershell
+   winget upgrade --all
+   ```
+
 ---
 
 This script ensures `winget` remains functional and efficient, resolving common issues while automating upgrades. Use it regularly to maintain a smooth and optimized system environment.
