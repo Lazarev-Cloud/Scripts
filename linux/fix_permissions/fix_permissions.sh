@@ -1,11 +1,19 @@
-#!/bin/bash
-echo "Fixing ownership and permission issues in home directory..."
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Change ownership of all files in the user's home directory to the current user
-sudo chown -R $USER:$USER /home/$USER
+LOG_FILE="/var/log/fix_permissions.log"
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : $1" | tee -a "$LOG_FILE"
+}
 
-# Fix common permission issues
-sudo find /home/$USER -type d -exec chmod 755 {} \;
-sudo find /home/$USER -type f -exec chmod 644 {} \;
+HOME_DIR="/home/$USER"
+if [[ ! -d "$HOME_DIR" ]]; then
+    echo "Home directory $HOME_DIR not found" >&2
+    exit 1
+fi
 
-echo "Permissions and ownership fixed."
+log "Fixing permissions in $HOME_DIR"
+sudo chown -R "$USER":"$USER" "$HOME_DIR"
+sudo find "$HOME_DIR" -type d -exec chmod 755 {} \;
+sudo find "$HOME_DIR" -type f -exec chmod 644 {} \;
+log "Permissions fixed"

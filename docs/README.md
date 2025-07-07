@@ -16,3 +16,5 @@ Example for Windows (run from PowerShell as Administrator):
 cd windows\Winget
 ./WingetFix.ps1
 ```
+
+For security information see [SECURITY.md](SECURITY.md). Troubleshooting tips are in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

@@ -39,22 +39,37 @@ The `Clean-Disk` PowerShell script is designed to clean up temporary files and s
 ## Code Explanation
 
 ```powershell
+param(
+    [switch]$Confirm
+)
+
 function Clean-Disk {
     Write-Host "Cleaning up temporary files and system junk..." -ForegroundColor Cyan
 
-    # Remove system temporary files
-    Remove-Item -Path "$env:SystemRoot\Temp\*" -Force -Recurse
+    $paths = @(
+        "$env:SystemRoot\Temp",
+        "$env:SystemRoot\SoftwareDistribution\Download",
+        "$env:USERPROFILE\AppData\Local\Temp"
+    )
 
-    # Remove Windows Update cache files
-    Remove-Item -Path "$env:SystemRoot\SoftwareDistribution\Download\*" -Force -Recurse
-
-    # Remove user-specific temporary files
-    Remove-Item -Path "$env:USERPROFILE\AppData\Local\Temp\*" -Force -Recurse
+    foreach ($p in $paths) {
+        if (Test-Path $p) {
+            try {
+                Remove-Item -Path "$p\*" -Force -Recurse -ErrorAction Stop
+            } catch {
+                Write-Host "Failed to clean $p : $_" -ForegroundColor Red
+            }
+        }
+    }
 
     Write-Host "Disk cleanup completed." -ForegroundColor Green
 }
 
-Clean-Disk
+if ($Confirm) {
+    Clean-Disk
+} else {
+    Write-Host "Run with -Confirm to perform disk cleanup." -ForegroundColor Yellow
+}
 ```
 
 - **Key Directories Cleaned**:
@@ -72,3 +87,4 @@ Clean-Disk
 1. **Irreversible Deletion**: The script permanently deletes files in the specified directories. Ensure there are no important files in these locations before running the script.
 2. **Targeted Cleanup**: The script is limited to standard temporary and cache directories, minimizing the risk of affecting critical system files.
 3. **Recommended Usage**: Use this script periodically to maintain system cleanliness and performance.
+Logs are stored in `$env:TEMP\Clean-Disk.log`.
