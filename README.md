@@ -15,3 +15,7 @@ so they're easy to run when needed.
 - See [windows/README.md](windows/README.md) for Windows scripts.
 
 For general usage instructions check [docs/README.md](docs/README.md).
+
+For security guidelines see [docs/SECURITY.md](docs/SECURITY.md).
+Troubleshooting tips are available in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+To verify script syntax run `tests/run_tests.sh`.

@@ -71,6 +71,18 @@ This repository contains a collection of PowerShell scripts designed to simplify
 
 ---
 
+### 11. **System Health Monitor**
+- **Description**: Logs basic CPU, memory, and disk usage.
+- **Key Features**:
+  - Uses built-in PowerShell commands to gather statistics.
+  - Saves output to a configurable log file.
+
+### 12. **Registry Cleanup**
+- **Description**: Removes invalid startup entries from the registry after creating a backup.
+- **Key Features**:
+  - Backs up the HKCU hive before deleting entries.
+  - Requires the `-Confirm` flag to run.
+
 ## How to Use
 
 1. Navigate to the subfolder containing the desired script.

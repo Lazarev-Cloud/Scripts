@@ -11,6 +11,7 @@ This folder contains shell scripts for common Linux maintenance tasks. Each scri
 - `fix_dnf_lock/` - Clear DNF/Yum lock files.
 - `fix_permissions/` - Fix ownership and permissions in the user's home directory.
 - `network_restart/` - Restart a network interface.
+- `system_health/` - Monitor basic CPU, memory, and disk usage.
 - `maintenance/` - Comprehensive maintenance script with many features.
 
 Each subdirectory contains its own `README.md` with detailed usage instructions.
