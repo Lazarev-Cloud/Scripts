@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DIR="/opt/prometheus-unified-exporter"
 SERVICE_NAME="prometheus-unified-exporter"
 PYTHON_PACKAGES=(psutil pynvml)
@@ -109,8 +110,14 @@ ensure_system_dependencies() {
   install_packages "$pkg_mgr" "${base_packages[@]}" "${sensor_packages[@]}" "${gpu_packages[@]}"
 
   if require_command sensors-detect; then
-    log "Running sensors-detect to enable CPU/board temperature readings"
-    $SUDO sensors-detect --auto || true
+    log "Running sensors-detect non-interactively to enable CPU/board temperature readings"
+    yes "" | $SUDO sensors-detect --auto || true
+  fi
+
+  if require_command modprobe; then
+    log "Attempting to load common sensor modules (coretemp, nct6775)"
+    $SUDO modprobe coretemp 2>/dev/null || true
+    $SUDO modprobe nct6775 2>/dev/null || true
   fi
 
   if require_command lspci && lspci | grep -qi nvidia; then
@@ -135,9 +142,21 @@ ensure_system_dependencies() {
 }
 
 setup_virtualenv() {
+  local exporter_src=""
+  for candidate in "$SCRIPT_DIR/prometheus_unified_metrics.py" "$REPO_ROOT/monitoring/prometheus_unified_metrics.py"; do
+    if [[ -f "$candidate" ]]; then
+      exporter_src="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$exporter_src" ]]; then
+    fail "prometheus_unified_metrics.py not found next to the setup script; place them together and retry"
+  fi
+
   log "Creating installation directory at $INSTALL_DIR"
   $SUDO mkdir -p "$INSTALL_DIR"
-  $SUDO cp "$REPO_ROOT/monitoring/prometheus_unified_metrics.py" "$INSTALL_DIR/"
+  $SUDO cp "$exporter_src" "$INSTALL_DIR/"
   $SUDO chown -R "$(id -u):$(id -g)" "$INSTALL_DIR"
 
   if [[ ! -d "$INSTALL_DIR/venv" ]]; then

@@ -168,7 +168,10 @@ class MetricCollector:
         if not hasattr(self.psutil, "sensors_temperatures"):
             return []
 
-        temps = self.psutil.sensors_temperatures(fahrenheit=False) or {}
+        try:
+            temps = self.psutil.sensors_temperatures(fahrenheit=False) or {}
+        except (NotImplementedError, OSError):
+            return []
         lines: List[str] = [
             "# HELP system_temperature_celsius Reported temperature sensors",
             "# TYPE system_temperature_celsius gauge",
