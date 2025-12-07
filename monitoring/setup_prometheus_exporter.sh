@@ -93,21 +93,29 @@ ensure_system_dependencies() {
   pkg_mgr=$(identify_pkg_manager)
   log "Detected package manager: $pkg_mgr"
 
-  local base_packages=(python3 python3-venv python3-pip curl)
-  local sensor_packages=(lm-sensors nvme-cli smartmontools)
+  local base_packages=()
+  local sensor_packages=()
   local gpu_packages=()
 
   case "$pkg_mgr" in
     apt)
+      base_packages=(python3 python3-venv python3-pip curl)
+      sensor_packages=(lm-sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     dnf|yum)
+      base_packages=(python3 python3-pip python3-virtualenv curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     pacman)
+      base_packages=(python python-pip curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     zypper)
+      base_packages=(python3 python3-pip curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
   esac
