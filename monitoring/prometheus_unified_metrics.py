@@ -102,7 +102,7 @@ class MetricCollector:
         lines = [
             "# HELP system_cpu_usage_percent CPU utilization percentage",
             "# TYPE system_cpu_usage_percent gauge",
-            f"system_cpu_usage_percent {{}} {cpu_percent:.2f}",
+            f"system_cpu_usage_percent{{}} {cpu_percent:.2f}",
             "# HELP system_load_average CPU load average over 1, 5, and 15 minutes",
             "# TYPE system_load_average gauge",
             f"system_load_average{{interval=\"1m\"}} {load1:.2f}",
