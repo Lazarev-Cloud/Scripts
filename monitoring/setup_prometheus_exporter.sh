@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+if [[ -z "$SCRIPT_PATH" || "$SCRIPT_PATH" == "bash" ]]; then
+  SCRIPT_DIR="$PWD"
+else
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DIR="/opt/prometheus-unified-exporter"
 SERVICE_NAME="prometheus-unified-exporter"
@@ -88,21 +93,29 @@ ensure_system_dependencies() {
   pkg_mgr=$(identify_pkg_manager)
   log "Detected package manager: $pkg_mgr"
 
-  local base_packages=(python3 python3-venv python3-pip curl)
-  local sensor_packages=(lm-sensors nvme-cli smartmontools)
+  local base_packages=()
+  local sensor_packages=()
   local gpu_packages=()
 
   case "$pkg_mgr" in
     apt)
+      base_packages=(python3 python3-venv python3-pip curl)
+      sensor_packages=(lm-sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     dnf|yum)
+      base_packages=(python3 python3-pip python3-virtualenv curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     pacman)
+      base_packages=(python python-pip curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
     zypper)
+      base_packages=(python3 python3-pip curl)
+      sensor_packages=(lm_sensors nvme-cli smartmontools)
       gpu_packages=(pciutils)
       ;;
   esac
@@ -151,7 +164,12 @@ setup_virtualenv() {
   done
 
   if [[ -z "$exporter_src" ]]; then
-    fail "prometheus_unified_metrics.py not found next to the setup script; place them together and retry"
+    local exporter_url="${EXPORTER_URL:-https://raw.githubusercontent.com/Lazarev-Cloud/Scripts/refs/heads/main/monitoring/prometheus_unified_metrics.py}"
+    log "Exporter not found locally; attempting to download from $exporter_url"
+    exporter_src="$SCRIPT_DIR/prometheus_unified_metrics.py"
+    if ! curl -fsSL "$exporter_url" -o "$exporter_src"; then
+      fail "Unable to download prometheus_unified_metrics.py; set EXPORTER_URL or place it next to this script."
+    fi
   fi
 
   log "Creating installation directory at $INSTALL_DIR"

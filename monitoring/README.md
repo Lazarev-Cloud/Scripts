@@ -37,6 +37,11 @@ directory and run the helper script:
 sudo bash setup_prometheus_exporter.sh
 ```
 
+When piping the installer directly from the repository (for example with
+`curl ... | bash`), the script now falls back to the current working directory
+and downloads `prometheus_unified_metrics.py` automatically. You can override the
+download source by setting `EXPORTER_URL=<your_url>` before running the script.
+
 ## Metrics Exposed
 - `system_info`: basic OS, release, and architecture labels
 - `system_cpu_usage_percent`: CPU usage percentage
