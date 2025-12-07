@@ -5,6 +5,8 @@ required Python dependency (`psutil`) is installed, and exposes common machine
 metrics in Prometheus' text format. It works on both Linux and Windows without
 extra configuration. Running the Linux setup helper requires root/sudo access
 so it can install sensor tooling (for CPU/board/SSD temps) and GPU utilities.
+It also auto-loads common sensor modules (`coretemp`, `nct6775`) so temperature
+readings are available immediately after installation.
 
 ## Requirements
 - Python 3.8+
@@ -27,7 +29,7 @@ You can change the bind address with `--bind` (defaults to `0.0.0.0`). The
 exporter serves metrics at `http://<bind>:<port>/metrics`.
 
 To fully provision a host (install Python, sensor tooling, Python deps, copy the
-exporter, and create a systemd service on Linux), place
+exporter, auto-load sensor modules, and create a systemd service on Linux), place
 `setup_prometheus_exporter.sh` and `prometheus_unified_metrics.py` in the same
 directory and run the helper script:
 

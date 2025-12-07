@@ -114,6 +114,12 @@ ensure_system_dependencies() {
     yes "" | $SUDO sensors-detect --auto || true
   fi
 
+  if require_command modprobe; then
+    log "Attempting to load common sensor modules (coretemp, nct6775)"
+    $SUDO modprobe coretemp 2>/dev/null || true
+    $SUDO modprobe nct6775 2>/dev/null || true
+  fi
+
   if require_command lspci && lspci | grep -qi nvidia; then
     if ! require_command nvidia-smi; then
       log "NVIDIA GPU detected but nvidia-smi missing; attempting to install utilities"
