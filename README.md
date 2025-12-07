@@ -8,10 +8,12 @@ so they're easy to run when needed.
 ```
 .
 ├── linux/   # Bash utilities
+├── monitoring/ # Cross-platform monitoring/exporter scripts
 └── windows/ # PowerShell utilities
 ```
 
 - See [linux/README.md](linux/README.md) for Linux scripts.
 - See [windows/README.md](windows/README.md) for Windows scripts.
+- See [monitoring/README.md](monitoring/README.md) for metrics exporters.
 
 For general usage instructions check [docs/README.md](docs/README.md).
