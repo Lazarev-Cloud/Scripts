@@ -1,0 +1,56 @@
+# Jekyll configuration for the GitHub Pages site.
+#
+# The site is built from the repository's own README files. Each one carries
+# YAML front matter, which GitHub hides when it renders markdown, so there is a
+# single source for both the repo view and the published site. Do not duplicate
+# script documentation into a separate docs tree.
+
+title: Lazarev Cloud Scripts
+description: Maintenance scripts for Linux, Proxmox VE and Windows. Safe by default, cron-ready, zero lint findings.
+remote_theme: just-the-docs/just-the-docs@v0.10.1
+url: https://lazarev-cloud.github.io
+baseurl: /Scripts
+
+permalink: pretty
+
+# Sidebar and navigation
+aux_links:
+  View on GitHub:
+    - https://github.com/Lazarev-Cloud/Scripts
+aux_links_new_tab: true
+
+search_enabled: true
+search:
+  heading_level: 2
+  previews: 3
+
+color_scheme: dark
+heading_anchors: true
+
+back_to_top: true
+back_to_top_text: Back to top
+
+footer_content: >-
+  MIT licensed.
+  These scripts run as root — read the blast radius section before you do.
+
+# Everything that is not documentation.
+exclude:
+  - .github/
+  - .gitattributes
+  - .gitignore
+  - install.sh
+  - lib/
+  - monitoring/prometheus_unified_metrics.py
+  - monitoring/requirements.txt
+  - monitoring/setup_prometheus_exporter.sh
+  - vendor/
+  - Gemfile
+  - Gemfile.lock
+  - "**/*.sh"
+  - "**/*.ps1"
+  - "**/*.py"
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag

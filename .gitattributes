@@ -1,0 +1,9 @@
+# These scripts are fetched over curl and executed on Linux hosts. A CRLF line
+# ending would break the shebang ("bad interpreter"), and this repo is authored
+# on Windows where core.autocrlf is commonly true. Pin the endings per type so
+# the checked-in bytes never depend on the contributor's platform.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.bash text eol=lf
+*.ps1  text eol=crlf
+*.md   text
