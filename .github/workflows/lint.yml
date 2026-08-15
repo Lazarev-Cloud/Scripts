@@ -7,6 +7,11 @@
 # check would fail a commit nobody wrote, which is exactly the silent
 # regression this gate is supposed to prevent. Bump these two values
 # intentionally, and fix whatever the new version finds in the same change.
+#
+# Actions are pinned by commit SHA for the same reason this repo tells you to
+# fetch update-lxcs.sh by SHA rather than by branch: a tag is a movable
+# pointer, a commit is content-addressed. The trailing comment records which
+# release the SHA belongs to; keep the two in step when bumping.
 name: lint
 
 on:
@@ -26,7 +31,7 @@ jobs:
     name: shellcheck (.sh)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The runner image ships its own shellcheck at an unpinned version, so
       # install the pinned release rather than using whatever is preinstalled.
@@ -69,7 +74,7 @@ jobs:
       run:
         shell: powershell
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PSScriptAnalyzer ${{ env.PSSCRIPTANALYZER_VERSION }}
         run: |
