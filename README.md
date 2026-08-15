@@ -1,19 +1,43 @@
 # Lazarev Cloud Scripts
 
-A collection of small maintenance utilities for both Windows and Linux.
-Each script lives in its own folder with a short README explaining how
-it works. The goal is to keep common troubleshooting steps in one place
-so they're easy to run when needed.
+Maintenance and troubleshooting utilities for Linux and Windows hosts. Each
+script lives in its own folder with a README covering its flags, environment
+variables, exit codes and blast radius.
 
 ```
 .
-├── linux/   # Bash utilities
-├── monitoring/ # Cross-platform monitoring/exporter scripts
-└── windows/ # PowerShell utilities
+├── linux/       # Bash utilities (9 script folders)
+├── windows/     # PowerShell utilities (10 script folders)
+├── monitoring/  # Prometheus host-metrics exporter and its installer
+├── lib/         # Shared Bash library (optional log/metric shipping)
+└── docs/        # Conventions common to every script
 ```
 
-- See [linux/README.md](linux/README.md) for Linux scripts.
-- See [windows/README.md](windows/README.md) for Windows scripts.
-- See [monitoring/README.md](monitoring/README.md) for metrics exporters.
+- [linux/README.md](linux/README.md) — Linux scripts
+- [windows/README.md](windows/README.md) — Windows scripts
+- [monitoring/README.md](monitoring/README.md) — metrics exporter and installer
+- [docs/README.md](docs/README.md) — how to run these safely
 
-For general usage instructions check [docs/README.md](docs/README.md).
+## What to expect
+
+Scripts that change the system are safe by default: they print what they would
+do and need `--yes` (Bash) or `-Force`/confirmation (PowerShell) before acting.
+The one exception is `ResetNetwork`, whose default `DnsCache` scope flushes the
+DNS resolver cache without prompting. All of them support `-h/--help`, and the
+help text is the
+authoritative reference for that script — flags, environment variables, exit
+codes and exactly what it touches.
+
+Scripts run unattended from cron or Task Scheduler: they detect a missing
+terminal and refuse to prompt rather than hanging.
+
+## Quality bar
+
+`.github/workflows/lint.yml` runs ShellCheck over every `.sh` and
+PSScriptAnalyzer over every `.ps1` on each push and pull request. Both are
+pinned and both currently report zero findings; any new finding fails the
+build.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
