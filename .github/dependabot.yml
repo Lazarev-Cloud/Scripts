@@ -1,0 +1,91 @@
+# Two things in this repo have real upstream dependencies: the actions the CI
+# and Pages workflows call, and the Python packages the Prometheus exporter
+# installs. Dependabot watches both.
+#
+# Nothing else here has any. The shell and PowerShell scripts deliberately call
+# only what the OS already ships, which is why there is no third ecosystem
+# below. The pins Dependabot cannot reach are listed at the end of this file --
+# those stay manual, and knowing which ones they are is the point.
+version: 2
+
+updates:
+  # Covers .github/workflows/lint.yml and .github/workflows/pages.yml. `/` is
+  # the required value for this ecosystem: Dependabot always scans
+  # .github/workflows from the repository root, not the directory named here.
+  #
+  # The actions are pinned by commit SHA with the release in a trailing
+  # comment. Dependabot understands that form and rewrites both halves, but
+  # only while the comment is a bare `# vX.Y.Z`. Add any prose to that line and
+  # it silently leaves the comment behind, so the file keeps claiming a version
+  # it is no longer pinned to. Explanations belong on their own line above the
+  # step.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+
+    # Patch and minor arrive together, because a batch of them is a single
+    # review. Majors are deliberately left out of the group so each one gets
+    # its own pull request: the last major bump here crossed three checkout
+    # majors and a breaking change in upload-pages-artifact that silently drops
+    # hidden files, and none of that should be read in a pile with routine
+    # patches.
+    groups:
+      actions-patch-and-minor:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
+
+    # Let a release sit before proposing it. Yanked and immediately-respun
+    # releases are common enough, and nothing in this repo is urgent enough to
+    # want day-zero. Security updates ignore this.
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+
+  # monitoring/requirements.txt. This is only useful because that file pins
+  # exact versions -- a range would leave Dependabot nothing to bump.
+  - package-ecosystem: pip
+    directory: /monitoring
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+
+    groups:
+      exporter-patch-and-minor:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
+
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+
+# Pins Dependabot cannot see. Check these by hand:
+#
+#   _config.yml                     remote_theme just-the-docs@v0.10.1.
+#                                   Jekyll remote themes are not an ecosystem.
+#   .github/workflows/lint.yml      SHELLCHECK_VERSION, PSSCRIPTANALYZER_VERSION.
+#                                   Plain env vars, not a manifest.
+#   monitoring/setup_prometheus_exporter.sh
+#                                   PIP_SPEC_LIST and GPU_PIP_SPEC_LIST repeat
+#                                   psutil and nvidia-ml-py as shell defaults
+#                                   for hosts with no requirements.txt beside
+#                                   the exporter. A Dependabot PR against
+#                                   requirements.txt will not touch them, so
+#                                   they drift unless updated in the same
+#                                   change.
+#
+# One trade-off comes with the SHA pins: Dependabot raises security *alerts*
+# only for actions referenced by semver, never for SHA-pinned ones. Scheduled
+# version updates still bump them, so a vulnerable action is replaced on the
+# weekly run -- it just arrives as a routine bump rather than an alert.
