@@ -200,6 +200,9 @@ Blast radius:
                 files. Run with -n first and read the plan. The autoremove list
                 is simulated before the upgrade, so treat it as a lower bound:
                 the upgrade can orphan further packages, which are removed too.
+                If the upgrade itself fails, autoremove and the cache cleanup
+                are SKIPPED: what is orphaned is read from the package state,
+                and a half-applied upgrade is not a state to remove from.
   --conffile new
                 OVERWRITES local edits under $ETC_DIR. Only sensible where
                 configuration management re-applies state afterwards.
@@ -937,9 +940,30 @@ main() {
         return "$EX_OK"
     fi
 
-    do_upgrade
-    do_autoremove
-    do_clean
+    # Cleanup only runs if the upgrade actually finished. apt computes "no
+    # longer needed" from the package state in front of it, so after a
+    # part-applied transaction that set is derived from a dependency graph this
+    # run failed to bring to completion. The case that strands a host: a kernel
+    # meta-package moves to a new ABI and orphans the running kernel's image,
+    # the upgrade then fails (a failed initramfs build is the usual way), and
+    # autoremove deletes the last kernel that still boots. --autoremove-purge
+    # additionally deletes the packages' configuration.
+    #
+    # This is not the do_update case above, where continuing is deliberate:
+    # there the failure is a stale index and the work still makes sense. Here
+    # the work is package removal decided from a state the run has just
+    # reported as broken.
+    if do_upgrade; then
+        do_autoremove
+        do_clean
+    else
+        if ((AUTOREMOVE)); then
+            log WARN "Skipping autoremove: the upgrade failed, so the set of"
+            log WARN "packages 'nothing depends on' would be computed from a"
+            log WARN "half-applied transaction. Re-run once the upgrade succeeds."
+        fi
+        log WARN "Skipping the archive cleanup so a retry can reuse the downloaded packages."
+    fi
 
     report
 

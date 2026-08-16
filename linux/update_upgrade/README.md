@@ -167,6 +167,15 @@ upgrade plan, before the confirmation prompt. Treat it as a lower bound: it is
 computed *before* the upgrade, and the upgrade can orphan further packages,
 which are then removed too.
 
+If the upgrade fails, autoremove and the cache cleanup do not run at all. apt
+derives "nothing depends on this any more" from the package state in front of
+it, and after a half-applied transaction that state is one this run failed to
+finish building — the case that strands a host is a kernel meta-package moving
+to a new ABI, the upgrade failing on the initramfs build, and autoremove then
+deleting the last kernel that still boots. The cache is kept for the same
+reason, so a retry does not have to download everything again. The run still
+exits `1`, and re-running once the upgrade succeeds performs both.
+
 ## Conffiles
 
 The default `--conffile old` passes `--force-confdef --force-confold` to dpkg:
