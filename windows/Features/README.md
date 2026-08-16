@@ -17,8 +17,13 @@ never starts a servicing transaction.
 
 Only the features you name. Enabling or disabling an optional feature is a servicing
 transaction against the running Windows image, and most features need a restart to
-finish. The script always passes `-NoRestart`, never reboots, and returns exit code
-`3010` when a restart is pending.
+finish. The script always passes `-NoRestart` and never reboots; a pending restart is
+reported as `RestartNeeded` on the result object.
+
+A run that will change a feature holds a machine-wide named mutex
+(`Global\lzc-features`), so two DISM feature transactions cannot overlap on one image;
+a second run exits `75`. A read-only listing and a `-WhatIf` preview never take it, and
+so are never blocked by a run in progress.
 
 Two behaviours are explicit opt-ins because both do considerably more than their
 names suggest:
@@ -42,10 +47,22 @@ you to re-run with this switch.
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7.x. The DISM cmdlets are natively compatible
-  with PowerShell 7; no compatibility layer is needed.
-- Administrator. Enforced by `#Requires -RunAsAdministrator`. `Get-WindowsOptionalFeature
-  -Online` itself requires elevation, so even listing needs it.
+- Windows. Any other platform exits `3`.
+- Windows PowerShell 5.1 or PowerShell 7.x. Older exits `3`. The DISM cmdlets are
+  natively compatible with PowerShell 7; no compatibility layer is needed. If the
+  DISM PowerShell module is unavailable the run exits `3`.
+- Administrator; a non-elevated run exits `4`. This applies to `-List` and `-WhatIf`
+  as well as to a real change: `Get-WindowsOptionalFeature -Online` cannot read a
+  feature's state unelevated, so without the check the run would degrade into a
+  per-feature `Failed` whose actual cause is an elevation error rather than a missing
+  feature.
+
+Elevation is checked at run time rather than with `#Requires -RunAsAdministrator`,
+which fails the script before it starts and exits `1`. The runtime check is what makes
+the documented exit `4` reachable.
+
+Arguments and `LZC_WINDOWSFEATURES_*` values are validated **before** the elevation
+check, so a typo can be found from an ordinary shell.
 
 ## Usage
 
@@ -79,19 +96,40 @@ Get-WindowsOptionalFeature -Online | Select-Object FeatureName, State
 
 ## Parameters
 
+Every parameter has an environment variable, so the script can be driven entirely
+from the environment in a scheduled task. Every variable is named
+`LZC_WINDOWSFEATURES_*`, so `Get-ChildItem env:LZC_*` lists everything configurable in
+this repository.
+
 | Parameter | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `-Action <Enable\|Disable>` | `WINFEATURE_ACTION` | none (listing mode) | The change to make. Omit it to stay read-only. |
-| `-FeatureName <string[]>` | `WINFEATURE_NAMES` (comma separated) | none | One or more feature names. Required with `-Action`. |
-| `-List` | - | implied when `-Action` is omitted | Force listing mode. |
-| `-Filter <string>` | `WINFEATURE_FILTER` | `*` | Wildcard applied to the feature name when listing. Ignored when changing. |
-| `-RemovePayload` | `WINFEATURE_REMOVE_PAYLOAD` | off | On disable, also remove the feature's files from the image. |
-| `-IncludeParent` | `WINFEATURE_INCLUDE_PARENT` | off | On enable, also enable parent features. |
-| `-Force` | `WINFEATURE_FORCE` | off | Suppress confirmation prompts. Required for unattended runs. |
+| `-Action <Enable\|Disable>` | `LZC_WINDOWSFEATURES_ACTION` | none (listing mode) | The change to make. Case does not matter. Omit it to stay read-only. |
+| `-FeatureName <string[]>` | `LZC_WINDOWSFEATURES_NAMES` (comma separated) | none | One or more feature names. Required with `-Action`. |
+| `-List` | - | implied when `-Action` is omitted | Ask for listing mode explicitly. Passing it together with `-Action` is a contradiction and exits `2`. |
+| `-Filter <string>` | `LZC_WINDOWSFEATURES_FILTER` | `*` | Wildcard applied to the feature name when listing. Ignored when changing. |
+| `-RemovePayload` | `LZC_WINDOWSFEATURES_REMOVE_PAYLOAD` | off | On disable, also remove the feature's files from the image. |
+| `-IncludeParent` | `LZC_WINDOWSFEATURES_INCLUDE_PARENT` | off | On enable, also enable parent features. |
+| `-Force` | `LZC_WINDOWSFEATURES_FORCE` | off | Suppress confirmation prompts. Required for unattended runs. |
 
-An explicitly passed switch always wins over its environment variable. `-WhatIf`,
-`-Confirm`, `-Verbose` and `-InformationAction` work as usual; `-WhatIf` takes
-precedence over `-Force`.
+An explicitly passed parameter always wins over its environment variable.
+
+**Booleans** (`LZC_WINDOWSFEATURES_REMOVE_PAYLOAD`, `..._INCLUDE_PARENT`, `..._FORCE`)
+accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`, in any case. Anything else
+is a usage error with a message naming the variable, not a silent "off".
+
+`NO_COLOR` (any non-empty value, per [no-color.org](https://no-color.org)) is
+honoured. The script emits no colour of its own — progress, warnings and errors go to
+PowerShell's streams and the host renders them — and on PowerShell 7 `NO_COLOR`
+additionally forces `$PSStyle.OutputRendering` to `PlainText` for the run.
+
+Standard PowerShell parameters also apply:
+
+| Parameter | Effect |
+| --- | --- |
+| `-WhatIf` | Full dry run. Takes precedence over `-Force`. |
+| `-Confirm` | Prompt before each feature change. |
+| `-Verbose` | Extra detail. |
+| `-InformationAction SilentlyContinue` | Quiet run. Progress goes to the information stream, which is on by default. |
 
 ## Output
 
@@ -123,34 +161,34 @@ Possible states: `Enabled`, `Disabled`, `DisabledWithPayloadRemoved`,
 
 ## Exit codes
 
-| Code | Meaning |
+The repository-wide table. Every script in this repository uses these numbers and no
+others.
+
+| Code | Meaning here |
 | --- | --- |
-| `0` | Every requested feature reached the requested state, or was already there. |
-| `1` | At least one feature failed to change, was not found, or its state could not be read. |
-| `2` | Usage or precondition failure: `-Action` given without `-FeatureName`, the DISM cmdlets are unavailable, or the feature list could not be enumerated. |
-| `3` | Not Windows, or PowerShell older than 5.1. Nothing was changed. |
+| `0` | Every requested feature reached the requested state, or was already there. **A pending restart is still `0`** — see below. |
+| `1` | The work ran but part of it failed: a feature would not change, was not found, its state could not be read, or the feature list could not be enumerated. |
+| `2` | Usage error: an unknown argument, `-Action` without `-FeatureName`, `-Action` together with `-List`, or an invalid `LZC_WINDOWSFEATURES_*` value. |
+| `3` | Not Windows, PowerShell older than 5.1, or the DISM PowerShell module is unavailable. |
 | `4` | Not running as Administrator. |
 | `5` | A change needs confirmation, there is no terminal to confirm on, and `-Force` was not given. |
-| `75` | Another instance holds the lock. Retry later; nothing is wrong. |
+| `75` | Another instance holds `Global\lzc-features` (`EX_TEMPFAIL`: retry later, not a fault). See the [repo-wide table](../../docs/exit-codes.md) for why `75` rather than a generic failure. |
 | `130` | Interrupted. Features already changed stay changed. |
-| `3010` | Success, and a restart is required to finish. |
 
-An enumeration failure is reported as exit `2`, never as an empty list with exit `0`.
+An enumeration failure is reported as a failure, never as an empty list with exit `0`.
 
-Administrator rights are checked up front, for `-List` and `-WhatIf` as well as
-for a real change: DISM cannot read a feature's state unelevated, so without that
-check the run degrades into a per-feature `Failed` whose actual cause is an
-elevation error rather than a missing feature.
+**A pending restart is not signalled with a bespoke exit code such as `3010`.** The
+work succeeded, so the exit code is `0`; the signal is carried on the result objects,
+which is also the only place it can be per-feature:
 
-A run that changes a feature takes a machine-wide named mutex
-(`Global\lzc-features`), so two DISM feature transactions cannot overlap on one
-image. A read-only listing and a `-WhatIf` preview never take it, and so are
-never blocked by a run in progress. See the [repo-wide
-table](../../docs/exit-codes.md) for why `75` rather than a generic failure.
+```powershell
+$r = .\WindowsFeatures.ps1 -Action Enable -FeatureName NetFx3 -Force
+if ($r | Where-Object RestartNeeded) { <# schedule the restart #> }
+```
 
 ## Scheduled task
 
-Use `-File`, never `-Command`.
+Use `-File`, never `-Command`. `-Command` collapses the exit code to 0 or 1.
 
 ```
 Program:   C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
@@ -159,6 +197,17 @@ Arguments: -NoProfile -NonInteractive -ExecutionPolicy Bypass
            -Action Enable -FeatureName NetFx3 -Force
 ```
 
-When passing `-FeatureName` through `-File`, list multiple values space separated
-(`-FeatureName TelnetClient TFTP`); `-File` binds array parameters from separate
-tokens.
+`-Force` is not optional: without it the task has nothing to confirm on and the run is
+refused with exit `5`. Set `LZC_WINDOWSFEATURES_FORCE=1` if you prefer to carry it in
+the environment.
+
+**Passing several features through `-File`: use the comma form, in one token.**
+`powershell.exe -File` hands each argument to the script as one literal string, so
+`-FeatureName TelnetClient,TFTP` arrives as the single string `TelnetClient,TFTP`
+— which this script splits on commas, so it does the right thing. The
+space-separated form is silently wrong: `-FeatureName TelnetClient TFTP` binds only
+`TelnetClient`, and `TFTP` falls through to the unknown-argument catch-all, which
+exits `2`.
+
+`LZC_WINDOWSFEATURES_NAMES=TelnetClient,TFTP` works the same way and is the tidier
+choice when the task already carries other settings in the environment.

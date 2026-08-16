@@ -92,16 +92,18 @@
 .EXAMPLE
     PS> .\ResetNetwork.ps1 -Scope Winsock -Force
 
-    Unattended Winsock catalog reset. The snapshot is written first, and the returned object
-    carries RebootRequired = $true.
+    Unattended Winsock catalog reset. The snapshot is written first, the returned object carries
+    RebootRequired = $true, and the script exits 3010 to tell a scheduler to restart the machine.
 
 .INPUTS
     None. This script does not accept pipeline input.
 
 .OUTPUTS
     System.Management.Automation.PSCustomObject, one per operation, with Operation, Target,
-    ExitCode, Status and RebootRequired properties. RebootRequired is $true only on an operation
-    that actually ran and needs a reboot to take effect.
+    ExitCode, Status and RebootRequired properties. Status is Succeeded or Skipped; Skipped means
+    the ShouldProcess gate declined it, which is what every operation reports under -WhatIf.
+    RebootRequired is $true only on an operation that actually ran and needs a reboot to take
+    effect, so it is always $false on a Skipped operation and on DnsCache.
 
 .NOTES
     Version : 2.0
@@ -109,7 +111,7 @@
     Origin  : https://github.com/Lazarev-Cloud/Scripts
     Tested  : Windows PowerShell 5.1 on Windows 11.
 
-    Exit codes (the repo-wide table; this script can return the subset below):
+    Exit codes (the repo-wide table, plus 3010; this script can return the subset below):
       0     success, or a -WhatIf dry run
       1     the work ran but something in it failed, including the rollback snapshot that a
             destructive scope depends on
@@ -117,10 +119,14 @@
             selected, or a remote session without -AllowRemoteSession
       4     must be run as administrator
       5     refused: confirmation was needed, the session cannot prompt, and -Force was not given
+      3010  success, and a restart is required before the reset takes effect
 
-    A reboot requirement is NOT signalled through the exit code. A successful Winsock, IPv4 or
-    IPv6 reset exits 0 and sets RebootRequired = $true on the returned object, alongside a
-    warning. Read that property rather than testing for a magic number.
+    3010 is the one code outside the repo-wide table. It is the Windows convention for "success,
+    soft reboot required", and Intune, SCCM and most RMM tools act on it. It is used here rather
+    than a plain 0 because a Winsock, IPv4 or IPv6 reset does NOT take effect until the machine
+    restarts: exiting 0 would tell a scheduler the job was finished while leaving the stack in a
+    half-reset state that looks healthy and is not. Callers that cannot handle 3010 should read
+    the RebootRequired property on the returned objects and treat 3010 as success.
 
     Rollback: re-apply the saved 'netsh interface dump' with
       netsh -f <BackupPath>\netsh-interface-dump-<stamp>.txt
@@ -540,6 +546,10 @@ function Invoke-GatedNetsh {
     .DESCRIPTION
         The gate sits immediately before the native call, which is what makes -WhatIf truthful:
         netsh itself has no dry-run mode.
+    .PARAMETER RebootRequiredOnSuccess
+        Marks this component's reset as one that only takes effect after a restart. The returned
+        RebootRequired is true only when the reset actually ran, never when the gate declined it,
+        so a caller that reboots on the flag never reboots for work that did not happen.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     [OutputType([pscustomobject])]
@@ -561,15 +571,19 @@ function Invoke-GatedNetsh {
 
         [Parameter(Mandatory)]
         [ValidateRange(10, 600)]
-        [int] $TimeoutSeconds
+        [int] $TimeoutSeconds,
+
+        [Parameter()]
+        [switch] $RebootRequiredOnSuccess
     )
 
     if (-not $PSCmdlet.ShouldProcess($Target, $Operation)) {
         return [pscustomobject]@{
-            Operation = $Operation
-            Target    = $Target
-            ExitCode  = $null
-            Status    = 'Skipped'
+            Operation      = $Operation
+            Target         = $Target
+            ExitCode       = $null
+            Status         = 'Skipped'
+            RebootRequired = $false
         }
     }
 
@@ -584,10 +598,11 @@ function Invoke-GatedNetsh {
     }
 
     return [pscustomobject]@{
-        Operation = $Operation
-        Target    = $Target
-        ExitCode  = $result.ExitCode
-        Status    = 'Succeeded'
+        Operation      = $Operation
+        Target         = $Target
+        ExitCode       = $result.ExitCode
+        Status         = 'Succeeded'
+        RebootRequired = [bool] $RebootRequiredOnSuccess
     }
 }
 
@@ -603,16 +618,18 @@ function Invoke-DnsCacheReset {
     if (-not $PSCmdlet.ShouldProcess('DNS client cache', 'Clear cached DNS records')) {
         return [pscustomobject]@{
             Operation = 'Clear DNS client cache'; Target = 'DNS client cache'
-            ExitCode = $null; Status = 'Skipped'
+            ExitCode = $null; Status = 'Skipped'; RebootRequired = $false
         }
     }
 
     # Errors propagate: $ErrorActionPreference is 'Stop' and the outer handler reports them.
     Clear-DnsClientCache -ErrorAction Stop
 
+    # Takes effect immediately, so RebootRequired is false. The property is present on every
+    # result object regardless, so a caller can read it without testing for its existence.
     return [pscustomobject]@{
         Operation = 'Clear DNS client cache'; Target = 'DNS client cache'
-        ExitCode = 0; Status = 'Succeeded'
+        ExitCode = 0; Status = 'Succeeded'; RebootRequired = $false
     }
 }
 
@@ -757,40 +774,33 @@ function Invoke-Main {
     }
 
     $results = @()
-    $rebootRequired = $false
 
+    # -RebootRequiredOnSuccess sets RebootRequired on the result object in the same place Status is
+    # set, and only when the reset actually ran. Marking a component merely because it was
+    # requested would report a reboot after the user declined the prompt, and a scheduler acting on
+    # that would restart the machine for a reset that never happened.
     foreach ($component in $components) {
         switch ($component) {
             'DnsCache' {
                 $results += Invoke-DnsCacheReset
             }
-            # Each branch records "reboot required" only if its own reset actually ran. Setting the
-            # flag merely because the component was requested would report 3010 after the user
-            # declined the prompt, and a scheduler reading 3010 would reboot the machine for a
-            # reset that never happened.
             'Winsock' {
-                $outcome = Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('winsock', 'reset') `
+                $results += Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('winsock', 'reset') `
                     -Target 'Winsock catalog' `
                     -Operation 'Reset Winsock catalog (removes third-party LSPs; reboot required)' `
-                    -TimeoutSeconds $TimeoutSeconds
-                $results += $outcome
-                if ($outcome.Status -eq 'Succeeded') { $rebootRequired = $true }
+                    -TimeoutSeconds $TimeoutSeconds -RebootRequiredOnSuccess
             }
             'IPv4' {
-                $outcome = Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('interface', 'ipv4', 'reset') `
+                $results += Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('interface', 'ipv4', 'reset') `
                     -Target 'IPv4 stack' `
                     -Operation 'Reset IPv4 stack to defaults (discards static IP, routes and DNS; reboot required)' `
-                    -TimeoutSeconds $TimeoutSeconds
-                $results += $outcome
-                if ($outcome.Status -eq 'Succeeded') { $rebootRequired = $true }
+                    -TimeoutSeconds $TimeoutSeconds -RebootRequiredOnSuccess
             }
             'IPv6' {
-                $outcome = Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('interface', 'ipv6', 'reset') `
+                $results += Invoke-GatedNetsh -NetshPath $netsh -ArgumentList @('interface', 'ipv6', 'reset') `
                     -Target 'IPv6 stack' `
                     -Operation 'Reset IPv6 stack to defaults (discards static IP, routes and DNS; reboot required)' `
-                    -TimeoutSeconds $TimeoutSeconds
-                $results += $outcome
-                if ($outcome.Status -eq 'Succeeded') { $rebootRequired = $true }
+                    -TimeoutSeconds $TimeoutSeconds -RebootRequiredOnSuccess
             }
             default {
                 throw "Internal error: unhandled component '$component'."
@@ -798,7 +808,9 @@ function Invoke-Main {
         }
     }
 
-    if ($rebootRequired -and -not $WhatIfPreference) {
+    # Derived from the objects rather than tracked alongside them, so the exit code and the
+    # RebootRequired properties can never disagree about whether a restart is outstanding.
+    if (@($results | Where-Object { $_.RebootRequired }).Count -gt 0 -and -not $WhatIfPreference) {
         Write-Warning 'A reboot is required before the reset takes effect. Exit code 3010 signals this to schedulers and RMM tools.'
         $script:ExitCode = 3010
     }
@@ -816,7 +828,11 @@ try {
     # so the exit statement below is always reached.
     $origin = @($_.ScriptStackTrace -split "`r?`n") | Select-Object -First 1
     Write-Error -ErrorAction Continue -Message ("{0}{1}  {2}" -f $_.Exception.Message, [Environment]::NewLine, $origin)
-    $script:ExitCode = 1
+    # A validation site that already classified the fault (2 for a usage error) keeps its code;
+    # only an unclassified exception becomes the generic "work failed" 1. Assigning 1
+    # unconditionally here would discard every $script:ExitCode = 2 set above and make each
+    # documented usage error report as a runtime failure instead.
+    if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }
 }
 
 exit $script:ExitCode

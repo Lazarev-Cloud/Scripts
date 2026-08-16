@@ -8,13 +8,13 @@
     -Action and -FeatureName, and every change is gated by $PSCmdlet.ShouldProcess,
     so it prompts unless -Force is given and does nothing under -WhatIf.
 
-    Blast radius: only the named features. Enabling or disabling an optional
+    Blast radius: only the features you name. Enabling or disabling an optional
     feature is a servicing transaction against the running Windows image, and most
     features need a restart to finish. This script always passes -NoRestart and
-    never reboots; it reports exit code 3010 when a restart is pending.
+    never reboots.
 
-    Two behaviours that were previously silent and are now explicit opt-ins,
-    because both do considerably more than their names suggest:
+    Two behaviours are explicit opt-ins, because both do considerably more than
+    their names suggest:
 
       -RemovePayload   Disable with DISM's -Remove, which deletes the feature's
                        files from the image, not just its registration. The state
@@ -28,38 +28,70 @@
                        enable fails because a parent is disabled, the script says
                        so and suggests this switch.
 
-    Features already in the requested state are reported and skipped, so no
-    servicing transaction runs for a no-op.
+    Safety properties:
+      * Nothing changes without passing $PSCmdlet.ShouldProcess, so -WhatIf
+        produces a complete dry run and changes nothing.
+      * Features already in the requested state are reported and skipped, so no
+        servicing transaction runs for a no-op.
+      * The resulting state is read back from the system rather than assumed. A
+        change that did not happen is reported as a failure, not as success.
+      * A feature is reported as NotFound only when absence was established. A
+        query that could not run at all proves nothing about whether the feature
+        exists, and is reported as a failure with the real reason.
+      * A run that will change something takes a machine-wide lock
+        (Global\lzc-features) and exits 75 if another instance holds it, so two
+        DISM feature transactions never overlap on one image.
+      * A run that would prompt, on a host with no terminal to prompt on and
+        without -Force, is refused with exit 5 before any transaction starts.
+
+    Every environment variable a user may set is named LZC_WINDOWSFEATURES_*, so
+    `Get-ChildItem env:LZC_*` shows everything configurable in this repository.
+    A variable is consulted only when the matching parameter is not passed, and
+    an unusable value is a usage error (exit 2) rather than a silent default.
 
 .PARAMETER Action
     Enable or Disable. Required to change anything. Omit it, or pass -List, to
-    stay in read-only listing mode. Environment variable: WINFEATURE_ACTION.
+    stay in read-only listing mode. Case does not matter. Environment variable:
+    LZC_WINDOWSFEATURES_ACTION.
 
 .PARAMETER FeatureName
     One or more feature names, exactly as Get-WindowsOptionalFeature reports them
-    (for example NetFx3, Microsoft-Windows-Subsystem-Linux, TelnetClient). Required
-    with -Action. Environment variable: WINFEATURE_NAMES (comma separated).
+    (for example NetFx3, Microsoft-Windows-Subsystem-Linux, TelnetClient).
+    Required with -Action. A comma-separated list is accepted as one value
+    ('TelnetClient,TFTP'), which is the form that also works through
+    powershell.exe -File. Environment variable: LZC_WINDOWSFEATURES_NAMES (comma
+    separated).
 
 .PARAMETER List
-    List optional features and exit. This is the default when -Action is omitted.
+    List optional features and exit. This is already the default when -Action is
+    omitted, so it is only needed to be explicit. Passing it together with
+    -Action is a contradiction and is refused with exit 2.
 
 .PARAMETER Filter
     Wildcard applied to the feature name when listing, for example '*Hyper*'.
-    Ignored when changing a feature. Environment variable: WINFEATURE_FILTER.
+    Ignored when changing a feature. Defaults to '*'. Environment variable:
+    LZC_WINDOWSFEATURES_FILTER.
 
 .PARAMETER RemovePayload
     When disabling, also remove the feature's files from the image. Re-enabling
     afterwards requires Windows Update or an installation source. Environment
-    variable: WINFEATURE_REMOVE_PAYLOAD (1, true, yes or on to enable).
+    variable: LZC_WINDOWSFEATURES_REMOVE_PAYLOAD
+    (1, true, yes, on / 0, false, no, off).
 
 .PARAMETER IncludeParent
     When enabling, also enable any parent features the named feature depends on.
-    Environment variable: WINFEATURE_INCLUDE_PARENT (1, true, yes or on to enable).
+    Environment variable: LZC_WINDOWSFEATURES_INCLUDE_PARENT
+    (1, true, yes, on / 0, false, no, off).
 
 .PARAMETER Force
     Suppress confirmation prompts, for scheduled and unattended runs. -WhatIf
-    still takes precedence over -Force. Environment variable: WINFEATURE_FORCE
-    (1, true, yes or on to enable).
+    still takes precedence over -Force. Environment variable:
+    LZC_WINDOWSFEATURES_FORCE (1, true, yes, on / 0, false, no, off).
+
+.PARAMETER ExtraArgument
+    Collects anything that is not a parameter of this script. Passing something
+    here is a typo, so the run stops with exit code 2 and names what it did not
+    understand. Do not pass it deliberately.
 
 .EXAMPLE
     PS> .\WindowsFeatures.ps1
@@ -80,7 +112,7 @@
     PS> .\WindowsFeatures.ps1 -Action Enable -FeatureName 'Microsoft-Hyper-V' -IncludeParent -Force
 
     Enables Hyper-V together with the parent features it depends on, without
-    prompting. Reports exit code 3010 if a restart is needed.
+    prompting. Reports RestartNeeded on the result object if a restart is needed.
 
 .EXAMPLE
     PS> .\WindowsFeatures.ps1 -Action Disable -FeatureName TelnetClient -Force
@@ -97,14 +129,38 @@
     RestartNeeded, Status and Detail.
 
 .NOTES
-    Exit codes:
-      0     every requested feature reached the requested state, or was already there
-      1     at least one feature failed to change, was not found, or its state
-            could not be read
-      2     usage or precondition failure (-Action given without -FeatureName, the
-            DISM cmdlets are unavailable, or the feature list could not be
-            enumerated)
-      3010  success, and a restart is required to finish
+    Exit codes (the repository-wide table; every script in this repository uses
+    the same numbers):
+      0     success: every requested feature reached the requested state or was
+            already there. A pending restart is still exit 0 -- read the
+            RestartNeeded property of the result objects
+      1     the work ran but something in it failed: a feature would not change,
+            was not found, its state could not be read, or the feature list could
+            not be enumerated
+      2     usage error: an unknown argument, -Action without -FeatureName,
+            -Action together with -List, or a parameter or
+            LZC_WINDOWSFEATURES_* value that is invalid
+      3     unsupported platform or missing prerequisite (not Windows, PowerShell
+            older than 5.1, or the DISM PowerShell module is unavailable)
+      4     not running as Administrator
+      5     refused: the run needs confirmation, there is no terminal to confirm
+            on, and neither -Force nor -Confirm:$false was given
+      75    another instance holds the lock Global\lzc-features (EX_TEMPFAIL, so
+            cron and scheduled tasks treat it as "retry later")
+      130   interrupted (Ctrl-C or cancellation)
+
+    Checks run in that order with one deliberate exception: arguments and
+    settings are validated BEFORE the elevation check, so a typo is discoverable
+    from an ordinary shell without an elevated one.
+
+    A pending restart is NOT signalled with a bespoke exit code such as 3010.
+    Deployment tools that key on a reboot must read the result objects instead:
+    any object whose RestartNeeded is true means a restart finishes the work.
+
+    Elevation is checked at run time rather than with
+    `#Requires -RunAsAdministrator`, which fails the script before it starts and
+    exits 1. The runtime check is what makes the documented exit 4 reachable.
+    It applies to listing too: DISM cannot read a feature's state unelevated.
 
     List the exact names this script accepts with:
       Get-WindowsOptionalFeature -Online | Select-Object FeatureName, State
@@ -112,7 +168,19 @@
     On PowerShell 7 the DISM cmdlets are natively compatible; no compatibility
     layer is required.
 
-    Scheduled task invocation (use -File, never -Command):
+    Progress is written to the information stream and is visible by default. Add
+    -InformationAction SilentlyContinue for a quiet run, or -Verbose for detail.
+    Warnings and errors go to the warning and error streams, so the success
+    stream carries only the result objects.
+
+    This script emits no colour of its own; the host renders the information,
+    warning and error streams. NO_COLOR (https://no-color.org, any non-empty
+    value) is honoured: on PowerShell 7 it forces $PSStyle.OutputRendering to
+    PlainText for the run, and Windows PowerShell 5.1 renders those streams
+    without ANSI sequences already.
+
+    Scheduled task invocation (use -File, never -Command; -Command collapses the
+    exit code to 0 or 1):
       powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
         -File "C:\path\WindowsFeatures.ps1" -Action Enable -FeatureName NetFx3 -Force
 
@@ -129,29 +197,31 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 [OutputType([pscustomobject])]
 param(
+    # Values are deliberately NOT resolved from the environment here, and carry
+    # no ValidateSet/ValidateNotNullOrEmpty attributes. A validation attribute is
+    # not applied to a parameter's DEFAULT value, so an invalid
+    # LZC_WINDOWSFEATURES_ACTION resolved here would sail past the binder and
+    # detonate later; and a failure inside the binder ends the process with exit
+    # code 1 before a single line of this script runs, which would make the
+    # documented exit-code table a lie. Every value is therefore resolved and
+    # validated in Start-FeatureManagement, which can report a clear message and
+    # exit 2. ArgumentCompleter keeps tab-completion for -Action without handing
+    # the binder a value it can reject.
     [Parameter(Position = 0)]
-    [ValidateSet('Enable', 'Disable')]
-    [string] $Action = $(
-        if ($env:WINFEATURE_ACTION) { $env:WINFEATURE_ACTION } else { '' }
-    ),
+    [ArgumentCompleter({ 'Enable', 'Disable' })]
+    [AllowEmptyString()]
+    [string] $Action = '',
 
     [Parameter(Position = 1)]
-    [ValidateNotNullOrEmpty()]
-    [string[]] $FeatureName = $(
-        if ($env:WINFEATURE_NAMES) {
-            $env:WINFEATURE_NAMES -split ',' | Where-Object { $_ -and $_.Trim() }
-        }
-        else { @() }
-    ),
+    [AllowEmptyCollection()]
+    [string[]] $FeatureName = @(),
 
     [Parameter()]
     [switch] $List,
 
     [Parameter()]
     [AllowEmptyString()]
-    [string] $Filter = $(
-        if ($env:WINFEATURE_FILTER) { $env:WINFEATURE_FILTER } else { '*' }
-    ),
+    [string] $Filter = '',
 
     [Parameter()]
     [switch] $RemovePayload,
@@ -160,7 +230,13 @@ param(
     [switch] $IncludeParent,
 
     [Parameter()]
-    [switch] $Force
+    [switch] $Force,
+
+    # Anything the binder could not match. Without this an unknown argument is a
+    # binding error (exit 1); with it the run reports the typo and exits 2.
+    [Parameter(ValueFromRemainingArguments)]
+    [AllowEmptyCollection()]
+    [string[]] $ExtraArgument = @()
 )
 
 Set-StrictMode -Version 3.0
@@ -237,49 +313,6 @@ function ConvertTo-BooleanSetting {
         "$Source must be one of 1, true, yes, on, 0, false, no or off (case does not matter). Got: '$Value'.")
 }
 
-function ConvertTo-IntegerSetting {
-    <#
-    .SYNOPSIS
-        Converts a user-supplied numeric setting to a bounded integer.
-    .DESCRIPTION
-        Digits only, so '0x10', '+5', '5.0', '1e3' and '-1' are rejected with a
-        message naming the setting instead of a .NET parse exception. A
-        zero-padded value such as 08 is read as decimal 8, never as octal.
-    #>
-    [CmdletBinding()]
-    [OutputType([int])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string] $Source,
-
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string] $Value,
-
-        [Parameter(Mandatory)]
-        [int] $Minimum,
-
-        [Parameter(Mandatory)]
-        [int] $Maximum
-    )
-
-    $text = ''
-    if ($null -ne $Value) { $text = $Value.Trim() }
-
-    $number = 0
-    if ($text -notmatch '^[0-9]+$' -or -not [int]::TryParse($text, [ref] $number)) {
-        throw [ArgumentException]::new(
-            "$Source must be a whole number between $Minimum and $Maximum. Got: '$Value'.")
-    }
-    if ($number -lt $Minimum -or $number -gt $Maximum) {
-        throw [ArgumentException]::new(
-            "$Source must be between $Minimum and $Maximum. Got: '$Value'.")
-    }
-    return $number
-}
-
 function Resolve-BooleanSetting {
     <#
     .SYNOPSIS
@@ -308,14 +341,17 @@ function Resolve-BooleanSetting {
     return (ConvertTo-BooleanSetting -Source $EnvironmentName -Value $value)
 }
 
-function Resolve-IntegerSetting {
+function Resolve-ChoiceSetting {
     <#
     .SYNOPSIS
-        Resolves a numeric parameter, then the environment variable, then the
-        documented default, and validates whichever one supplied the value.
+        Resolves a parameter that accepts a fixed set of words, then the
+        environment variable, then the documented default.
+    .DESCRIPTION
+        Matching is case-insensitive and the canonical spelling is returned, so
+        'enable' and 'ENABLE' both come back as 'Enable'.
     #>
     [CmdletBinding()]
-    [OutputType([int])]
+    [OutputType([string])]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
@@ -331,22 +367,81 @@ function Resolve-IntegerSetting {
         [string] $EnvironmentName,
 
         [Parameter(Mandatory)]
-        [int] $Default,
+        [ValidateNotNullOrEmpty()]
+        [string[]] $Allowed,
 
         [Parameter(Mandatory)]
-        [int] $Minimum,
-
-        [Parameter(Mandatory)]
-        [int] $Maximum
+        [AllowEmptyString()]
+        [string] $Default
     )
 
+    $source = $EnvironmentName
+    $text = [Environment]::GetEnvironmentVariable($EnvironmentName)
     if ($ScriptBoundParameter.ContainsKey($Name)) {
-        return (ConvertTo-IntegerSetting -Source "-$Name" -Value $Value -Minimum $Minimum -Maximum $Maximum)
+        $source = "-$Name"
+        $text = $Value
     }
 
-    $fromEnvironment = [Environment]::GetEnvironmentVariable($EnvironmentName)
-    if ([string]::IsNullOrWhiteSpace($fromEnvironment)) { return $Default }
-    return (ConvertTo-IntegerSetting -Source $EnvironmentName -Value $fromEnvironment -Minimum $Minimum -Maximum $Maximum)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+
+    $trimmed = $text.Trim()
+    foreach ($choice in $Allowed) {
+        if ($trimmed -eq $choice) { return $choice }
+    }
+
+    throw [ArgumentException]::new(
+        "$source must be one of: $($Allowed -join ', '). Got: '$text'.")
+}
+
+function Resolve-ListSetting {
+    <#
+    .SYNOPSIS
+        Resolves a list-valued setting from a parameter, then a separated
+        environment variable, then an empty list.
+    .DESCRIPTION
+        Every element is also split on commas, so -FeatureName means the same
+        thing however the script was started. powershell.exe -File passes each
+        argument as one literal string: '-FeatureName A,B' arrives as the single
+        string 'A,B', and '-FeatureName A B' binds only A and lets B fall through
+        to another parameter. Splitting here makes the comma form correct in both
+        an interactive session and a scheduled task. A feature name never
+        contains a comma, so nothing legitimate is split.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Name,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [string[]] $Value,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $EnvironmentName
+    )
+
+    $raw = @()
+    if ($ScriptBoundParameter.ContainsKey($Name)) {
+        $raw = @($Value)
+    }
+    else {
+        $fromEnvironment = [Environment]::GetEnvironmentVariable($EnvironmentName)
+        if (-not [string]::IsNullOrWhiteSpace($fromEnvironment)) {
+            $raw = @($fromEnvironment -split ',')
+        }
+    }
+
+    # Cast, not just @(): the declared OutputType has to be the type actually
+    # returned, and an unconstrained array pipeline yields Object[].
+    return [string[]]@($raw |
+            Where-Object { $_ } |
+            ForEach-Object { $_ -split ',' } |
+            Where-Object { $_ -and $_.Trim() } |
+            ForEach-Object { $_.Trim() })
 }
 
 function Test-WindowsHost {
@@ -578,7 +673,7 @@ function Get-FeatureInventory {
 
     # Deliberately not wrapped in try/catch: an enumeration failure is not the
     # same as "no feature matched", and the caller has to be able to tell them
-    # apart so it can report exit code 2 instead of a successful empty list.
+    # apart so it can report a failure instead of a successful empty list.
     $feature = @(Get-WindowsOptionalFeature -Online -ErrorAction Stop)
 
     $feature |
@@ -673,6 +768,8 @@ function Set-FeatureState {
         }
     }
 
+    # A payload-removed feature is already disabled. Only a -RemovePayload disable
+    # of a still-payloaded feature has anything left to do here.
     if ($Operation -eq 'Disable' -and $previous -eq 'DisabledWithPayloadRemoved') {
         Write-Information -MessageData "$Name is already disabled and its payload is already removed; nothing to do."
         return [pscustomobject]@{
@@ -778,6 +875,65 @@ function Start-FeatureManagement {
     [OutputType([pscustomobject])]
     param()
 
+    # --- Usage (exit 2) ------------------------------------------------------
+    # Arguments and settings are checked before elevation deliberately: a typo
+    # must be discoverable from an ordinary shell, not only an elevated one.
+    if ($ExtraArgument.Count -gt 0) {
+        Write-Error -Message ("Unknown argument(s): {0}. Run 'Get-Help .\WindowsFeatures.ps1 -Full' for the parameters this script accepts." -f `
+            ($ExtraArgument -join ' ')) -ErrorAction Continue
+        $script:ExitCode = 2
+        return
+    }
+
+    if ($List.IsPresent -and $ScriptBoundParameter.ContainsKey('Action')) {
+        Write-Error -Message '-List and -Action contradict each other. -List only reports; drop one of them.' -ErrorAction Continue
+        $script:ExitCode = 2
+        return
+    }
+
+    $forced = $false
+    $withParent = $false
+    $withPayloadRemoval = $false
+    $actionName = ''
+    $requested = @()
+    try {
+        $forced = Resolve-BooleanSetting -Name 'Force' -Switch:$Force `
+            -EnvironmentName 'LZC_WINDOWSFEATURES_FORCE'
+        $withParent = Resolve-BooleanSetting -Name 'IncludeParent' `
+            -Switch:$IncludeParent -EnvironmentName 'LZC_WINDOWSFEATURES_INCLUDE_PARENT'
+        $withPayloadRemoval = Resolve-BooleanSetting -Name 'RemovePayload' `
+            -Switch:$RemovePayload -EnvironmentName 'LZC_WINDOWSFEATURES_REMOVE_PAYLOAD'
+        $actionName = Resolve-ChoiceSetting -Name 'Action' -Value $Action `
+            -EnvironmentName 'LZC_WINDOWSFEATURES_ACTION' `
+            -Allowed @('Enable', 'Disable') -Default ''
+        # @() around the call, not just inside it: PowerShell unrolls a returned
+        # array, so an empty result arrives as $null and Set-StrictMode then turns
+        # the .Count test below into a runtime error instead of a usage message.
+        $requested = @(Resolve-ListSetting -Name 'FeatureName' -Value $FeatureName `
+                -EnvironmentName 'LZC_WINDOWSFEATURES_NAMES')
+    }
+    catch [ArgumentException] {
+        Write-Error -Message $_.Exception.Message -ErrorAction Continue
+        $script:ExitCode = 2
+        return
+    }
+
+    $pattern = '*'
+    if ($ScriptBoundParameter.ContainsKey('Filter')) { $pattern = $Filter }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:LZC_WINDOWSFEATURES_FILTER)) {
+        $pattern = $env:LZC_WINDOWSFEATURES_FILTER
+    }
+    if ([string]::IsNullOrWhiteSpace($pattern)) { $pattern = '*' }
+
+    # Listing is the default: a run that names no action only reports.
+    $wantList = $List.IsPresent -or [string]::IsNullOrWhiteSpace($actionName)
+
+    if (-not $wantList -and $requested.Count -eq 0) {
+        Write-Error -Message "-Action $actionName needs -FeatureName (or LZC_WINDOWSFEATURES_NAMES). List the valid names with: Get-WindowsOptionalFeature -Online" -ErrorAction Continue
+        $script:ExitCode = 2
+        return
+    }
+
     # --- Platform and prerequisites (exit 3) ---------------------------------
     if (-not (Test-WindowsHost)) {
         Write-Error -Message 'This script manages Windows optional features and only runs on Windows.' -ErrorAction Continue
@@ -790,7 +946,7 @@ function Start-FeatureManagement {
         return
     }
     if (-not (Test-DismCmdletAvailable)) {
-        $script:ExitCode = 2
+        $script:ExitCode = 3
         return
     }
 
@@ -805,26 +961,25 @@ function Start-FeatureManagement {
     }
 
     # -Force means "do not prompt". Lowering $ConfirmPreference rather than
-    # short-circuiting ShouldProcess is what keeps -WhatIf authoritative.
-    if ((Resolve-BooleanSetting -Name 'Force' -Switch:$Force -EnvironmentName 'WINFEATURE_FORCE') -and
-        -not $ScriptBoundParameter.ContainsKey('Confirm')) {
+    # short-circuiting ShouldProcess is what keeps -WhatIf authoritative, so
+    # -Force -WhatIf still changes nothing.
+    if ($forced -and -not $ScriptBoundParameter.ContainsKey('Confirm')) {
         $ConfirmPreference = 'None'
     }
 
-    $wantList = $List.IsPresent -or [string]::IsNullOrWhiteSpace($Action)
     if ($wantList) {
         Write-Information -MessageData 'Read-only listing. Pass -Action Enable|Disable with -FeatureName to change a feature.'
         $inventory = @()
         try {
-            $inventory = @(Get-FeatureInventory -Pattern $Filter)
+            $inventory = @(Get-FeatureInventory -Pattern $pattern)
         }
         catch {
             Write-Error -Message "Could not enumerate optional features: $($_.Exception.Message)" -ErrorAction Continue
-            $script:ExitCode = 2
+            $script:ExitCode = 1
             return
         }
         if ($inventory.Count -eq 0) {
-            Write-Warning -Message "No optional feature matched '$Filter'."
+            Write-Warning -Message "No optional feature matched '$pattern'."
         }
         else {
             Write-Information -MessageData ('{0:N0} feature(s) matched.' -f $inventory.Count)
@@ -833,22 +988,10 @@ function Start-FeatureManagement {
         return
     }
 
-    $requested = @($FeatureName | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
-    if ($requested.Count -eq 0) {
-        Write-Error -Message "-Action $Action needs -FeatureName. List the valid names with: Get-WindowsOptionalFeature -Online" -ErrorAction Continue
-        $script:ExitCode = 2
-        return
-    }
-
-    $withParent = Resolve-BooleanSetting -Name 'IncludeParent' `
-        -Switch:$IncludeParent -EnvironmentName 'WINFEATURE_INCLUDE_PARENT'
-    $withPayloadRemoval = Resolve-BooleanSetting -Name 'RemovePayload' `
-        -Switch:$RemovePayload -EnvironmentName 'WINFEATURE_REMOVE_PAYLOAD'
-
-    if ($Action -eq 'Disable' -and $withPayloadRemoval) {
+    if ($actionName -eq 'Disable' -and $withPayloadRemoval) {
         Write-Warning -Message '-RemovePayload deletes the feature files from the image. Re-enabling will need Windows Update or an installation source.'
     }
-    if ($Action -eq 'Enable' -and $withParent) {
+    if ($actionName -eq 'Enable' -and $withParent) {
         Write-Warning -Message '-IncludeParent also enables every parent feature the named feature depends on, including ones you did not name.'
     }
 
@@ -859,7 +1002,7 @@ function Start-FeatureManagement {
     $willChange = -not $WhatIfPreference
 
     if ($willChange -and $ConfirmPreference -ne 'None' -and -not (Test-InteractiveHost)) {
-        Write-Error -Message 'Refused: changing a feature needs confirmation, there is no terminal to confirm on, and -Force was not given. Re-run with -Force (or set WINFEATURE_FORCE=1), or preview with -WhatIf.' -ErrorAction Continue
+        Write-Error -Message 'Refused: changing a feature needs confirmation, there is no terminal to confirm on, and -Force was not given. Re-run with -Force (or set LZC_WINDOWSFEATURES_FORCE=1), or preview with -WhatIf.' -ErrorAction Continue
         $script:ExitCode = 5
         return
     }
@@ -881,7 +1024,7 @@ function Start-FeatureManagement {
 
     $result = [System.Collections.Generic.List[object]]::new()
     foreach ($name in $requested) {
-        $result.Add((Set-FeatureState -Name $name -Operation $Action `
+        $result.Add((Set-FeatureState -Name $name -Operation $actionName `
                     -WithParent $withParent -WithPayloadRemoval $withPayloadRemoval))
     }
 
@@ -898,8 +1041,11 @@ function Start-FeatureManagement {
         $script:ExitCode = 1
     }
     elseif ($reboot.Count -gt 0) {
-        Write-Information -MessageData 'A restart is required to finish. Exit code 3010.'
-        $script:ExitCode = 3010
+        # The work succeeded, so this is exit 0. The pending restart is carried
+        # on the result objects (RestartNeeded = $true) instead of in a bespoke
+        # exit code such as 3010, because this repository allows one exit-code
+        # table and no script-specific additions to it.
+        Write-Information -MessageData 'A restart is required to finish. The run itself succeeded: exit code 0, RestartNeeded true.'
     }
 
     foreach ($item in $result) { $item }

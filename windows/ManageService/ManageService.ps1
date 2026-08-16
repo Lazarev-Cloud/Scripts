@@ -45,7 +45,7 @@
 
 .PARAMETER Name
     Exact service name (the short name, for example 'Spooler', not the display name).
-    Wildcards are rejected. Environment: LZC_MANAGESERVICE_NAME.
+    Wildcards, quotes and path separators are rejected. Environment: LZC_MANAGESERVICE_NAME.
 
 .PARAMETER Action
     Status   Read-only. Reports state, start type, and dependencies. Default, no elevation needed.
@@ -129,7 +129,10 @@ param(
     [ValidateLength(1, 256)]
     # Service names are limited to 256 chars and may not contain '/' or '\'. Wildcards are
     # excluded on purpose: Get-Service would happily expand 'w*' to every matching service.
-    [ValidatePattern('^[^\*\?/\\]+$')]
+    # Quotes are excluded because Get-ServiceDetail interpolates this value into a WQL -Filter
+    # string, where an embedded quote would terminate the literal early; rejecting the character
+    # here is the invariant that makes that call site safe.
+    [ValidatePattern('^[^\*\?/\\''"]+$')]
     [string] $Name,
 
     [Parameter(ParameterSetName = 'Run', Position = 1)]
@@ -532,9 +535,12 @@ function Invoke-Main {
             $script:ExitCode = 2
             throw 'A service name is required. Pass -Name <service> or set LZC_MANAGESERVICE_NAME.'
         }
-        if ($Name -match '[\*\?/\\]') {
+        # Kept character-for-character in step with the -Name ValidatePattern above. Two
+        # validation paths that disagree would let the environment variable carry input the
+        # parameter rejects, which is exactly the class of gap the pattern exists to close.
+        if ($Name -match '[\*\?/\\''"]') {
             $script:ExitCode = 2
-            throw "LZC_MANAGESERVICE_NAME must be an exact service name without wildcards, got '$Name'."
+            throw "LZC_MANAGESERVICE_NAME must be an exact service name without wildcards, quotes or path separators, got '$Name'."
         }
     }
     if (-not $ScriptBoundParameter.ContainsKey('Action')) {

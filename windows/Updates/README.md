@@ -35,6 +35,16 @@ Only `%SystemRoot%\SoftwareDistribution` (overridable with
 
 Safety properties:
 
+- **The directory is validated before anything is stopped or touched.** That one
+  value decides what gets deleted, and in `-ResetDataStore` mode what gets renamed
+  aside wholesale, so it is checked first. Refused with exit `2`:
+  - a drive root (`C:\`, `D:\`, ...);
+  - `%SystemRoot%`, `%SystemRoot%\System32`, `%SystemRoot%\SysWOW64`,
+    `%SystemRoot%\WinSxS`, `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramData%`,
+    `%SystemDrive%\Users`;
+  - anything that is not an existing directory;
+  - with `-ResetDataStore`, any directory whose name is not `SoftwareDistribution` —
+    renaming an arbitrary directory aside is not what that mode is for.
 - Nothing is stopped or deleted without passing `$PSCmdlet.ShouldProcess`, so
   `-WhatIf` is a complete dry run that changes nothing.
 - Services are restarted from a `finally` block. A failure part way through can never
@@ -50,6 +60,11 @@ Safety properties:
 - Service waits are bounded by `-ServiceTimeoutSeconds`; a service that will not stop
   is reported and the run continues, rather than hanging.
 - `BytesFreed` counts only files whose deletion returned without error.
+- A run that will change something holds a machine-wide named mutex
+  (`Global\lzc-updates`); a second run exits `75` instead of fighting over the same
+  services and directory. `-WhatIf` takes no lock, so a preview is never blocked.
+- A run that would prompt, on a host with no terminal to prompt on and without
+  `-Force`, is refused with exit `5` before any service is stopped.
 
 ## Deliberately not done
 
@@ -67,8 +82,18 @@ fix in a routine cache clear, so this script does none of them:
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7.x.
-- Administrator. Enforced by `#Requires -RunAsAdministrator`.
+- Windows. Any other platform exits `3`.
+- Windows PowerShell 5.1 or PowerShell 7.x. Older exits `3`.
+- Administrator; a non-elevated run exits `4`. Elevation is required even for
+  `-WhatIf`, because without it the cache cannot be measured and the service state
+  cannot be read, so the preview would be wrong.
+
+Elevation is checked at run time rather than with `#Requires -RunAsAdministrator`,
+which fails the script before it starts and exits `1`. The runtime check is what
+makes the documented exit `4` reachable.
+
+Arguments and `LZC_UPDATES_*` values are validated **before** the elevation check, so
+a typo can be found from an ordinary shell.
 
 ## Usage
 
@@ -93,17 +118,43 @@ Get-Help .\Clear-WindowsUpdateCache.ps1 -Full
 
 ## Parameters
 
+Every parameter has an environment variable, so the script can be driven entirely
+from the environment in a scheduled task. Every variable is named `LZC_UPDATES_*`, so
+`Get-ChildItem env:LZC_*` lists everything configurable in this repository.
+
 | Parameter | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `-SoftwareDistributionPath <string>` | `WU_CACHE_PATH` | `%SystemRoot%\SoftwareDistribution` | The directory to operate on. |
-| `-ServiceName <string[]>` | `WU_CACHE_SERVICES` (comma separated) | `wuauserv`, `bits` | Services to stop for the duration. These two hold the handles inside `Download`. Add `UsoSvc` if files remain locked. |
-| `-ServiceTimeoutSeconds <int>` | `WU_CACHE_SERVICE_TIMEOUT` | `60` | How long to wait for each service to reach the requested state. Range 5-3600. |
-| `-ResetDataStore` | `WU_CACHE_RESET_DATASTORE` | off | Rename the whole directory aside instead of clearing only `Download`. Discards update history. |
-| `-Force` | `WU_CACHE_FORCE` | off | Suppress confirmation prompts. Required for unattended runs. |
+| `-SoftwareDistributionPath <string>` | `LZC_UPDATES_PATH` | `%SystemRoot%\SoftwareDistribution` | The directory to operate on. Validated as described under Blast radius. |
+| `-ServiceName <string[]>` | `LZC_UPDATES_SERVICES` (comma separated) | `wuauserv`, `bits` | Services to stop for the duration. These two hold the handles inside `Download`. Add `UsoSvc` if files remain locked. A name that does not exist is reported and ignored. |
+| `-ServiceTimeoutSeconds <int>` | `LZC_UPDATES_SERVICE_TIMEOUT` | `60` | How long to wait for each service to reach the requested state. Range 5-3600. The bound is per service and per transition. |
+| `-ResetDataStore` | `LZC_UPDATES_RESET_DATASTORE` | off | Rename the whole directory aside instead of clearing only `Download`. Discards update history. |
+| `-Force` | `LZC_UPDATES_FORCE` | off | Suppress confirmation prompts. Required for unattended runs. |
 
-An explicitly passed switch always wins over its environment variable. `-WhatIf`,
-`-Confirm`, `-Verbose` and `-InformationAction` work as usual; `-WhatIf` takes
-precedence over `-Force`.
+An explicitly passed parameter always wins over its environment variable.
+
+Value rules, enforced with a clear message and exit `2` rather than a default or a
+crash:
+
+- **Booleans** (`LZC_UPDATES_RESET_DATASTORE`, `LZC_UPDATES_FORCE`) accept `1`,
+  `true`, `yes`, `on`, `0`, `false`, `no`, `off`, in any case. Anything else is a
+  usage error.
+- **Numbers** (`LZC_UPDATES_SERVICE_TIMEOUT`, `-ServiceTimeoutSeconds`) are digits
+  only, within the documented range. `0x10`, `+5`, `5.0` and `-1` are rejected; a
+  zero-padded value such as `08` is read as decimal `8`, never as octal.
+
+`NO_COLOR` (any non-empty value, per [no-color.org](https://no-color.org)) is
+honoured. The script emits no colour of its own — progress, warnings and errors go to
+PowerShell's streams and the host renders them — and on PowerShell 7 `NO_COLOR`
+additionally forces `$PSStyle.OutputRendering` to `PlainText` for the run.
+
+Standard PowerShell parameters also apply:
+
+| Parameter | Effect |
+| --- | --- |
+| `-WhatIf` | Full dry run. Takes precedence over `-Force`. |
+| `-Confirm` | Prompt before the stop-clear-restart operation. |
+| `-Verbose` | One line per file removed or skipped, and per service transition. |
+| `-InformationAction SilentlyContinue` | Quiet run. Progress goes to the information stream, which is on by default. |
 
 ## Output
 
@@ -118,22 +169,33 @@ One result object on the success stream:
 | `ItemsSkipped` | Files that could not be removed. |
 | `BytesMovedAside` / `BackupPath` | `ResetDataStore` only: how much was renamed aside, and to where. |
 | `ServiceStopped` / `ServiceRestarted` | The services that were running when the run started (so the script owns restoring them), and the ones it brought back. Compare them: if they differ, a service did not restart and a warning names it. |
-| `Status` | `Success`, `Partial`, `Failed`, `NothingToDo` or `Skipped`. |
+| `Status` | `Success`, `Partial`, `Failed`, `NothingToDo` or `Skipped` (`-WhatIf`, or declined at the prompt). |
 
 ## Exit codes
 
-| Code | Meaning |
+The repository-wide table. Every script in this repository uses these numbers and no
+others.
+
+| Code | Meaning here |
 | --- | --- |
 | `0` | The cache was cleared and every stopped service was restarted. |
-| `1` | The clear was partial, or a service failed to stop or restart. |
-| `2` | Usage or precondition failure: the cache directory does not exist. |
+| `1` | The work ran but part of it failed: a partial clear, or a service that would not stop or restart. |
+| `2` | Usage error: an unknown argument, or an invalid parameter or `LZC_UPDATES_*` value — including a cache directory that does not exist, is a drive root, is a protected system directory, or is not named `SoftwareDistribution` while `-ResetDataStore` is in use. |
+| `3` | Not Windows, or PowerShell older than 5.1. |
+| `4` | Not running as Administrator. |
+| `5` | Refused: the run needs confirmation, there is no terminal to confirm on, and neither `-Force` nor `-Confirm:$false` was given. |
+| `75` | Another instance holds `Global\lzc-updates` (`EX_TEMPFAIL`: retry later, not a fault). |
+| `130` | Interrupted (Ctrl-C or cancellation). Services stopped by the run are restarted before it unwinds. |
+
+A scheduled task should treat `75` as "retry later", not as a failure. See the
+[repo-wide table](../../docs/exit-codes.md).
 
 Some updates need a restart before Windows Update behaves normally again. This script
 never reboots and never asks Windows to reboot.
 
 ## Scheduled task
 
-Use `-File`, never `-Command`.
+Use `-File`, never `-Command`. `-Command` collapses the exit code to 0 or 1.
 
 ```
 Program:   C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
@@ -141,8 +203,21 @@ Arguments: -NoProfile -NonInteractive -ExecutionPolicy Bypass
            -File "C:\Scripts\windows\Updates\Clear-WindowsUpdateCache.ps1" -Force
 ```
 
-When passing `-ServiceName` through `-File`, list the values space separated
-(`-ServiceName wuauserv bits UsoSvc`), not comma separated; `-File` binds array
-parameters from separate tokens. The comma form shown in the examples above is for
-interactive use. Alternatively set `WU_CACHE_SERVICES=wuauserv,bits,UsoSvc` in the
-environment, which takes a comma-separated list either way.
+`-NoProfile` is not optional: a user profile that changes `$ErrorActionPreference` or
+defines aliases would change how the script behaves.
+
+`-Force` is not optional either. Without it the task has nothing to confirm on and the
+run is refused with exit `5`; set `LZC_UPDATES_FORCE=1` if you prefer to carry it in
+the environment.
+
+**Passing several services through `-File`: use the comma form, in one token.**
+`powershell.exe -File` hands each argument to the script as one literal string, so
+`-ServiceName wuauserv,bits,UsoSvc` arrives as the single string
+`wuauserv,bits,UsoSvc` — which this script splits on commas, so it does the right
+thing. The space-separated form is silently wrong: `-ServiceName wuauserv bits` binds
+only `wuauserv`, and `bits` falls through to the positional
+`-SoftwareDistributionPath`, so the run then fails on a cache directory called
+`bits`.
+
+`LZC_UPDATES_SERVICES=wuauserv,bits,UsoSvc` works the same way and is the tidier
+choice when the task already carries other settings in the environment.

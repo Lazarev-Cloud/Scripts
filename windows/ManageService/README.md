@@ -17,8 +17,11 @@ Stopping or restarting a service interrupts everything that depends on it.
 
 ## Safety behaviour
 
-**Exact names only.** Wildcards are rejected. `Get-Service -Name 'w*'` would match dozens of
-services; a typo here cannot fan out.
+**Exact names only.** Wildcards, quotes and path separators are rejected.
+`Get-Service -Name 'w*'` would match dozens of services; a typo here cannot fan out. Quotes are
+refused because the name is interpolated into a WQL `-Filter` when reading `Win32_Service`, and
+an embedded quote would end the literal early. No real Windows service name contains one, so
+nothing legitimate is excluded.
 
 **Dependents are named before they are stopped.** Running dependent services are enumerated and
 listed. If any exist, the stop requires `-Force`, because that is what actually cascades — and
@@ -62,7 +65,7 @@ to list them.
 
 | Parameter | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `-Name` | `LZC_MANAGESERVICE_NAME` | — | Exact service name. Wildcards rejected. Required |
+| `-Name` | `LZC_MANAGESERVICE_NAME` | — | Exact service name. Wildcards, quotes and path separators rejected. Required |
 | `-Action` | `LZC_MANAGESERVICE_ACTION` | `Status` | `Status`, `Start`, `Stop`, `Restart` |
 | `-TimeoutSeconds` | `LZC_MANAGESERVICE_TIMEOUT_SECONDS` | `60` | Wait for the target state, 5-600. See below |
 | `-ProtectedService` | `LZC_MANAGESERVICE_PROTECTED_SERVICES` | see list above | Replaces the protected list. Env var is comma separated |

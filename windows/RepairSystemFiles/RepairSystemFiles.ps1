@@ -160,6 +160,13 @@
     that key on 3010 must read the result objects instead: any object whose
     Status is RebootRequired means a restart finishes the work.
 
+    Dism.exe and sfc.exe are always called by absolute path, never by bare name,
+    because PATH is influenceable. On a 64-bit Windows that path goes through
+    Sysnative rather than System32 whenever this script runs in a 32-bit
+    PowerShell (some RMM agents and task-scheduler entries still do): WOW64
+    redirects System32 to SysWOW64 for a 32-bit process, and the 32-bit DISM
+    refuses to service a running 64-bit operating system.
+
     Log files, which hold far more detail than the console:
       $env:SystemRoot\Logs\CBS\CBS.log     SFC and servicing detail
       $env:SystemRoot\Logs\DISM\dism.log   DISM detail
@@ -616,6 +623,14 @@ function Get-ToolPath {
     .DESCRIPTION
         Always absolute, never a bare name: PATH is influenceable and differs
         between Windows PowerShell and PowerShell 7.
+
+        On a 64-bit Windows the directory is Sysnative rather than System32
+        whenever this process is 32-bit. WOW64 redirects System32 to SysWOW64 for
+        a 32-bit process, and the 32-bit DISM cannot service a 64-bit online
+        image: it fails with "DISM does not support servicing a running 64-bit
+        operating system with a 32-bit version of DISM". Sysnative is the
+        redirection-free door to the real System32 and exists only for 32-bit
+        processes, which is why it is selected rather than tested for first.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -625,7 +640,13 @@ function Get-ToolPath {
         [string] $FileName
     )
 
-    $candidate = Join-Path -Path (Join-Path -Path $env:SystemRoot -ChildPath 'System32') -ChildPath $FileName
+    $systemDirectory = 'System32'
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        $systemDirectory = 'Sysnative'
+        Write-Verbose -Message "32-bit process on 64-bit Windows: resolving $FileName through Sysnative to avoid the 32-bit copy."
+    }
+
+    $candidate = Join-Path -Path (Join-Path -Path $env:SystemRoot -ChildPath $systemDirectory) -ChildPath $FileName
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
 
     Write-Warning -Message "Executable not found: $candidate"
@@ -687,7 +708,7 @@ function Invoke-NativeTool {
         [string] $Operation,
 
         [Parameter(Mandatory)]
-        [ValidateRange(0, 1440)]
+        [ValidateRange(1, 1440)]
         [int] $TimeoutMinute
     )
 
@@ -720,16 +741,15 @@ function Invoke-NativeTool {
         # come back null after a timed WaitForExit.
         $null = $process.Handle
 
-        if ($TimeoutMinute -gt 0) {
-            if (-not $process.WaitForExit([int]([TimeSpan]::FromMinutes($TimeoutMinute).TotalMilliseconds))) {
-                $timedOut = $true
-                Write-Warning -Message "$Operation exceeded $TimeoutMinute minute(s); terminating it."
-                try { $process.Kill() } catch { Write-Warning -Message "Could not terminate the process: $($_.Exception.Message)" }
-                $null = $process.WaitForExit(30000)
-            }
-        }
-        else {
-            $process.WaitForExit()
+        # Always bounded. There is deliberately no "wait forever" branch: an
+        # unbounded WaitForExit is exactly the hang this timeout exists to
+        # prevent, and a code path that can only be reached by weakening the
+        # validation above is a path that will eventually be reached.
+        if (-not $process.WaitForExit([int]([TimeSpan]::FromMinutes($TimeoutMinute).TotalMilliseconds))) {
+            $timedOut = $true
+            Write-Warning -Message "$Operation exceeded $TimeoutMinute minute(s); terminating it."
+            try { $process.Kill() } catch { Write-Warning -Message "Could not terminate the process: $($_.Exception.Message)" }
+            $null = $process.WaitForExit(30000)
         }
 
         if (-not $timedOut) { $exitCode = $process.ExitCode }
@@ -831,7 +851,7 @@ function Invoke-DismStage {
         [string] $Operation,
 
         [Parameter(Mandatory)]
-        [ValidateRange(0, 1440)]
+        [ValidateRange(1, 1440)]
         [int] $TimeoutMinute,
 
         [Parameter()]
@@ -944,7 +964,7 @@ function Invoke-SfcStage {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateRange(0, 1440)]
+        [ValidateRange(1, 1440)]
         [int] $TimeoutMinute
     )
 

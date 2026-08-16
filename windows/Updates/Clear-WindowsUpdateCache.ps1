@@ -39,6 +39,16 @@
         service providers and breaks VPN and endpoint-security products.
 
     Safety properties:
+      * The directory to operate on is validated before anything is stopped or
+        touched. A path that is not fully qualified (a drive-relative 'C:' or
+        'C:temp', which resolves against the process working directory rather
+        than the drive root), a drive root, a protected system directory
+        ($env:SystemRoot, System32, SysWOW64, WinSxS, $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}, $env:ProgramData, $env:SystemDrive\Users) and
+        anything that is not an existing directory are refused with exit 2.
+        -ResetDataStore additionally
+        refuses any directory not named SoftwareDistribution, because renaming an
+        arbitrary directory aside is not what that mode is for.
       * Nothing is stopped or deleted without passing $PSCmdlet.ShouldProcess, so
         -WhatIf produces a complete dry run and changes nothing.
       * Services are restarted from a finally block, so a failure part way through
@@ -58,16 +68,21 @@
     an unusable value is a usage error (exit 2) rather than a silent default.
 
 .PARAMETER SoftwareDistributionPath
-    The SoftwareDistribution directory. Defaults to
-    $env:SystemRoot\SoftwareDistribution. Environment variable:
-    LZC_UPDATES_PATH.
+    The SoftwareDistribution directory. Must be fully qualified
+    ('C:\Windows\SoftwareDistribution', not 'C:' or 'C:temp'). Defaults to
+    $env:SystemRoot\SoftwareDistribution. A drive root, a protected system
+    directory and a path that is not an existing directory are refused with exit
+    2; with -ResetDataStore the directory must also be named
+    SoftwareDistribution. Environment variable: LZC_UPDATES_PATH.
 
 .PARAMETER ServiceName
     Services to stop for the duration of the operation. Defaults to wuauserv and
     bits, which are the two that hold handles in Download. Add UsoSvc if files
     remain locked on Windows 10 and 11. A name that does not exist on this system
-    is reported and ignored rather than treated as a failure. Environment
-    variable: LZC_UPDATES_SERVICES (comma separated).
+    is reported and ignored rather than treated as a failure. A comma-separated
+    list is accepted as one value ('wuauserv,bits'), which is the form that also
+    works through powershell.exe -File. Environment variable:
+    LZC_UPDATES_SERVICES (comma separated).
 
 .PARAMETER ServiceTimeoutSeconds
     How long to wait for each service to reach the requested state before giving
@@ -123,8 +138,10 @@
       1     the work ran but something in it failed: a partial clear, or a
             service that would not stop or restart
       2     usage error: an unknown argument, or a parameter or LZC_UPDATES_*
-            value that is missing or invalid (including a cache directory that
-            does not exist)
+            value that is missing or invalid, including a cache directory that
+            is not fully qualified, does not exist, is a drive root, is a
+            protected system directory, or is not named SoftwareDistribution
+            while -ResetDataStore is in use
       3     unsupported platform or missing prerequisite (not Windows, or
             PowerShell older than 5.1)
       4     not running as Administrator
@@ -566,6 +583,103 @@ function Get-DirectorySize {
     }
 }
 
+function Resolve-CacheRoot {
+    <#
+    .SYNOPSIS
+        Validates the requested cache directory and returns its canonical path.
+    .DESCRIPTION
+        -SoftwareDistributionPath and LZC_UPDATES_PATH point a delete (default
+        mode) or a whole-directory rename (-ResetDataStore) at whatever they name,
+        so an unchecked value is the largest blast radius this script has. A typo
+        such as LZC_UPDATES_PATH=C:\Windows would otherwise send Rename-Item at
+        the Windows directory itself.
+
+        Refused: a drive root, a protected system directory, and anything that is
+        not an existing directory. -ResetDataStore is refused for any directory
+        not named SoftwareDistribution as well, because renaming an arbitrary
+        directory aside is not what that mode is for.
+
+        Throws ArgumentException naming the setting, which the caller reports as
+        the documented usage error, exit 2.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Source,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Candidate,
+
+        [Parameter(Mandatory)]
+        [bool] $ForReset
+    )
+
+    $expanded = ''
+    if ($null -ne $Candidate) { $expanded = [Environment]::ExpandEnvironmentVariables($Candidate).Trim() }
+    if ([string]::IsNullOrWhiteSpace($expanded)) {
+        throw [ArgumentException]::new("$Source is empty. Give the SoftwareDistribution directory to operate on.")
+    }
+
+    # Only a fully qualified path names one directory unambiguously, and every
+    # check below is applied to the RESOLVED path, so an ambiguous one silently
+    # moves the target. 'C:' and 'C:temp' are drive-RELATIVE: .NET resolves them
+    # against the per-drive current directory, so [IO.Path]::GetFullPath('C:')
+    # returns this process's working directory rather than the drive root. The
+    # drive-root guard below would then compare the wrong directory, pass, and
+    # aim the delete -- or, with -ResetDataStore, the rename -- at wherever the
+    # process happened to be running. A leading '\' is resolved against the
+    # current drive for the same reason. Checked on the string the user supplied,
+    # before GetFullPath erases the distinction.
+    if ($expanded -notmatch '^([A-Za-z]:[\\/]|\\\\)') {
+        throw [ArgumentException]::new(
+            "$Source must be a fully qualified path such as 'C:\Windows\SoftwareDistribution'. A drive-relative path like 'C:' or 'C:temp' resolves against this process's working directory, not the drive root. Got: '$expanded'.")
+    }
+
+    $full = $null
+    try {
+        $full = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+    }
+    catch {
+        throw [ArgumentException]::new("$Source is not a valid filesystem path: '$expanded'. $($_.Exception.Message)")
+    }
+
+    $driveRoot = [IO.Path]::GetPathRoot($full).TrimEnd('\')
+    if ($full -eq $driveRoot) {
+        throw [ArgumentException]::new("$Source must not be a drive root: '$full'.")
+    }
+
+    $protected = @(
+        $env:SystemRoot
+        (Join-Path -Path $env:SystemRoot -ChildPath 'System32')
+        (Join-Path -Path $env:SystemRoot -ChildPath 'SysWOW64')
+        (Join-Path -Path $env:SystemRoot -ChildPath 'WinSxS')
+        $env:ProgramFiles
+        ${env:ProgramFiles(x86)}
+        $env:ProgramData
+        (Join-Path -Path $env:SystemDrive -ChildPath 'Users')
+    ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+
+    foreach ($entry in $protected) {
+        if ($full -eq $entry) {
+            throw [ArgumentException]::new("$Source must not be a protected system directory: '$full'.")
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        throw [ArgumentException]::new("'$full' is not an existing directory. Set -SoftwareDistributionPath or LZC_UPDATES_PATH.")
+    }
+
+    if ($ForReset -and (Split-Path -Path $full -Leaf) -ne 'SoftwareDistribution') {
+        throw [ArgumentException]::new(
+            "-ResetDataStore renames the whole directory aside and is only correct for a Windows Update data store, but $Source names '$full'. Drop -ResetDataStore to clear only the download cache.")
+    }
+
+    return $full
+}
+
 function Get-ServiceStopPlan {
     <#
     .SYNOPSIS
@@ -836,19 +950,17 @@ function Start-CacheClear {
     }
 
     $requestedPath = ''
+    $pathSource = 'the built-in default'
     if ($ScriptBoundParameter.ContainsKey('SoftwareDistributionPath')) {
         $requestedPath = $SoftwareDistributionPath
+        $pathSource = '-SoftwareDistributionPath'
     }
     elseif (-not [string]::IsNullOrWhiteSpace($env:LZC_UPDATES_PATH)) {
         $requestedPath = $env:LZC_UPDATES_PATH
+        $pathSource = 'LZC_UPDATES_PATH'
     }
     else {
         $requestedPath = Join-Path -Path $env:SystemRoot -ChildPath 'SoftwareDistribution'
-    }
-    if ([string]::IsNullOrWhiteSpace($requestedPath)) {
-        Write-Error -Message 'No cache directory was supplied. Use -SoftwareDistributionPath or set LZC_UPDATES_PATH.' -ErrorAction Continue
-        $script:ExitCode = 2
-        return
     }
 
     $serviceList = @()
@@ -856,21 +968,37 @@ function Start-CacheClear {
         $serviceList = @($ServiceName)
     }
     elseif (-not [string]::IsNullOrWhiteSpace($env:LZC_UPDATES_SERVICES)) {
-        $serviceList = @($env:LZC_UPDATES_SERVICES -split ',')
+        $serviceList = @($env:LZC_UPDATES_SERVICES)
     }
     else {
         $serviceList = @('wuauserv', 'bits')
     }
-    $serviceList = @($serviceList | Where-Object { $_ -and $_.Trim() })
+    # Split on commas whatever the source. powershell.exe -File passes each
+    # argument as one literal string, so '-ServiceName wuauserv,bits' arrives as
+    # the single string 'wuauserv,bits'; and '-ServiceName wuauserv bits' binds
+    # only the first, letting 'bits' fall through to the positional
+    # -SoftwareDistributionPath. Splitting here makes the comma form mean the same
+    # thing interactively, from -File and from the environment variable. A service
+    # name never contains a comma, so nothing legitimate is split.
+    $serviceList = @($serviceList |
+            Where-Object { $_ } |
+            ForEach-Object { $_ -split ',' } |
+            Where-Object { $_ -and $_.Trim() } |
+            ForEach-Object { $_.Trim() })
     if ($serviceList.Count -eq 0) {
         Write-Error -Message 'No service was supplied. Use -ServiceName or set LZC_UPDATES_SERVICES.' -ErrorAction Continue
         $script:ExitCode = 2
         return
     }
 
-    $root = [Environment]::ExpandEnvironmentVariables($requestedPath).TrimEnd('\')
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        Write-Error -Message "'$root' is not an existing directory. Set -SoftwareDistributionPath or LZC_UPDATES_PATH." -ErrorAction Continue
+    # Validated before anything is stopped or renamed: this one value decides what
+    # gets deleted, and in -ResetDataStore mode what gets renamed aside wholesale.
+    $root = ''
+    try {
+        $root = Resolve-CacheRoot -Source $pathSource -Candidate $requestedPath -ForReset $fullReset
+    }
+    catch [ArgumentException] {
+        Write-Error -Message $_.Exception.Message -ErrorAction Continue
         $script:ExitCode = 2
         return
     }

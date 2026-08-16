@@ -60,6 +60,10 @@ which stops the services first.
   `-WhatIf`, because without it `%SystemRoot%\Temp` cannot be enumerated and the
   preview would under-report what it would delete.
 
+Elevation is checked at run time rather than with `#Requires -RunAsAdministrator`,
+which fails the script before it starts and exits `1`. The runtime check is what
+makes the documented exit `4` reachable.
+
 Arguments and `LZC_CLEAN_DISK_*` values are validated **before** the elevation
 check, so a typo can be found from an ordinary shell.
 
@@ -174,6 +178,19 @@ or defines aliases would change how the script behaves.
 the run is refused with exit `5`; set `LZC_CLEAN_DISK_FORCE=1` if you prefer to
 carry it in the environment.
 
-When passing `-Path` through `-File`, list the values space separated
-(`-Path C:\a C:\b`), not comma separated. `-File` binds array parameters from
-separate tokens.
+**Passing several directories through `-File`: use the environment variable.**
+`powershell.exe -File` hands each argument to the script as one literal string, so
+neither `-Path C:\a C:\b` nor `-Path C:\a,C:\b` does what it looks like: the first
+binds only `C:\a` and lets `C:\b` fall through to the unknown-argument catch-all
+(exit `2`), and the second arrives as a single path named `C:\a,C:\b`. A comma or a
+semicolon is legal in a Windows directory name, so `-Path` is deliberately not split
+on either.
+
+Pass one `-Path` on the command line, or set
+`LZC_CLEAN_DISK_PATHS=C:\a;C:\b` in the task's environment, which is split on
+semicolons.
+
+In an **interactive** PowerShell session the comma form `-Path C:\a,C:\b` does work,
+because there the PowerShell parser itself builds the array before the script is
+called. The space-separated form `-Path C:\a C:\b` works in neither host: `C:\b`
+falls through to the unknown-argument catch-all and the run is refused with exit `2`.
