@@ -12,18 +12,41 @@ pass `--yes`. `-n`/`--dry-run` forces report-only.
 
 | Folder | What it does | Env prefix |
 | --- | --- | --- |
-| [`update_upgrade/`](update_upgrade/) | Refreshes APT indexes, upgrades packages non-interactively, and reports follow-up work: pending reboot, conffile drift, held packages. Debian/Ubuntu. | `APT_UPGRADE_` |
-| [`fix_broken_packages/`](fix_broken_packages/) | Repairs a half-finished dpkg transaction or unsatisfied dependencies, then verifies the system is actually consistent again. Debian/Ubuntu. | `APT_REPAIR_` |
-| [`fix_apt_lock/`](fix_apt_lock/) | Diagnoses a stuck `Could not get lock /var/lib/dpkg/lock-frontend` and clears the lock **only** when no process holds it. Can run `dpkg --configure -a` afterwards. | `FIX_APT_LOCK_` |
-| [`fix_dnf_lock/`](fix_dnf_lock/) | The same doctor for dnf/yum: diagnoses `Waiting for process with pid NNNN`, clears a lock only when nothing holds it. | `FIX_DNF_LOCK_` |
-| [`clean_logs/`](clean_logs/) | Deletes rotated log archives older than a cutoff and vacuums the systemd journal. Can also truncate oversized live logs (off by default). | `CLEAN_LOGS_` |
-| [`fix_permissions/`](fix_permissions/) | Repairs ownership and permissions inside a single user's home directory, never following symlinks out of it. | `FIXPERMS_` |
-| [`network_restart/`](network_restart/) | Restarts one interface and verifies it came back, with an armed rollback so a failed bounce recovers without console access. Refuses to bounce the interface carrying your SSH session unless forced. | `NET_RESTART_` |
-| [`maintenance/`](maintenance/) | Runs named maintenance tasks on Debian/Ubuntu and RHEL-family hosts. With no task it produces a read-only health report. | `MAINT_` |
-| [`proxmox/ve/`](proxmox/ve/) | Updates the packages inside every LXC container on a Proxmox VE node, or across a whole cluster over SSH. | `LXC_UPDATER_` |
+| [`update_upgrade/`](update_upgrade/) | Refreshes APT indexes, upgrades packages non-interactively, and reports follow-up work: pending reboot, conffile drift, held packages. Debian/Ubuntu. | `LZC_UPDATE_UPGRADE_` |
+| [`fix_broken_packages/`](fix_broken_packages/) | Repairs a half-finished dpkg transaction or unsatisfied dependencies, then verifies the system is actually consistent again. Debian/Ubuntu. | `LZC_FIX_BROKEN_PACKAGES_` |
+| [`fix_apt_lock/`](fix_apt_lock/) | Diagnoses a stuck `Could not get lock /var/lib/dpkg/lock-frontend` and clears the lock **only** when no process holds it. Can run `dpkg --configure -a` afterwards. | `LZC_FIX_APT_LOCK_` |
+| [`fix_dnf_lock/`](fix_dnf_lock/) | The same doctor for dnf/yum: diagnoses `Waiting for process with pid NNNN`, clears a lock only when nothing holds it. | `LZC_FIX_DNF_LOCK_` |
+| [`clean_logs/`](clean_logs/) | Deletes rotated log archives older than a cutoff and vacuums the systemd journal. Can also truncate oversized live logs (off by default). | `LZC_CLEAN_LOGS_` |
+| [`fix_permissions/`](fix_permissions/) | Repairs ownership and permissions inside a single user's home directory, never following symlinks out of it. | `LZC_FIX_PERMISSIONS_` |
+| [`network_restart/`](network_restart/) | Restarts one interface and verifies it came back, with an armed rollback so a failed bounce recovers without console access. Refuses to bounce the interface carrying your SSH session unless forced. | `LZC_NETWORK_RESTART_` |
+| [`maintenance/`](maintenance/) | Runs named maintenance tasks on Debian/Ubuntu and RHEL-family hosts. With no task it produces a read-only health report. | `LZC_MAINTENANCE_` |
+| [`proxmox/ve/`](proxmox/ve/) | Updates the packages inside every LXC container on a Proxmox VE node, or across a whole cluster over SSH. | `LZC_UPDATE_LXCS_` |
 
 `maintenance/` tasks: `report`, `update`, `autoremove`, `clean-cache`,
 `clean-logs`, `clean-tmp`, `fix-packages`, `fix-locks`, `routine`.
+
+Every flag has an `LZC_<SCRIPT>_<SETTING>` environment variable, which is the
+practical route when piping a script in over `curl`. `--dry-run` and `--color`
+are the exceptions — every script has both flags, but not every script exposes
+them as variables. `--color` has one in `fix_apt_lock`, `fix_dnf_lock`,
+`fix_permissions` and `maintenance`; `--dry-run` has one in the first two and
+`maintenance`, while `fix_permissions` inverts it as
+`LZC_FIX_PERMISSIONS_APPLY`.
+
+## Installing them
+
+[`../install.sh`](../install.sh) copies these scripts to `PREFIX/sbin` (default
+`/usr/local`) as `lzc-*` commands — `lzc-update-upgrade`, `lzc-clean-logs`,
+`lzc-update-lxcs` and so on — along with the shared library and bash
+completion. It only copies files already on the machine; it never downloads
+anything. `--uninstall` removes what it created.
+
+## Exit codes
+
+The [repo-wide table](../docs/exit-codes.md) applies to all of them: `0`
+success, `1` partial failure, `2` usage, `3` unsupported platform or missing
+prerequisite, `4` not root, `5` refused for want of confirmation, `75` another
+instance holds the lock, `130` interrupted.
 
 ## Why the lock scripts are not `rm`
 

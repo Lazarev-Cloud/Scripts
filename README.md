@@ -10,7 +10,8 @@ variables, exit codes and blast radius.
 ├── windows/     # PowerShell utilities (10 script folders)
 ├── monitoring/  # Prometheus host-metrics exporter and its installer
 ├── lib/         # Shared Bash library (optional log/metric shipping)
-└── docs/        # Conventions common to every script
+├── docs/        # Conventions common to every script
+└── install.sh   # Installs the Linux scripts as lzc-* commands
 ```
 
 - [linux/README.md](linux/README.md) — Linux scripts
@@ -29,7 +30,14 @@ authoritative reference for that script — flags, environment variables, exit
 codes and exactly what it touches.
 
 Scripts run unattended from cron or Task Scheduler: they detect a missing
-terminal and refuse to prompt rather than hanging.
+terminal and refuse to prompt rather than hanging. Every flag also has an
+environment variable named `LZC_<SCRIPT>_<SETTING>`, which is how you configure
+a script piped in over `curl` or driven from Intune. All of them report the
+same [exit codes](docs/exit-codes.md).
+
+`./install.sh` copies the Linux scripts to `/usr/local/sbin` as `lzc-*`
+commands with bash completion; `--uninstall` removes them again. It only copies
+files already on the machine and never downloads anything.
 
 ## Quality bar
 

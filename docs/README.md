@@ -41,16 +41,21 @@ These hold across the Bash scripts:
   `network_restart` never prompt at all — they simply do nothing without
   `--yes`. Either way they are safe to run from cron.
 - **Most flags have an environment variable**, which is the practical route
-  when piping a script in over `curl`. The prefix is per-script; see its
-  README. `--dry-run` and `--color` are the usual exceptions — only some
-  scripts expose those two as variables.
+  when piping a script in over `curl`. Every one is named
+  `LZC_<SCRIPT>_<SETTING>`; the exact prefix is in the script's README.
+  `--dry-run` and `--color` are the exceptions — every script has both flags,
+  but only some expose them as variables.
 - **stdout is the report, stderr is problems.** Colour only when stdout is a
-  terminal, and `--color never` disables it everywhere.
+  terminal, and `--color never` disables it everywhere. `NO_COLOR` is honoured.
 - **The slow, blocking calls run under `timeout`** — package transactions,
   `journalctl`, `du`, probes into a container. Local helpers such as `find`,
   `rm` and `sleep` generally are not wrapped.
-- **Concurrent runs are refused** via `flock`, not queued — except
-  `fix_permissions` and `network_restart`, which take no lock.
+- **Concurrent runs are refused** via `flock`, not queued: a run that loses the
+  race exits `75` and changes nothing. Every script that touches the system
+  takes a lock, and the path is overridable — with its `_LOCK` variable, or
+  `_SELF_LOCK` in the two lock doctors, where the name distinguishes the
+  script's own lock from the package-manager lock it is inspecting.
+  `install.sh` is the exception — it takes no lock.
 - **`main "$@"` is the last line of every executable script**, so a truncated
   download never executes a partial program. (`lib/lzc-obs.sh` is a sourced
   library and defines functions only.)
@@ -59,24 +64,24 @@ PowerShell scripts use the platform equivalents: `SupportsShouldProcess`, so
 `-WhatIf` previews and `-Confirm`/`-Force` gate the change; they are read-only
 until told otherwise, and they refuse rather than prompt when non-interactive.
 
-## Exit codes differ between scripts
+## Exit codes
 
-There is no single repo-wide exit-code table. `0` always means success and `2`
-is usually a usage error, but the rest is per-script — the same number does
-not mean the same thing everywhere. Notably:
+One table covers the whole repository — see [exit-codes.md](exit-codes.md).
+`0` success, `1` partial failure, `2` usage error, `3` unsupported platform or
+missing prerequisite, `4` must be root, `5` refused for want of confirmation,
+`75` another instance holds the lock, `130` interrupted. A wrapper can treat
+every script identically.
 
-- "no terminal and no `--yes`" is `4` in `fix_apt_lock`, `fix_dnf_lock`,
-  `fix_permissions` and `maintenance`, but `2` in `fix_broken_packages` and
-  `update_upgrade`.
-- "root required" is `5` in `fix_broken_packages` and `update_upgrade`, `3` in
-  `fix_permissions`, and `2` in `clean_logs` and `network_restart`.
-- `4` means "not an APT system" in the two APT scripts, but "installed and the
-  service did not serve /metrics" in the exporter installer.
-- Lock contention is `75` (`EX_TEMPFAIL`) in most scripts; the Proxmox updater
-  exits `1`.
+Two things to know before wiring one into alerting:
 
-Read the `Exit status` section of the script's `--help` before wiring one into
-alerting.
+- **`75` is not a fault.** Another copy was already doing the work. Retry
+  later; do not page on it.
+- **`ResetNetwork.ps1` also returns `3010`** when a reset needs a reboot to
+  finish. It is the only script in the repo that returns a code outside the
+  table, and both its `.NOTES` and its README say so.
+
+The `Exit status` section of each script's `--help` lists what that particular
+script means by each code.
 
 ## Running from the network
 
