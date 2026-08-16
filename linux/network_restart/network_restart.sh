@@ -385,6 +385,41 @@ iface_master() {
     ip -o link show dev "$1" 2>/dev/null | sed -n 's/.* master \([^ ]*\).*/\1/p' | head -n 1
 }
 
+# The device this one sits on top of, which is NOT the same relationship as
+# `master`. A VLAN or macvlan child is not enslaved to anything -- it has no
+# master at all -- and iproute2 renders the link in the device name instead:
+# "vmbr0.100@vmbr0". Walking only masters therefore cannot see the single most
+# common Proxmox layout, where the management address lives on a VLAN child of
+# the bridge whose port is the physical NIC.
+#
+# veth and some tunnels print "@if12", an ifindex rather than a name, and for a
+# veth the peer usually lives in another namespace. Resolve what is resolvable
+# here and report nothing for the rest: a parent that cannot be named is not a
+# parent this script can reason about, and inventing one would be worse than
+# admitting the gap.
+iface_parent() {
+    local field raw parent idx path
+    field=$(ip -o link show dev "$1" 2>/dev/null | awk '{ print $2 }') || return 0
+    raw=${field%:}
+    [[ $raw == *@* ]] || return 0
+    parent=${raw##*@}
+    [[ -n $parent ]] || return 0
+
+    if [[ $parent =~ ^if([0-9]+)$ ]]; then
+        idx=${BASH_REMATCH[1]}
+        for path in /sys/class/net/*/ifindex; do
+            [[ -r $path ]] || continue
+            [[ $(cat "$path" 2>/dev/null) == "$idx" ]] || continue
+            path=${path%/ifindex}
+            printf '%s' "${path##*/}"
+            return 0
+        done
+        return 0
+    fi
+
+    printf '%s' "$parent"
+}
+
 iface_operstate() {
     ip -o link show dev "$1" 2>/dev/null | sed -n 's/.* state \([^ ]*\).*/\1/p' | head -n 1
 }
@@ -399,6 +434,28 @@ master_chain() {
         printf '%s\n' "$parent"
         dev=$parent
         depth=$((depth + 1))
+    done
+}
+
+# Every device between $1 and the wire, following both relationships: masters
+# (enslavement) and parents (VLAN/macvlan link). A device can have both -- a
+# VLAN child can itself be a bridge port -- so this is a small graph rather
+# than a chain, and it is walked with an explicit stack, deduplicated, and
+# bounded so a pathological or looped configuration cannot spin here.
+uplink_chain() {
+    local -a stack=("$1")
+    local seen=" $1 " dev next steps=0
+    while ((${#stack[@]} > 0 && steps < 32)); do
+        dev=${stack[-1]}
+        unset 'stack[-1]'
+        steps=$((steps + 1))
+        for next in "$(iface_master "$dev")" "$(iface_parent "$dev")"; do
+            [[ -n $next ]] || continue
+            [[ $seen == *" $next "* ]] && continue
+            seen+="$next "
+            stack+=("$next")
+            printf '%s\n' "$next"
+        done
     done
 }
 
@@ -450,23 +507,37 @@ target_carries_session() {
     [[ $target == "$session" ]] && return 0
 
     local item
-    # target is enslaved to (or under) the session-carrying device.
+    # target is enslaved to the session-carrying device: bouncing a bridge port
+    # can take down the path the bridge forwards over. Masters only, on
+    # purpose. The parent relationship does not work this way -- taking down
+    # vmbr0.100 leaves vmbr0 and every other VLAN on it up -- so walking
+    # parents here would refuse restarts that are perfectly safe.
     while read -r item; do
         [[ $item == "$session" ]] && return 0
     done < <(master_chain "$target")
 
-    # the session-carrying device is enslaved to (or under) the target.
+    # the session-carrying device sits under the target. Here parents DO count:
+    # bouncing vmbr0 (or enp1s0 beneath it) takes vmbr0.100 down with it.
     while read -r item; do
         [[ $item == "$target" ]] && return 0
-    done < <(master_chain "$session")
+    done < <(uplink_chain "$session")
 
-    # Both are ports of the same bridge or slaves of the same bond. Which port
-    # actually forwards the session cannot be determined from configuration, so
-    # siblings count as related.
-    local tm sm
-    tm=$(iface_master "$target") || tm=''
-    sm=$(iface_master "$session") || sm=''
-    [[ -n $tm && $tm == "$sm" ]] && return 0
+    # Both hang off the same bridge, bond, or parent NIC. Comparing only the
+    # immediate masters missed the stock Proxmox layout entirely: with the
+    # address on vmbr0.100 and the target enp1s0, neither device is enslaved to
+    # the other and neither has the other in its chain, but both reach vmbr0 --
+    # and bouncing the port takes the VLAN, and the session, down with it. Which
+    # port actually forwards the session cannot be determined from
+    # configuration, so any shared ancestor counts as related.
+    local -a tchain=() schain=()
+    mapfile -t tchain < <(uplink_chain "$target")
+    mapfile -t schain < <(uplink_chain "$session")
+    local t s
+    for t in ${tchain[@]+"${tchain[@]}"}; do
+        for s in ${schain[@]+"${schain[@]}"}; do
+            [[ $t == "$s" ]] && return 0
+        done
+    done
 
     return 1
 }

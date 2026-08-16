@@ -255,10 +255,20 @@ changes nothing at all.
   changes you made to config files — this script never makes any.
 - A rollback scheduled with `setsid` (no systemd) does not survive a reboot. One
   scheduled with `systemd-run` does not either; both live in `/run`.
-- Sibling ports of the same bridge or bond are treated as carrying the session,
-  because which port actually forwards traffic cannot be read from
-  configuration. That is deliberately conservative — use `--force` when you know
-  better.
+- Two interfaces that share *any* enclosing device are treated as carrying the
+  session, because which port actually forwards traffic cannot be read from
+  configuration. That covers sibling ports of the same bridge or bond, and the
+  stock Proxmox layout where the address sits on `vmbr0.100` and the target is
+  `enp1s0`: neither is enslaved to the other, but both reach `vmbr0`. That is
+  deliberately conservative — use `--force` when you know better.
+- Both kinds of relationship are followed: enslavement (`master`, for bridge
+  ports and bond slaves) and the parent link (`vmbr0.100@vmbr0`, for VLAN and
+  macvlan children, which have no master at all). The two are not symmetric.
+  Restarting a parent takes its VLAN children down, so that counts as carrying
+  the session; restarting a VLAN child leaves the parent and its other children
+  up, so it does not. A parent printed only as an ifindex (`@if12`, typical of
+  one end of a veth pair) is resolved through `/sys` when it is local, and
+  otherwise treated as no parent rather than guessed at.
 - IPv6-only hosts: the address check and the `auto` ping target are IPv4. Pass
   `--check-host <v6 address>` or `--check-host none`.
 - For a change you expect to be risky, run it under
