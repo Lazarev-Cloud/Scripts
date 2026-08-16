@@ -37,17 +37,50 @@ repair.
 
 ## How it decides
 
-`/proc/locks` is the authority. It lists every POSIX and flock record the kernel
-is holding, so it answers the only question that matters: *is this file locked
-right now, and by which PID?* Lock records are matched by **inode**, because the
-`st_dev` → `major:minor` mapping is not reversible on btrfs, ZFS or overlayfs
-(anonymous devices can have a minor number above 255). Matching the inode alone
-can only ever over-report, and over-reporting refuses a removal — the safe
-direction. Under-reporting would permit one.
+`/proc/locks` is the authority. Per `proc_locks(5)` it lists every `POSIX`
+(`fcntl`) byte-range lock, every `FLOCK` (BSD `flock(2)`) lock and every `OFDLCK`
+open-file-description lock the kernel holds, so it answers the only question that
+matters: *is this file locked right now, and by which PID?* Lock records are
+matched by **inode**, because the `st_dev` → `major:minor` mapping is not
+reversible on btrfs, ZFS or overlayfs (anonymous devices can have a minor number
+above 255). Matching the inode alone can only ever over-report, and
+over-reporting refuses a removal — the safe direction. Under-reporting would
+permit one. OFD locks are reported by the kernel with a PID of `-1`, which the
+script renders as an unidentified owner and treats as held.
 
-`fuser` and `lsof` are consulted as corroboration when installed, neither is
-required. They report processes with the file merely *open*, which is a superset
-of the processes that have it *locked*.
+### Why not just `flock -n` to test the lock?
+
+Because it lies here. APT takes its locks with `fcntl(FD, F_SETLK, &fl)` and
+`fl.l_type = F_WRLCK` (`GetLock()` in `apt-pkg/contrib/fileutl.cc`), and the
+`flock(2)` manual states that "there is no interaction between the types of lock
+placed by `flock()` and `fcntl(2)`". So:
+
+```bash
+flock -n /var/lib/dpkg/lock true   # succeeds while dpkg is holding the file
+```
+
+That command reports the opposite of the truth, which is why this script reads
+the kernel's lock table instead of trying to take a lock of its own.
+
+### The second opinion, and what it means when it is missing
+
+`fuser` and `lsof` are consulted when installed; neither is required. They report
+processes with the file merely *open*, which is a superset of the processes that
+have it *locked* — so they add the one case `/proc/locks` cannot see, a process
+holding the lock file open without a lock on it. Their three possible outcomes
+are kept distinct, because collapsing them is how a wedged mount comes to look
+like a clean bill of health:
+
+| Outcome | Effect on the verdict |
+| --- | --- |
+| Probe ran | Any PID it names is treated as a holder. |
+| Tool not installed | The `/proc/locks` verdict stands; the report says the corroboration **did not happen** rather than implying it passed. |
+| Probe timed out | That file is reported `unknown`, nothing is removed, exit 75. |
+
+The middle row matters on minimal images — Debian slim and similar ship neither
+`psmisc` nor `lsof`, and that is exactly where stuck locks turn up. Refusing to
+work there would make the script useless; the system-wide process scan below is
+the guard that does not depend on either tool.
 
 Beyond the files themselves the script also refuses when any `apt`, `apt-get`,
 `aptitude`, `dpkg`, `unattended-upgr` or `synaptic` process exists anywhere on
@@ -182,9 +215,13 @@ widen what gets *inspected*, never what gets deleted.
 
 75 is the interesting one for monitoring: the machine is busy, not broken, and
 cron and systemd both read `EX_TEMPFAIL` as "retry later" rather than a fault.
-The exception is a lock path that is a symlink or not a regular file — that is
-also 75, and it will **not** clear on a retry, so read the report before wiring
-a retry loop around this.
+Three cases also return 75 but will **not** clear on a retry, so read the report
+before wiring a retry loop around this:
+
+- a lock path that is a symlink,
+- a lock path that is not a regular file,
+- a lock path whose `fuser`/`lsof` probe timed out — usually a wedged NFS or
+  FUSE mount, which needs fixing before any of this is meaningful.
 
 ## Limits and residual risk
 
@@ -197,6 +234,14 @@ a retry loop around this.
   re-checked immediately before it is unlinked. What remains is the gap between
   that last check and the `rm` itself, and a shell cannot make it zero — taking
   the lock properly would need an `fcntl` lock, which bash has no way to acquire.
+- **`/proc/locks` cannot see an open-but-unlocked descriptor.** A process that
+  has a lock file open without holding a lock on it is not in a critical section
+  and does not block apt, but it will re-lock that inode later. `fuser`/`lsof`
+  are what catch it, and on a host with neither installed that check simply does
+  not happen — the report says so. The system-wide scan for `apt`, `apt-get`,
+  `dpkg`, `unattended-upgr` and friends is the backstop that always runs, so the
+  uncovered case is a *non-package-manager* process holding a dpkg lock file
+  open. That is rare, and it is stated here rather than papered over.
 - **Inode-only matching can over-report.** If an unrelated file on another
   filesystem happens to share an inode number with a lock file and is locked,
   the script reports the lock as held and refuses. It prints the PID and command

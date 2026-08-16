@@ -23,6 +23,7 @@ when the interface is managed by NetworkManager, systemd-networkd or ifupdown.
 sudo ./network_restart.sh eth0 --yes         # restart it
 sudo ./network_restart.sh eth0 --yes --force # ... even if it carries your SSH session
 sudo ./network_restart.sh --interface vmbr0 --yes --rollback 300
+sudo ./network_restart.sh eth0 --yes --check-host 10.0.0.1 --ping-count 5
 ```
 
 There is no prompt in either direction. The default is a plan, so a run without
@@ -138,13 +139,49 @@ After the bounce, in order:
    within `--wait` seconds;
 2. a global IPv4 address returns within `--wait` seconds — **only if the
    interface had one before**, so an unnumbered bridge port is not failed;
-3. `ping` to `--check-host` succeeds. `auto` uses the default gateway recorded
-   *before* the bounce, `none` skips the check.
+3. `ping` to `--check-host` succeeds — `--ping-count` packets, `--ping-wait`
+   seconds each. `auto` uses the default gateway recorded *before* the bounce,
+   `none` skips the check.
 
 Everything checked here is captured during preflight. Reading the default
 gateway afterwards would be useless: taking the interface down removes the
 route, so the check would silently degrade to "the link is up" and call a dead
 network healthy.
+
+Each step reports what failed. A command that fails or times out has its first
+lines of output surfaced as warnings and its real exit status propagated, so a
+timeout (124) is distinguishable from a refusal — the message naming the cause
+is exactly what you need at the moment the link may still be down.
+
+**The `auto` ping target can be indirect.** When the interface owned no default
+route of its own, `auto` falls back to the host's default gateway, which may
+live on a completely different interface — a reply then does not by itself
+prove the bounced interface recovered. The plan says so when that is the case.
+Binding the ping to the interface is not the fix: an unnumbered bridge port has
+no source address to bind to, and the check would fail on a healthy link. Pass
+`--check-host` with something reachable only through this interface when you
+need the check to be conclusive.
+
+### Rollback timing
+
+The rollback fires `--rollback` seconds after it is armed, which is *before*
+the bounce — so it competes with verification, whose worst case is
+`--wait` (link) + `--wait` (address, only if the interface had one) +
+`--timeout` (ping). With the defaults that is 150s against a 120s rollback.
+
+That 150s is the **verification** budget, and it is what the plan prints and
+what the warning compares against. The rollback timer starts earlier still, so
+the real window also includes the bounce: `--settle`, plus up to `--timeout`
+for each command the bounce runs — two for most managers, up to five for
+`networkd` when `networkctl up`/`down` is rejected and the `ip link` fallback
+is used. Budget for that too before concluding a given `--rollback` is safe.
+
+Nothing breaks when the rollback wins that race — every recovery command is
+idempotent — but it will have already run by the time the script says
+"Rollback cancelled". The script prints the budget in the plan, notes there
+when `--rollback` is below it, and warns again at arm time. It does not adjust
+the value for you: raising it silently would extend the window in which a
+genuinely dead host stays dead, and that is your call.
 
 ## Blast radius
 
@@ -168,11 +205,12 @@ Configuration files are never written.
 | `--rollback SECONDS` | `LZC_NETWORK_RESTART_ROLLBACK` | Rollback delay; `0` disables it (120). |
 | `--wait SECONDS` | `LZC_NETWORK_RESTART_WAIT` | How long to wait, after the bounce, for the interface to come back — first for the link to reach `UP`, then for a global IPv4 address to return if it had one. Minimum 1 (60). |
 | `--check-host HOST` | `LZC_NETWORK_RESTART_CHECK_HOST` | Ping target; `auto` or `none` (auto). |
+| `--ping-count N` | `LZC_NETWORK_RESTART_PING_COUNT` | Packets for that ping. Minimum 1 (3). |
+| `--ping-wait SECONDS` | `LZC_NETWORK_RESTART_PING_WAIT` | Per-packet reply timeout (`ping -W`). Minimum 1 (2). |
+| `--settle SECONDS` | `LZC_NETWORK_RESTART_SETTLE` | Pause between down and up; `0` for none (2). |
 | `--timeout SECONDS` | `LZC_NETWORK_RESTART_TIMEOUT` | Bounds each individual command — one `nmcli`/`networkctl`/`ifup`/`ip` invocation, or the ping. **Not** the wait for the interface to return, which is `--wait`. Minimum 1 (30). |
+| `--state-dir DIR` | `LZC_NETWORK_RESTART_STATE_DIR` | Where the rollback script and its cancel token live (`/run/network-restart`). Its own leftovers (`*.recover.sh`, `*.cancel`) are cleaned up after a day; nothing else in the directory is touched. |
 | `--color WHEN` | — | `auto`, `always`, `never`. |
-| — | `LZC_NETWORK_RESTART_SETTLE` | Seconds between down and up (2). |
-| — | `LZC_NETWORK_RESTART_PING_COUNT` | Ping packets. Minimum 1 (3). |
-| — | `LZC_NETWORK_RESTART_STATE_DIR` | Rollback state directory (`/run/network-restart`). |
 | — | `LZC_NETWORK_RESTART_LOCK` | Lock file (`/run/lock/lzc-network-restart.lock`). |
 | `-V, --version` | — | Print version and exit. |
 | `-h, --help` | — | Print help and exit. |

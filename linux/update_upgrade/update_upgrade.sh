@@ -30,6 +30,8 @@ LOG_FILE="${LZC_UPDATE_UPGRADE_LOG:-/var/log/apt-upgrade.log}"
 LOG_MAX_BYTES="${LZC_UPDATE_UPGRADE_LOG_MAX_BYTES:-5242880}"
 LOCK_FILE="${LZC_UPDATE_UPGRADE_LOCK:-/run/lock/lzc-update_upgrade.lock}"
 DPKG_LOCK_TIMEOUT="${LZC_UPDATE_UPGRADE_DPKG_LOCK_TIMEOUT:-600}"
+ACQUIRE_RETRIES="${LZC_UPDATE_UPGRADE_ACQUIRE_RETRIES:-3}"
+LISTCHANGES_FRONTEND="${LZC_UPDATE_UPGRADE_LISTCHANGES_FRONTEND:-none}"
 UPDATE_TIMEOUT="${LZC_UPDATE_UPGRADE_UPDATE_TIMEOUT:-600}"
 UPGRADE_TIMEOUT="${LZC_UPDATE_UPGRADE_UPGRADE_TIMEOUT:-3600}"
 CLEANUP_TIMEOUT="${LZC_UPDATE_UPGRADE_CLEANUP_TIMEOUT:-600}"
@@ -75,6 +77,12 @@ declare -a HELD=()
 declare -a DRIFT=()
 REBOOT_REQUIRED=0
 REBOOT_REASON=''
+# Whether the probe behind each reported value actually ran. A check that could
+# not run must never be reported as a count of zero or as "no" -- see
+# count_label() and check_reboot().
+HELD_KNOWN=1
+DRIFT_KNOWN=1
+REBOOT_KNOWN=1
 LOG_READY=0
 LOG_SINK=/dev/null
 LOCK_HELD=0
@@ -121,6 +129,21 @@ die() {
 banner() {
     [[ -t 1 ]] || return 0
     printf '%s%s v%s%s\n\n' "$GN" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$CL"
+}
+
+# Renders a count only when the probe behind it actually ran. A bare "0" from a
+# failed inspection is indistinguishable from a "0" that means there is nothing
+# to report, and this summary is the whole reason the script prints anything --
+# so an unverified count says so rather than quietly reading as good news.
+count_label() {
+    local known=$1 n=$2
+    if ((known)); then
+        printf '%d' "$n"
+    elif ((n)); then
+        printf '%d (incomplete: the check could not finish)' "$n"
+    else
+        printf 'unknown (the check could not run)'
+    fi
 }
 
 usage() {
@@ -187,8 +210,20 @@ Blast radius:
                 interruptions. It never restarts the machine.
 
 This script never reboots and never deletes an apt or dpkg lock file. A pending
-reboot is reported, and exits $EX_OK: it is not a failure. Test /run/reboot-required
-if you need to act on it from a wrapper.
+reboot is reported, and exits $EX_OK: it is not a failure.
+
+To act on it from a wrapper, use the same test this script does -- which one
+that is depends on the host, so do not assume the marker file:
+  * with update-notifier-common installed:  [ -e /run/reboot-required ]
+  * otherwise, with needrestart installed:
+      needrestart -b -r l | grep -q '^NEEDRESTART-KSTA: [23]\$'
+  * with neither, there is nothing to test; the summary says "unknown".
+
+Reboot detection has three answers, not two. The markers come from
+update-notifier-common, which Debian does not install by default; where nothing
+writes them and needrestart is absent, the summary says "unknown" rather than
+claiming "no". The same applies to every count in the summary: a check that
+could not run is reported as unknown, never as a zero.
 
 Every option also has an environment variable, which is the easier route when
 piping this script in from the network. They all begin LZC_UPDATE_UPGRADE_, so
@@ -198,6 +233,8 @@ piping this script in from the network. They all begin LZC_UPDATE_UPGRADE_, so
   LZC_UPDATE_UPGRADE_AUTOREMOVE=1       LZC_UPDATE_UPGRADE_AUTOREMOVE_PURGE=1
   LZC_UPDATE_UPGRADE_CLEAN=autoclean    LZC_UPDATE_UPGRADE_NEEDRESTART_MODE=l
   LZC_UPDATE_UPGRADE_DPKG_LOCK_TIMEOUT=600
+  LZC_UPDATE_UPGRADE_ACQUIRE_RETRIES=3
+  LZC_UPDATE_UPGRADE_LISTCHANGES_FRONTEND=none
   LZC_UPDATE_UPGRADE_UPDATE_TIMEOUT=600 LZC_UPDATE_UPGRADE_UPGRADE_TIMEOUT=3600
   LZC_UPDATE_UPGRADE_CLEANUP_TIMEOUT=600
   LZC_UPDATE_UPGRADE_PROBE_TIMEOUT=120
@@ -357,6 +394,9 @@ validate_args() {
         die "$EX_USAGE" "LZC_UPDATE_UPGRADE_CLEAN must be none, autoclean or clean, got '$CLEAN_MODE'"
     [[ $NEEDRESTART_RUN_MODE =~ ^[ali]$ ]] ||
         die "$EX_USAGE" "LZC_UPDATE_UPGRADE_NEEDRESTART_MODE must be a, l or i, got '$NEEDRESTART_RUN_MODE'"
+    [[ $LISTCHANGES_FRONTEND =~ ^[a-z][a-z-]*$ ]] ||
+        die "$EX_USAGE" \
+            "LZC_UPDATE_UPGRADE_LISTCHANGES_FRONTEND must be an apt-listchanges frontend name (none, pager, text, mail, ...), got '$LISTCHANGES_FRONTEND'"
 
     # Minimum 1, never 0: every one of these is handed to timeout(1), where 0
     # means "no limit" and would silently remove the protection the setting
@@ -366,6 +406,10 @@ validate_args() {
     normalise_int CLEANUP_TIMEOUT 1 'LZC_UPDATE_UPGRADE_CLEANUP_TIMEOUT'
     normalise_int PROBE_TIMEOUT 1 'LZC_UPDATE_UPGRADE_PROBE_TIMEOUT'
     normalise_int LOG_MAX_BYTES 1 'LZC_UPDATE_UPGRADE_LOG_MAX_BYTES'
+
+    # 0 is meaningful here and is not a timeout: it means "do not retry a failed
+    # download at all", which is the right choice on a metered connection.
+    normalise_int ACQUIRE_RETRIES 0 'LZC_UPDATE_UPGRADE_ACQUIRE_RETRIES'
 
     # The exception, and it is a real one: this is apt's own
     # DPkg::Lock::Timeout, not timeout(1). There 0 means "fail immediately if
@@ -500,6 +544,11 @@ setup_apt_env() {
     export DEBIAN_PRIORITY=critical
     export NEEDRESTART_MODE="$NEEDRESTART_RUN_MODE"
 
+    # apt-listchanges runs as an APT Pre-Install-Pkgs hook, outside everything
+    # DEBIAN_FRONTEND governs, and with `confirm=true` in its own configuration
+    # it asks a question on stdin. 'none' is its documented off switch.
+    export APT_LISTCHANGES_FRONTEND="$LISTCHANGES_FRONTEND"
+
     # ucf-managed conffiles are a separate mechanism from dpkg's, and the
     # Dpkg::Options below do not reach them. ucf's own variables are spelled
     # with two Fs (ucf(1)): UCF_FORCE_CONFFOLD keeps the installed file,
@@ -513,6 +562,9 @@ setup_apt_env() {
     APT_OPTS=(
         -o "Dpkg::Use-Pty=0"
         -o "DPkg::Lock::Timeout=$DPKG_LOCK_TIMEOUT"
+        # A transient mirror or DNS blip should not fail an unattended run that
+        # will not be looked at until morning.
+        -o "Acquire::Retries=$ACQUIRE_RETRIES"
     )
     # Without a terminal, apt's progress redraws are just noise in a log file.
     [[ -t 1 ]] || APT_OPTS+=(-q)
@@ -649,48 +701,109 @@ do_clean() {
 
 # --- Reporting ---------------------------------------------------------------
 
+# Fills HELD, and records in HELD_KNOWN whether the answer is real. apt-mark is
+# optional, so "not installed" and "installed but it failed" both have to render
+# as unknown rather than as a confident zero.
 collect_holds() {
-    command -v apt-mark >/dev/null 2>&1 || return 0
-    mapfile -t HELD < <(timeout --foreground "$PROBE_TIMEOUT" apt-mark showhold 2>/dev/null)
+    local out rc=0
+    HELD=()
+    HELD_KNOWN=1
+
+    if ! command -v apt-mark >/dev/null 2>&1; then
+        HELD_KNOWN=0
+        return 0
+    fi
+    out=$(timeout --foreground "$PROBE_TIMEOUT" apt-mark showhold 2>/dev/null) || rc=$?
+    if ((rc != 0)); then
+        HELD_KNOWN=0
+        return 0
+    fi
+    # Guarded: `mapfile <<<""` yields one empty element, not zero, which would
+    # turn "no holds" into "one hold, named nothing".
+    [[ -n $out ]] && mapfile -t HELD <<<"$out"
     return 0
 }
 
 # Conffiles the package shipped but dpkg kept back because the local copy was
 # edited. The 'old' policy creates these on purpose, and nobody ever goes
 # looking for them, so they are surfaced on every run.
+#
+# find exits non-zero when any directory could not be read, having still printed
+# everything it did find -- which is the normal case for an unprivileged
+# --dry-run over /etc. So the results are kept and the scan is marked
+# incomplete, rather than thrown away or passed off as exhaustive.
 collect_drift() {
-    [[ -d $ETC_DIR ]] || return 0
-    mapfile -t DRIFT < <(timeout --foreground "$PROBE_TIMEOUT" \
+    local out rc=0
+    DRIFT=()
+    DRIFT_KNOWN=1
+
+    if [[ ! -d $ETC_DIR ]]; then
+        DRIFT_KNOWN=0
+        return 0
+    fi
+    out=$(timeout --foreground "$PROBE_TIMEOUT" \
         find "$ETC_DIR" -xdev -type f \
         \( -name '*.dpkg-dist' -o -name '*.dpkg-new' -o -name '*.ucf-dist' \) \
-        -print 2>/dev/null)
+        -print 2>/dev/null) || rc=$?
+    [[ -n $out ]] && mapfile -t DRIFT <<<"$out"
+    ((rc == 0)) || DRIFT_KNOWN=0
     return 0
 }
 
+# Whether the ABSENCE of a reboot marker actually means anything. The markers
+# are written by update-notifier-common, which Ubuntu installs by default and
+# plain Debian does not. Where nothing writes them, "no marker" is silence, not
+# a negative answer, and reporting it as "no" is simply false.
+markers_are_authoritative() {
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    local status
+    # shellcheck disable=SC2016 # ${db:Status-Status} is a dpkg-query(1) format
+    # specifier, not a shell expansion; single quotes are required so dpkg-query
+    # receives it verbatim.
+    status=$(timeout --foreground "$PROBE_TIMEOUT" \
+        dpkg-query -W -f='${db:Status-Status}' update-notifier-common 2>/dev/null) || return 1
+    [[ $status == installed ]]
+}
+
+# Sets REBOOT_REQUIRED and REBOOT_KNOWN. Three outcomes, not two: yes, no, and
+# "this host has no way to tell you". Returns 0 only when a reboot is pending.
 check_reboot() {
+    REBOOT_REQUIRED=0
+    REBOOT_KNOWN=0
+    REBOOT_REASON=''
+
     local marker
     local -a markers=()
     read -r -a markers <<<"$REBOOT_MARKERS"
     for marker in ${markers[@]+"${markers[@]}"}; do
         if [[ -e $marker ]]; then
             REBOOT_REQUIRED=1
+            REBOOT_KNOWN=1
             REBOOT_REASON="$marker exists"
             return 0
         fi
     done
 
-    # Debian without update-notifier-common never writes those markers. If
-    # needrestart is installed, ask it instead: `-r l` is list-only and restarts
+    # No marker. That is only a negative answer where something writes markers.
+    markers_are_authoritative && REBOOT_KNOWN=1
+
+    # needrestart settles the kernel question either way, and on a minimal
+    # Debian it is the only detection there is. `-r l` is list-only and restarts
     # nothing. KSTA 2 means a kernel ABI upgrade is pending, 3 a version upgrade.
-    command -v needrestart >/dev/null 2>&1 || return 1
     local out ksta
-    out=$(timeout --foreground "$PROBE_TIMEOUT" needrestart -b -r l 2>/dev/null) || return 1
-    ksta=$(printf '%s\n' "$out" | sed -n 's/^NEEDRESTART-KSTA: *//p' | head -n1)
-    [[ $ksta =~ ^[0-9]+$ ]] || return 1
-    ((ksta >= 2)) || return 1
-    REBOOT_REQUIRED=1
-    REBOOT_REASON="needrestart reports the running kernel is outdated (KSTA $ksta)"
-    return 0
+    if command -v needrestart >/dev/null 2>&1 &&
+        out=$(timeout --foreground "$PROBE_TIMEOUT" needrestart -b -r l 2>/dev/null); then
+        ksta=$(printf '%s\n' "$out" | sed -n 's/^NEEDRESTART-KSTA: *//p' | head -n1)
+        if [[ $ksta =~ ^[0-9]+$ ]]; then
+            REBOOT_KNOWN=1
+            if ((ksta >= 2)); then
+                REBOOT_REQUIRED=1
+                REBOOT_REASON="needrestart reports the running kernel is outdated (KSTA $ksta)"
+                return 0
+            fi
+        fi
+    fi
+    return 1
 }
 
 report() {
@@ -701,15 +814,19 @@ report() {
     check_reboot
 
     ((WITH_NEW_PKGS)) && [[ $MODE == upgrade ]] && mode_note=' (--with-new-pkgs)'
-    ((REBOOT_REQUIRED)) && reboot_word=yes
+    if ((!REBOOT_KNOWN)); then
+        reboot_word='unknown (install update-notifier-common or needrestart to detect it)'
+    elif ((REBOOT_REQUIRED)); then
+        reboot_word=yes
+    fi
 
     printf '\n'
     log INFO "Summary:"
     printf '  Mode                : %s%s\n' "$MODE" "$mode_note"
     printf '  Conffile policy     : keep %s\n' "$CONFFILE"
     printf '  Steps failed        : %d\n' "${#FAILED_STEPS[@]}"
-    printf '  Held packages       : %d\n' "${#HELD[@]}"
-    printf '  Conffiles kept back : %d\n' "${#DRIFT[@]}"
+    printf '  Held packages       : %s\n' "$(count_label "$HELD_KNOWN" "${#HELD[@]}")"
+    printf '  Conffiles kept back : %s\n' "$(count_label "$DRIFT_KNOWN" "${#DRIFT[@]}")"
     printf '  Reboot pending      : %s\n' "$reboot_word"
     printf '\n'
 

@@ -74,9 +74,14 @@ Default patterns:
 
 The digit classes are bounded to one and two digits **on purpose**. A greedy
 `*.[0-9]*` would also match `/var/log/mysql/mysql-bin.000001`; deleting MySQL
-binary logs silently breaks replication and point-in-time recovery. Override
-the list with `LZC_CLEAN_LOGS_PATTERNS` if you must, but add specific patterns
-rather than generalising these.
+binary logs silently breaks replication and point-in-time recovery.
+
+Override the list with `--pattern` (repeatable) or `LZC_CLEAN_LOGS_PATTERNS`,
+but add *specific* patterns rather than generalising these. Both forms
+**replace** the built-in list rather than adding to it, which is the safe
+direction: narrowing a sweep to `--pattern '*.gz'` must mean only `*.gz`, not
+`*.gz` plus eight patterns you did not ask for. Patterns are matched against
+the file name only, never the directory part — use `--exclude` for paths.
 
 ## Blast radius
 
@@ -105,22 +110,37 @@ rather than generalising these.
 | `-p, --path DIR` | `LZC_CLEAN_LOGS_PATHS` | Root to clean; repeatable. Env form is `:`-separated. Default `/var/log`. |
 | `-d, --days N` | `LZC_CLEAN_LOGS_DAYS` | Cutoff in 24h units (14). `0` means "older than 24 hours". |
 | `-x, --exclude GLOB` | `LZC_CLEAN_LOGS_EXCLUDE` | Skip matching paths; repeatable. |
+| `--pattern GLOB` | `LZC_CLEAN_LOGS_PATTERNS` | Filename glob marking a rotated archive; repeatable. **Replaces** the built-in list. Env form is whitespace-separated. |
+| `--active-pattern GLOB` | `LZC_CLEAN_LOGS_ACTIVE_PATTERNS` | Same, for the live-log list `--truncate-active` works from (`*.log syslog messages`). |
 | `--no-journal` | `LZC_CLEAN_LOGS_JOURNAL=0` | Leave the systemd journal alone. |
 | `--journal-size SIZE` | `LZC_CLEAN_LOGS_JOURNAL_KEEP_SIZE` | Journal size to keep (`200M`). |
-| `--journal-time TIME` | `LZC_CLEAN_LOGS_JOURNAL_KEEP_TIME` | Journal age to keep (defaults to `--days` as `Nd`). |
+| `--journal-time TIME` | `LZC_CLEAN_LOGS_JOURNAL_KEEP_TIME` | Journal age to keep. Defaults to `--days` as `Nd`, floored at `1d`. |
 | `--truncate-active` | `LZC_CLEAN_LOGS_TRUNCATE` | Also empty live logs. Destroys their contents. |
 | `--truncate-larger-than N` | `LZC_CLEAN_LOGS_TRUNCATE_MIN` | Byte threshold for the above (104857600). |
 | `--list-limit N` | `LZC_CLEAN_LOGS_LIST_LIMIT` | Paths printed per section, `0` = all (50). |
 | `--timeout SECONDS` | `LZC_CLEAN_LOGS_TIMEOUT` | Wall-clock limit for **each** `du` call that measures the journal and for the `journalctl` vacuum call (60). It does not bound the file scan or the run as a whole. Minimum 1 — `timeout 0` means *no* limit. |
 | `--color WHEN` | — | `auto`, `always`, `never`. |
-| — | `LZC_CLEAN_LOGS_PATTERNS` | Replace the rotated-archive pattern list. |
-| — | `LZC_CLEAN_LOGS_ACTIVE_PATTERNS` | Live-log patterns for `--truncate-active` (`*.log syslog messages`). |
 | — | `LZC_CLEAN_LOGS_LOCK` | Lock file (`/run/lock/lzc-clean_logs.lock`). |
 | `-V, --version` | — | Print version and exit. |
 | `-h, --help` | — | Print help and exit. |
 
 Every variable a user can set is namespaced `LZC_CLEAN_LOGS_*`, so
 `env | grep LZC_` shows the whole configurable surface of this script.
+
+### Precedence
+
+A flag beats the environment variable it shadows. For the three list-valued
+options this means **replace, not merge**: passing any `--path` discards
+`LZC_CLEAN_LOGS_PATHS` entirely, and the same holds for `--pattern` against
+`LZC_CLEAN_LOGS_PATTERNS` and `--active-pattern` against
+`LZC_CLEAN_LOGS_ACTIVE_PATTERNS`. So if a cron file sets
+`LZC_CLEAN_LOGS_PATTERNS` and someone later adds `--pattern` to the command
+line, the environment value is gone rather than combined — which is the safe
+direction for a delete filter, but worth knowing before you edit that crontab.
+
+`--exclude` is the one exception and deliberately **adds** to
+`LZC_CLEAN_LOGS_EXCLUDE`: exclusions only ever remove files from the sweep, so
+accumulating them can never widen the blast radius.
 
 ### Value formats
 
@@ -151,6 +171,12 @@ removed, so the space reclaimed is normally less than the journal's total size.
 If the journal is much larger than you want permanently, set a cap in
 `/etc/systemd/journald.conf` (`SystemMaxUse=`) so it never grows back — this
 script trims, it does not configure.
+
+The vacuum time defaults to `--days` expressed as `Nd`, **floored at `1d`**.
+`--days 0` means "files older than 24 hours", and `0d` is not the journal
+equivalent of that: depending on the systemd release a zero retention reads
+either as "no time limit at all" or as "discard every archived file", and those
+are opposite outcomes. An explicit `--journal-time` is never rewritten.
 
 ## Exit status
 
@@ -198,3 +224,10 @@ signals the writing daemon; this script only removes what rotation left behind.
 - The script does not compress anything, does not edit logrotate configuration,
   and does not touch package-manager caches.
 - Running as a non-root user produces a partial report and says so.
+- **The scan does not stop at filesystem boundaries.** A separate mount or a
+  bind mount underneath a root is walked like any other directory. That is
+  deliberate — `/var/log/audit` being its own filesystem is common and should
+  still be swept — but it means a bind mount of unrelated data under `/var/log`
+  is in scope. Check the dry-run listing, or exclude it with `--exclude`.
+- Patterns match the **file name**, not the path. `--pattern '*/nginx/*.gz'`
+  matches nothing; use `--path` or `--exclude` to select by directory.

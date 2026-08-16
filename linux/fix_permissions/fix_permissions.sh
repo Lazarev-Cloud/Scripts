@@ -21,7 +21,7 @@
 set -uo pipefail
 
 readonly SCRIPT_NAME='Home Permission Repair'
-readonly SCRIPT_VERSION='2.0'
+readonly SCRIPT_VERSION='2.1'
 
 # Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
 # sysexits.h, which cron and systemd read as "retry later" rather than a fault.
@@ -51,14 +51,32 @@ USE_COLOR="${LZC_FIX_PERMISSIONS_COLOR:-auto}"
 FORCE_DRY_RUN=0
 
 # Canonical absolute paths that are never a home directory, whatever /etc/passwd
-# or --home claims. `/` is rejected separately, which also covers "is an ancestor
-# of a system directory" because every entry here is a direct child of `/`.
-# /root is deliberately absent: it is root's real home, and refusing it would
-# make the script useless for the one account most likely to need it.
-readonly FORBIDDEN_PATHS=(
-    /bin /boot /dev /etc /home /lib /lib32 /lib64 /libx32 /media /mnt /opt
-    /proc /run /sbin /srv /sys /tmp /usr /var
-    /nonexistent /dev/null /var/empty
+# or --home claims. `/` is rejected separately.
+#
+# Two lists, because "is the operating system" and "contains home directories"
+# need opposite rules. A single exact-match list gets this wrong in the dangerous
+# direction: it refuses /usr but accepts /usr/lib, so one --home typo aims a
+# recursive chown at 25,000 system files.
+#
+# FORBIDDEN_TREES: the directory itself AND everything beneath it. These hold the
+# operating system; nothing inside one is somebody's home.
+readonly FORBIDDEN_TREES=(
+    /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /sbin /sys /usr
+    /var/backups /var/cache /var/log /var/spool /var/tmp
+)
+
+# FORBIDDEN_ROOTS: the directory itself ONLY. Each of these legitimately holds
+# home directories one level down, so the container is refused while its
+# children stay usable. /var/lib is here rather than in the tree list because
+# service accounts really do live under it -- postgres at /var/lib/postgresql,
+# jenkins at /var/lib/jenkins -- and /var itself stays a root only so that
+# www-data's /var/www keeps working.
+# /root is deliberately absent from both: it is root's real home, and refusing
+# it would make the script useless for the one account most likely to need it.
+readonly FORBIDDEN_ROOTS=(
+    /home /media /mnt /opt /run /srv /tmp /var
+    /var/lib /var/local /var/mail /var/opt
+    /nonexistent /var/empty
 )
 
 # --- Runtime state -----------------------------------------------------------
@@ -141,7 +159,9 @@ BLAST RADIUS
     * never follows a symlink: links have their own ownership fixed with
       chown -h and are never chmod'ed, so a link pointing at /etc/shadow
       cannot be used to redirect this script out of the home directory
-    * never touches / or a system directory, whatever /etc/passwd says
+    * never touches /, a system directory, or anything inside one, whatever
+      /etc/passwd says -- and refuses the directories that merely hold homes
+      (/home, /srv, /var) so a missing user name cannot widen the target
     * never crosses a filesystem boundary unless asked
 
 Options:
@@ -167,7 +187,10 @@ Options:
       --cross-filesystems   Descend into mounted filesystems (default: no).
       --no-chown            Fix modes only, leave ownership alone.
       --no-chmod            Fix ownership only, leave modes alone.
-      --no-backup           Skip the getfacl snapshot before applying.
+      --no-backup           Skip the getfacl snapshot and accept that the run
+                            cannot be undone. Without this, a host with no
+                            getfacl refuses to apply (exit 3) rather than make
+                            thousands of irreversible changes unrecorded.
       --backup-dir PATH     Where to write the snapshot (default: $BACKUP_DIR).
       --timeout SECONDS     Bounds the scan of the home directory: the single
                             find(1) walk that builds the plan (default: $SCAN_TIMEOUT).
@@ -230,9 +253,11 @@ Exit status:
   1    the work ran but something in it failed: a change could not be applied,
        the scan timed out, or the snapshot could not be written
   2    usage error: unknown flag, missing value, or an invalid one -- which
-       includes an unknown user or group and a home directory that is / or a
-       system directory
-  3    a required tool is missing (GNU find, timeout, xargs, flock)
+       includes an unknown user or group, and a home directory that is /, is a
+       system directory, is inside one, or is a directory that merely holds
+       home directories
+  3    a required tool is missing (GNU find, timeout, xargs, flock, or getfacl
+       when a snapshot was not waived with --no-backup)
   4    must be run as root (changing ownership does; --no-chown does not)
   5    changes are pending but there is no terminal to confirm at and no --yes
   75   another instance holds the lock; try again later
@@ -468,16 +493,23 @@ canonicalize() {
     printf '%s' "$resolved"
 }
 
+# Runs against the canonicalised path, so `--home /home/x/../..` and a symlinked
+# home cannot slip past a prefix test.
 refuse_unsafe_home() {
-    local path=$1 forbidden
+    local path=$1 entry
 
     [[ -n $path ]] || die "$EX_USAGE" "No home directory to work on."
     [[ $path == /* ]] || die "$EX_USAGE" "Home directory must be an absolute path, got '$path'"
     [[ $path == / ]] && die "$EX_USAGE" "Refusing to operate on / -- that is the entire filesystem, not a home directory."
 
-    for forbidden in "${FORBIDDEN_PATHS[@]}"; do
-        [[ $path == "$forbidden" ]] &&
-            die "$EX_USAGE" "Refusing to operate on the system directory '$path'."
+    for entry in "${FORBIDDEN_TREES[@]}"; do
+        [[ $path == "$entry" || $path == "$entry"/* ]] &&
+            die "$EX_USAGE" "Refusing to operate on '$path': it is inside the system directory '$entry'."
+    done
+
+    for entry in "${FORBIDDEN_ROOTS[@]}"; do
+        [[ $path == "$entry" ]] &&
+            die "$EX_USAGE" "Refusing to operate on '$path': it holds home directories, it is not one. Point --home at the home itself."
     done
 
     [[ -d $path ]] || die "$EX_USAGE" "'$path' is not a directory."
@@ -543,6 +575,18 @@ preflight() {
     # Only an --apply run locks, so a dry run does not need util-linux either.
     ((APPLY)) && { command -v flock >/dev/null 2>&1 ||
         die "$EX_PREREQ" "flock (util-linux) not found; it is required to apply changes."; }
+
+    # Checked here rather than at the point of use so an --apply run that cannot
+    # record an undo point fails before it scans and before it prompts, instead
+    # of after the operator has already confirmed. Refusing is the deliberate
+    # choice: the alternative is applying tens of thousands of irreversible
+    # changes with nothing recorded, on exactly the minimal hosts where a
+    # warning is least likely to be read. --no-backup still buys that, but it
+    # now has to be asked for.
+    if ((APPLY && DO_BACKUP)) && ! command -v getfacl >/dev/null 2>&1; then
+        die "$EX_PREREQ" \
+            "getfacl not found, so no undo snapshot can be taken and this run would be irreversible. Install the 'acl' package, or pass --no-backup to accept that deliberately."
+    fi
 
     if [[ $EUID -ne 0 ]]; then
         log WARN "Not running as root: directories you cannot read are invisible to this scan."
@@ -898,12 +942,8 @@ confirm() {
 take_backup() {
     ((DO_BACKUP)) || return 0
 
-    if ! command -v getfacl >/dev/null 2>&1; then
-        log WARN "getfacl not found (install the 'acl' package); no snapshot will be taken."
-        log WARN "Nothing will record the current ownership and modes. This run is not reversible."
-        return 0
-    fi
-
+    # getfacl's presence was settled in preflight, so this is reached only when
+    # a snapshot can actually be taken.
     if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
         die "$EX_FAIL" "Cannot create backup directory '$BACKUP_DIR'. Use --backup-dir, or --no-backup to proceed without one."
     fi
@@ -911,17 +951,33 @@ take_backup() {
     BACKUP_FILE="$BACKUP_DIR/${TARGET_USER}-$(date -u '+%Y%m%dT%H%M%SZ').facl"
     log INFO "Recording current ownership and modes in $BACKUP_FILE"
 
+    # No special-casing for awkward file names: the snapshot format is escaped,
+    # not raw. getfacl writes a newline in a name as \012 and a literal
+    # backslash as \\, and setfacl --restore decodes both, so such a path round
+    # trips through the undo unchanged. Verified against acl 2.3.2 -- do not add
+    # a warning here on the assumption that a line-based format cannot carry it.
+
     # Only the paths this run will touch, fed from the scan. Walking the whole
     # home instead would ignore --exclude, follow the tree across mount points
     # the scan deliberately skipped, and take far longer than the run itself.
-    local rc=0
+    #
+    # Created under umask 0077 rather than created-then-chmod'ed: the snapshot
+    # is a complete structural listing of somebody's home, and the chmod-after
+    # form leaves it world-readable for the length of the walk.
+    local rc=0 prev_umask
+    prev_umask=$(umask)
+    umask 0077
     timeout "$BACKUP_TIMEOUT" xargs -0 -r getfacl -p -- <"$WORK_DIR/snap" \
         >"$BACKUP_FILE" 2>"$WORK_DIR/backup.err" || rc=$?
+    umask "$prev_umask"
+
     if ((rc != 0)) || [[ ! -s $BACKUP_FILE ]]; then
         [[ -s $WORK_DIR/backup.err ]] && head -n 5 "$WORK_DIR/backup.err" >&2
         die "$EX_FAIL" "Snapshot failed (status $rc). Nothing was changed. Raise --backup-timeout if it timed out, or pass --no-backup to accept an irreversible run."
     fi
 
+    # Belt and braces: umask only constrains creation, and the file may already
+    # have existed with looser bits.
     chmod 0600 "$BACKUP_FILE" 2>/dev/null || log WARN "Could not restrict permissions on $BACKUP_FILE"
     log SUCCESS "Snapshot written. Undo this run with: setfacl --restore=$BACKUP_FILE"
     return 0

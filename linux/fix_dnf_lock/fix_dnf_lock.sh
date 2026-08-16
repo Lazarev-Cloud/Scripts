@@ -11,11 +11,15 @@
 # Origin:  https://github.com/Lazarev-Cloud/Scripts
 #
 # Error model: this is a linear script -- detect, decide, act -- that must abort
-# on the first unexpected failure rather than carry on towards an `rm`, so
-# `set -Eeuo pipefail` is the right choice and is used deliberately. On top of
-# that, every detection routine fails CLOSED: a lock whose state cannot be
-# determined is reported as held, and nothing is ever removed on the strength of
-# a check that did not actually run. Do not weaken either property.
+# rather than carry on towards an `rm`, so `set -Eeuo pipefail` is used
+# deliberately. Treat it as a backstop rather than as the safety mechanism:
+# much of the work below runs inside `if` and `||` conditions, and bash switches
+# errexit (and the ERR trap) off for the whole of a function called that way.
+#
+# The property that actually keeps this script safe is that every detection
+# routine fails CLOSED: a lock whose state cannot be determined is reported as
+# held, and nothing is ever removed on the strength of a check that did not
+# actually run. Do not weaken that.
 set -Eeuo pipefail
 # inherit_errexit is bash >= 4.4. Older shells simply miss the extra safety net;
 # every fallible command is checked explicitly regardless.
@@ -144,6 +148,15 @@ rpm transactions are what corrupt the RPM database. This script therefore
 identifies the process holding each lock and refuses to remove anything while
 one is alive.
 
+WHEN YOU ACTUALLY NEED THIS: less often than the internet suggests. dnf already
+recovers from the common case by itself -- when a *_lock.pid file records a PID
+that no longer exists, dnf truncates the file and takes the lock over, and it
+unlinks its own lock on a clean exit. The state dnf cannot recover from is a
+lock file whose contents are not a PID at all; it reports "Malformed lock file
+found" and tells you to remove the file, which is what this script does after
+proving nothing holds it. Run with --dry-run first: "nothing to clean up" is a
+perfectly normal and common answer here.
+
 Usage:
   fix_dnf_lock.sh [options]
 
@@ -187,6 +200,29 @@ be whole; the value in brackets is what this run would use.
 Colour: NO_COLOR (any non-empty value) disables it, as does --color never.
 Colour is emitted only when stdout is a terminal unless --color always is given.
 
+How a lock is judged:
+  $PROC_LOCKS is the authority. It records every POSIX (fcntl), FLOCK and OFD
+  lock held in the kernel, so a lock is only called free when no record names
+  the file's inode. An OFD lock is reported by the kernel with a PID of -1,
+  which this script shows as an unidentified owner and treats as held.
+
+  That covers both mechanisms in play here: dnf takes its
+  *_lock.pid locks with flock(2), and it is read rather than probed because
+  reading names the holding process and does not require taking a lock to find
+  out whether one could be taken.
+
+  For dnf's own lock files the recorded PID is used as a second check, the same
+  test dnf itself applies. fuser and lsof are consulted as a third, because they
+  can see a process holding the file OPEN without a lock, which $PROC_LOCKS
+  cannot. If neither is installed the report says the corroboration did not
+  happen rather than implying it passed; if either times out, that file is
+  reported 'unknown' and nothing is removed.
+
+  Independently of any file, a dnf, yum or rpm process running anywhere on the
+  system blocks every removal, because an rpm transaction releases and re-takes
+  its locks between stages -- "no lock held right now" is not the same as "no
+  transaction in flight".
+
 Blast radius:
   With --yes (or an answered prompt) this script deletes lock files that no
   process holds or has open, from this list --
@@ -216,9 +252,12 @@ Exit status:
   130  interrupted (SIGINT/SIGTERM)
 
 75 is the interesting one for monitoring: the machine is busy, not broken, and
-cron and systemd both read it as "retry later". The exception is a lock path
-that is a symlink or not a regular file -- that is also 75 and will not clear on
-a retry, so look at the report before wiring a retry loop around it.
+cron and systemd both read it as "retry later". Four cases return 75 and will
+NOT clear on a retry, so read the report before wiring a retry loop around it:
+a lock path that is a symlink, one that is not a regular file, one whose
+fuser/lsof probe timed out (usually a wedged NFS or FUSE mount), and a lock file
+whose recorded PID has been reused by an unrelated process -- the report shows
+that process's command line, so you can see it is not a package manager.
 
 A non-zero 'dnf check' does not fail the run: it reports RPM database problems
 that predate this script, and the fact that it ran proves the locks are usable.
@@ -414,6 +453,16 @@ release_self_lock() {
 
 # --- Holder detection --------------------------------------------------------
 
+# Trims leading and trailing whitespace. `read` does this in one step via IFS;
+# `${var## }` strips exactly one space, which is not enough for the run of
+# padding that `ps -o etime=` emits or the trailing separator left behind when
+# a NUL-separated /proc/<pid>/cmdline is flattened.
+_trim() {
+    local trimmed
+    read -r trimmed <<<"$1" || trimmed=''
+    printf '%s' "$trimmed"
+}
+
 # Describes a PID from procfs. Returns 1 if the process has already gone.
 describe_pid() {
     local pid=$1 comm='' cmdline='' etime=''
@@ -437,8 +486,8 @@ describe_pid() {
         etime=$(ps -o etime= -p "$pid" 2>/dev/null) || etime=''
     fi
     # Trim the surrounding whitespace ps and cmdline leave behind.
-    etime=${etime## } etime=${etime%% }
-    cmdline=${cmdline%% }
+    etime=$(_trim "$etime")
+    cmdline=$(_trim "$cmdline")
     if ((${#cmdline} > CMDLINE_MAX)); then
         cmdline="${cmdline:0:CMDLINE_MAX}..."
     fi
@@ -478,21 +527,36 @@ locks_for_inode() {
             n = split(dev, part, ":")
             if (n >= 3 && part[n] == want) printf "%s %s\n", pid, kind
         }
-    ' "$PROC_LOCKS"
+    ' "$PROC_LOCKS" 2>/dev/null
+    # awk's own "cannot open file" goes to /dev/null on purpose: the non-zero
+    # status is what matters, and scan_path turns it into a clearer message that
+    # names the file and says the lock state is unknown. Two errors for one
+    # fault would only invite someone to treat the noisier one as the real one.
 }
 
-# Corroboration only. fuser and lsof report processes with the file OPEN, which
-# is a superset of the processes that have it LOCKED -- an open descriptor
-# without a lock does not block dnf. They are consulted because they are the
-# tools an operator will reach for, and because a second opinion that disagrees
-# with /proc/locks is worth printing. Neither is required to be installed.
+# fuser and lsof report processes with the file OPEN, which is a superset of the
+# processes that have it LOCKED -- /proc/locks remains the authority on locks.
+# What these add is the process that holds the file open without a lock, which
+# /proc/locks cannot see.
+#
+# The caller must distinguish three outcomes, so they are returned separately:
+#   0  the probe ran; stdout is the (possibly empty) list of PIDs
+#   1  the tool is not installed, so no opinion was formed at all
+#   2  the probe ran but timed out, so the answer is genuinely UNKNOWN
+#
+# Collapsing 2 into 1 is what makes a wedged mount look like a clean bill of
+# health, so scan_path treats them differently.
+#
+# `--` is deliberately not passed: resolve_paths already guarantees every path is
+# absolute, so an end-of-options marker buys nothing here and dropping it avoids
+# depending on how each tool's own option parser treats one.
 openers_via_fuser() {
     local path=$1 out rc=0
     command -v fuser >/dev/null 2>&1 || return 1
-    out=$(timeout "$PROBE_TIMEOUT" fuser -- "$path" 2>/dev/null) || rc=$?
-    # fuser exits 1 when nothing has the file open, and >=124 when the timeout
-    # fired. Only the latter means "we do not know".
-    ((rc >= 124)) && return 1
+    out=$(timeout "$PROBE_TIMEOUT" fuser "$path" 2>/dev/null) || rc=$?
+    # fuser exits 1 when nothing has the file open -- that is an answer, not a
+    # failure. 124 is the timeout firing; 125-127 mean timeout could not run it.
+    ((rc >= 124)) && return 2
     printf '%s\n' "$out"
     return 0
 }
@@ -500,8 +564,8 @@ openers_via_fuser() {
 openers_via_lsof() {
     local path=$1 out rc=0
     command -v lsof >/dev/null 2>&1 || return 1
-    out=$(timeout "$PROBE_TIMEOUT" lsof -t -- "$path" 2>/dev/null) || rc=$?
-    ((rc >= 124)) && return 1
+    out=$(timeout "$PROBE_TIMEOUT" lsof -t "$path" 2>/dev/null) || rc=$?
+    ((rc >= 124)) && return 2
     printf '%s\n' "$out"
     return 0
 }
@@ -509,10 +573,28 @@ openers_via_lsof() {
 # Reads the PID a dnf/yum lock file advertises. These are pid files as well as
 # lock targets, so the recorded PID is a useful cross-check: if it names a live
 # process the lock is real even when the lock record is ambiguous.
+#
+# This mirrors what dnf itself does. dnf/lock.py's ProcessLock._try_lock reads
+# the recorded PID and, when /proc/<pid>/stat does not exist, truncates the file
+# and takes the lock over -- so a dead PID is not a condition dnf needs help
+# with, and this script is no more conservative than dnf is.
+#
+# Returning 1 for content that is not a plain integer is deliberate, not an
+# oversight: that is dnf's "Malformed lock file found" case, the one state dnf
+# cannot recover from on its own and whose documented remedy is removing the
+# file. Reporting no recorded PID lets such a file fall through to the normal
+# lock checks and be cleared if genuinely unheld.
 recorded_pid() {
     local path=$1 content=''
     [[ -s $path ]] || return 1
-    read -r content <"$path" 2>/dev/null || return 1
+    # `read` returns 1 at EOF without a delimiter, and that is precisely what a
+    # dnf lock file is: dnf/lock.py writes `os.write(fd, str(pid).encode())`
+    # with NO trailing newline. Gating on read's status therefore rejected every
+    # real dnf lock file and silently skipped this whole cross-check. Judge the
+    # content instead -- an unreadable file leaves `content` empty and is caught
+    # by the emptiness test below.
+    read -r content <"$path" 2>/dev/null || true
+    [[ -n $content ]] || return 1
     [[ $content =~ ^[0-9]+$ ]] || return 1
     printf '%s' "$content"
     return 0
@@ -577,17 +659,28 @@ scan_path() {
         found=1
     done <<<"$records"
 
-    local opener out
+    local opener out prc probes_ran=0 probes_failed=0
     for opener in openers_via_fuser openers_via_lsof; do
-        if out=$("$opener" "$path"); then
-            for pid in $out; do
-                [[ $pid =~ ^[0-9]+$ ]] || continue
-                if desc=$(describe_pid "$pid"); then
-                    notes+=("has it open: $desc")
-                    found=1
-                fi
-            done
-        fi
+        prc=0
+        # The capture and the status read must stay one statement: a bare
+        # assignment followed by a separate `$?` read would abort under errexit.
+        out=$("$opener" "$path") || prc=$?
+        case $prc in
+            0)
+                probes_ran=1
+                for pid in $out; do
+                    [[ $pid =~ ^[0-9]+$ ]] || continue
+                    if desc=$(describe_pid "$pid"); then
+                        notes+=("has it open: $desc")
+                        found=1
+                    fi
+                done
+                ;;
+            2)
+                probes_failed=1
+                notes+=("${opener#openers_via_} probe timed out after ${PROBE_TIMEOUT}s")
+                ;;
+        esac
     done
 
     if pid=$(recorded_pid "$path"); then
@@ -595,21 +688,32 @@ scan_path() {
             notes+=("names a live process: $desc")
             found=1
         else
-            notes+=("names pid $pid, which no longer exists")
+            notes+=("names pid $pid, which no longer exists -- dnf reclaims such a lock by itself")
         fi
     fi
 
+    # A probe that timed out is not the same as a probe that is not installed.
+    # The first means this file's state is genuinely unknown -- a wedged NFS or
+    # FUSE mount is the usual cause -- and must fail closed. The second is a
+    # known-absent capability, and /proc/locks is still authoritative for locks,
+    # so the verdict stands; the report just has to say the corroboration never
+    # happened rather than implying it passed.
+    if ((probes_failed)); then
+        STATE["$path"]=unknown
+        DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
+        return 0
+    fi
+    ((probes_ran)) ||
+        notes+=('open-file corroboration not performed: neither fuser (psmisc) nor lsof is installed')
+
     if ((found)); then
         STATE["$path"]=locked
-        DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
     else
         STATE["$path"]=free
-        if ((${#notes[@]})); then
-            DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
-        else
-            DETAIL["$path"]="no lock record in $PROC_LOCKS (device $dev, inode $inode)"
-        fi
+        notes=("no lock record in $PROC_LOCKS (device $dev, inode $inode)"
+            ${notes[@]+"${notes[@]}"})
     fi
+    DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
     return 0
 }
 
@@ -790,12 +894,20 @@ remove_stale_locks() {
     # is an unbound-variable error under `set -u`.
     ((${#STALE[@]})) || return 0
     for path in "${STALE[@]}"; do
-        if ((DRY_RUN)); then
-            log INFO "[dry-run] Would remove stale lock $path"
-            continue
-        fi
+        # The safety gate runs in BOTH modes deliberately. --dry-run is the mode
+        # this script tells an operator to run first, so it has to print the plan
+        # the real run would actually follow. Announcing "would remove" for a path
+        # that safe_to_remove goes on to refuse -- reachable whenever --path or
+        # LZC_FIX_DNF_LOCK_PATHS names something that is not shaped like a lock
+        # file -- makes the rehearsal claim a destruction that cannot happen, and
+        # exits 0 where the real run exits 1. scan_path is read-only, so running
+        # the gate early costs nothing but the probes.
         if ! safe_to_remove "$path"; then
             rc=1
+            continue
+        fi
+        if ((DRY_RUN)); then
+            log INFO "[dry-run] Would remove stale lock $path"
             continue
         fi
         if rm -f -- "$path"; then

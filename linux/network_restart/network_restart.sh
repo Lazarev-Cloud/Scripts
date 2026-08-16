@@ -28,7 +28,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 trap '' HUP
 
 readonly SCRIPT_NAME='Network Interface Restart'
-readonly SCRIPT_VERSION='2.1'
+readonly SCRIPT_VERSION='2.2'
 
 # Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
 # sysexits.h, which cron and systemd read as "retry later" rather than a fault.
@@ -43,6 +43,7 @@ WAIT_SECS="${LZC_NETWORK_RESTART_WAIT:-60}"
 SETTLE_SECS="${LZC_NETWORK_RESTART_SETTLE:-2}"
 CHECK_HOST="${LZC_NETWORK_RESTART_CHECK_HOST:-auto}"
 PING_COUNT="${LZC_NETWORK_RESTART_PING_COUNT:-3}"
+PING_WAIT="${LZC_NETWORK_RESTART_PING_WAIT:-2}"
 CMD_TIMEOUT="${LZC_NETWORK_RESTART_TIMEOUT:-30}"
 STATE_DIR="${LZC_NETWORK_RESTART_STATE_DIR:-/run/network-restart}"
 LOCK_FILE="${LZC_NETWORK_RESTART_LOCK:-/run/lock/lzc-network-restart.lock}"
@@ -158,10 +159,17 @@ Options:
       --check-host HOST   Ping this after the bounce. 'auto' uses the default
                           gateway recorded before the bounce, 'none' skips the
                           check (default: $CHECK_HOST).
+      --ping-count N      Packets for that ping. Minimum 1 (default: $PING_COUNT).
+      --ping-wait SECONDS Per-packet reply timeout for that ping (ping -W).
+                          Minimum 1 (default: $PING_WAIT).
+      --settle SECONDS    Pause between taking the interface down and bringing
+                          it back up; 0 for none (default: $SETTLE_SECS).
       --timeout SECONDS   Bounds each individual command this script runs --
                           one nmcli/networkctl/ifup/ip invocation, or the ping
                           -- not the wait for the interface to return, which is
                           --wait. Minimum 1 (default: $CMD_TIMEOUT).
+      --state-dir DIR     Where the rollback script and its cancel token live
+                          (default: $STATE_DIR).
       --color WHEN        auto | always | never (default: auto).
   -V, --version           Print version and exit.
   -h, --help              Print this help and exit.
@@ -173,7 +181,8 @@ and 0/false/no/off, case-insensitively; anything else is a usage error:
   LZC_NETWORK_RESTART_FORCE=1           LZC_NETWORK_RESTART_MANAGER=auto
   LZC_NETWORK_RESTART_ROLLBACK=120      LZC_NETWORK_RESTART_WAIT=60
   LZC_NETWORK_RESTART_CHECK_HOST=auto   LZC_NETWORK_RESTART_PING_COUNT=3
-  LZC_NETWORK_RESTART_TIMEOUT=30        LZC_NETWORK_RESTART_SETTLE=2
+  LZC_NETWORK_RESTART_PING_WAIT=2       LZC_NETWORK_RESTART_TIMEOUT=30
+  LZC_NETWORK_RESTART_SETTLE=2
   LZC_NETWORK_RESTART_STATE_DIR=/run/network-restart
   LZC_NETWORK_RESTART_LOCK=/run/lock/lzc-network-restart.lock
 
@@ -205,23 +214,29 @@ EOF
 # Without this, LZC_NETWORK_RESTART_YES=true reaches (( )) as a bare word, and
 # under `set -u` bash aborts with "true: unbound variable" before the script can
 # say anything useful.
+#
+# $2 is the spelling the operator typed -- the flag and the environment
+# variable, not the internal variable name. Answering someone who set
+# LZC_NETWORK_RESTART_YES with "ASSUME_YES must be true or false" points them at
+# a string that appears in no documentation and cannot be grepped for.
 _normalise_bool() {
-    local name=$1 value
+    local name=$1 label=$2 value
     case ${!name,,} in
         1 | true | yes | on) value=1 ;;
         0 | false | no | off | '') value=0 ;;
-        *) die "$EX_USAGE" "$name must be true or false, got '${!name}'" ;;
+        *) die "$EX_USAGE" "$label must be 1/true/yes/on or 0/false/no/off, got '${!name}'" ;;
     esac
     printf -v "$name" '%s' "$value"
 }
 
 _normalise_int() {
-    local name=$1 min=$2 value
-    [[ ${!name} =~ ^[0-9]+$ ]] || die "$EX_USAGE" "$name must be a whole number, got '${!name}'"
+    local name=$1 min=$2 label=$3 value
+    [[ ${!name} =~ ^[0-9]+$ ]] ||
+        die "$EX_USAGE" "$label must be a whole number, got '${!name}'"
     # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
     # an invalid octal literal and aborts the arithmetic.
     value=$((10#${!name}))
-    ((value >= min)) || die "$EX_USAGE" "$name must be at least $min, got '${!name}'"
+    ((value >= min)) || die "$EX_USAGE" "$label must be at least $min, got '${!name}'"
     printf -v "$name" '%s' "$value"
 }
 
@@ -266,9 +281,29 @@ parse_args() {
                 CHECK_HOST=$2
                 shift
                 ;;
+            --ping-count)
+                need_arg "$1" $# "${2-}"
+                PING_COUNT=$2
+                shift
+                ;;
+            --ping-wait)
+                need_arg "$1" $# "${2-}"
+                PING_WAIT=$2
+                shift
+                ;;
+            --settle)
+                need_arg "$1" $# "${2-}"
+                SETTLE_SECS=$2
+                shift
+                ;;
             --timeout)
                 need_arg "$1" $# "${2-}"
                 CMD_TIMEOUT=$2
+                shift
+                ;;
+            --state-dir)
+                need_arg "$1" $# "${2-}"
+                STATE_DIR=$2
                 shift
                 ;;
             --color)
@@ -306,22 +341,24 @@ parse_args() {
 
     # Validated before the first arithmetic use below, which is the whole point:
     # a bare word reaching (( )) under `set -u` is a crash, not a message.
-    local name
-    for name in ASSUME_YES FORCE; do
-        _normalise_bool "$name"
-    done
+    _normalise_bool ASSUME_YES '--yes (LZC_NETWORK_RESTART_YES)'
+    _normalise_bool FORCE '--force (LZC_NETWORK_RESTART_FORCE)'
 
     # Minimum 1 for anything handed to timeout(1): `timeout 0` means NO limit,
     # so accepting 0 would silently remove the protection the option exists to
     # provide. --wait 0 would make the post-bounce polling loop give up before
-    # its first check, and `ping -c 0` is rejected by ping itself.
-    for name in CMD_TIMEOUT WAIT_SECS PING_COUNT; do
-        _normalise_int "$name" 1
-    done
+    # its first check, `ping -c 0` is rejected by ping itself, and `ping -W 0`
+    # is either rejected or means "wait forever" depending on the ping build.
+    _normalise_int CMD_TIMEOUT 1 '--timeout (LZC_NETWORK_RESTART_TIMEOUT)'
+    _normalise_int WAIT_SECS 1 '--wait (LZC_NETWORK_RESTART_WAIT)'
+    _normalise_int PING_COUNT 1 '--ping-count (LZC_NETWORK_RESTART_PING_COUNT)'
+    _normalise_int PING_WAIT 1 '--ping-wait (LZC_NETWORK_RESTART_PING_WAIT)'
     # 0 is meaningful for both: --rollback 0 disables the rollback (documented),
     # and --settle 0 asks for no pause between down and up.
-    _normalise_int ROLLBACK_SECS 0
-    _normalise_int SETTLE_SECS 0
+    _normalise_int ROLLBACK_SECS 0 '--rollback (LZC_NETWORK_RESTART_ROLLBACK)'
+    _normalise_int SETTLE_SECS 0 '--settle (LZC_NETWORK_RESTART_SETTLE)'
+
+    [[ -n $STATE_DIR ]] || die "$EX_USAGE" "--state-dir must not be empty"
 
     # --dry-run beats --yes so that adding -n to a known-good command line is
     # always a safe way to preview it.
@@ -461,10 +498,22 @@ networkd_manages() {
 
 ifupdown_manages() {
     command -v ifup >/dev/null 2>&1 || return 1
+    # The dot is a regex wildcard, and VLAN interfaces are named with one
+    # (eth0.100). Unescaped, a stanza for a differently named interface such as
+    # eth0x100 would match and this host would be misdetected as ifupdown-
+    # managed. preflight already limits IFACE to [A-Za-z0-9._:-], so the dot is
+    # the only metacharacter that can reach here.
+    #
+    # The replacement is single-quoted on purpose. Written bare as {IFACE//./\\.}
+    # bash strips the backslash during quote removal and the result is the
+    # unescaped name again -- the substitution silently does nothing, which is
+    # indistinguishable from working until you test it against a name like
+    # eth0x100. Quoting the replacement is what actually puts a backslash there.
+    local re=${IFACE//./'\.'}
     local f
     for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
         [[ -f $f ]] || continue
-        grep -Eq "^[[:space:]]*(iface|auto|allow-hotplug)[[:space:]]+.*\<${IFACE}\>" "$f" 2>/dev/null &&
+        grep -Eq "^[[:space:]]*(iface|auto|allow-hotplug)[[:space:]]+.*\<${re}\>" "$f" 2>/dev/null &&
             return 0
     done
     return 1
@@ -619,16 +668,48 @@ rollback_plan() {
     recovery_commands | sed 's/^/    /'
 }
 
+# The longest verification can legitimately take: the link wait, then the
+# address wait, then the ping. Used only to warn -- see arm_rollback.
+verify_budget() {
+    local budget=$((WAIT_SECS + CMD_TIMEOUT))
+    [[ -n $SNAP_ADDRS ]] && budget=$((budget + WAIT_SECS))
+    printf '%s' "$budget"
+}
+
 arm_rollback() {
     ((ROLLBACK_SECS > 0)) || {
         log WARN 'Rollback disabled (--rollback 0): a failed bounce will NOT self-recover.'
         return 0
     }
 
+    # A rollback that fires while verification is still running is not dangerous
+    # -- every recovery command is idempotent -- but it does make the final
+    # "Rollback cancelled" a false statement, because by then it has already
+    # run. Warn rather than adjust: raising --rollback silently would extend the
+    # window in which a genuinely dead host stays dead, which is the operator's
+    # call and not this script's.
+    local budget
+    budget=$(verify_budget)
+    if ((ROLLBACK_SECS < budget)); then
+        log WARN "--rollback ${ROLLBACK_SECS}s is shorter than the worst-case verification time (${budget}s);"
+        log WARN 'the rollback may fire while this run is still verifying. Raise --rollback to avoid that.'
+    fi
+
     mkdir -p -- "$STATE_DIR" || die "$EX_FAIL" "cannot create state directory $STATE_DIR"
     # Stale state from a run that was killed before it could tidy up. Only files
     # older than a day, so a concurrent run is never disturbed.
-    find "$STATE_DIR" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+    #
+    # Restricted to the two names this script itself creates. Without that name
+    # filter this is `find <operator-supplied dir> -type f -delete` running as
+    # root: --state-dir is a normal option, and pointing it at a directory that
+    # already holds something else -- /etc, /root/.ssh -- deleted every regular
+    # file in it that happened to be a day old. The loop only ever meant "clean
+    # up my own leftovers", so it now says exactly that. Both suffixes are safe
+    # to match on: RUN_ID is "${IFACE}.$$.$(date +%s)" and IFACE is gated to
+    # [A-Za-z0-9._:-] in preflight, so the suffix is always the last component.
+    find "$STATE_DIR" -maxdepth 1 -type f \
+        \( -name '*.cancel' -o -name '*.recover.sh' \) \
+        -mmin +1440 -delete 2>/dev/null || true
 
     RUN_ID="${IFACE}.$$.$(date +%s)"
     CANCEL_FILE="$STATE_DIR/$RUN_ID.cancel"
@@ -710,14 +791,41 @@ cancel_rollback() {
 
 # --- The bounce --------------------------------------------------------------
 
+# Runs one command under the per-command timeout and reports what it said when
+# it fails.
+#
+# Discarding stderr here was a real defect: a failed bounce printed "Failed to
+# restart eth0" and nothing else, at the exact moment the link may be down and
+# the host unreachable -- so the one message that would have named the cause
+# ("Error: Connection activation failed: no suitable device found") was thrown
+# away. Output is captured into a variable rather than a temp file because this
+# script has no TMP_DIR and adding one adds failure modes to preflight and to
+# the exit path.
+#
+# The real status is returned, not a flattened 1, so callers and the operator
+# can tell a timeout (124) from a refusal. `local out` is declared separately
+# from the assignment on purpose: `local out=$(...)` would make `local`'s own
+# status the one bash sees and the failure would vanish (ShellCheck SC2155).
 run_step() {
     local desc=$1
     shift
+    local out rc=0
     log INFO "$desc"
-    if ! timeout "$CMD_TIMEOUT" "$@" >/dev/null 2>&1; then
-        return 1
+    out=$(timeout "$CMD_TIMEOUT" "$@" 2>&1) || rc=$?
+    ((rc == 0)) && return 0
+
+    if ((rc == 124)); then
+        log WARN "  timed out after ${CMD_TIMEOUT}s"
     fi
-    return 0
+    # Bounded: some of these tools are chatty, and a wall of text at the point
+    # the operator is deciding whether they still have a host is not help.
+    local line n=0
+    while IFS= read -r line && ((n < 3)); do
+        [[ -n $line ]] || continue
+        log WARN "  $line"
+        n=$((n + 1))
+    done <<<"$out"
+    return "$rc"
 }
 
 bounce() {
@@ -813,7 +921,7 @@ check_connectivity() {
         return 0
     fi
     log INFO "Pinging $target"
-    timeout "$CMD_TIMEOUT" ping -n -c "$PING_COUNT" -W 2 "$target" >/dev/null 2>&1
+    timeout "$CMD_TIMEOUT" ping -n -c "$PING_COUNT" -W "$PING_WAIT" "$target" >/dev/null 2>&1
 }
 
 verify() {
@@ -867,19 +975,45 @@ report_plan() {
     printf '\nRollback (armed before the bounce, cancelled only after verification):\n'
     if ((ROLLBACK_SECS > 0)); then
         printf '  after %ss, unless cancelled:\n' "$ROLLBACK_SECS"
+        printf '  state in %s\n' "$STATE_DIR"
         rollback_plan
     else
         printf '    disabled (--rollback 0)\n'
     fi
 
-    printf '\nVerification:\n'
+    printf '\nVerification (worst case %ss):\n' "$(verify_budget)"
     printf '    link up within %ss\n' "$WAIT_SECS"
     [[ -n $SNAP_ADDRS ]] && printf '    global IPv4 address returns within %ss\n' "$WAIT_SECS"
     local target
     if target=$(connectivity_target); then
-        printf '    ping %s (%s packets)\n' "$target" "$PING_COUNT"
+        printf '    ping %s (%s packets, %ss each)\n' "$target" "$PING_COUNT" "$PING_WAIT"
+        # An honest report of what the check does and does not prove. When this
+        # interface owned no default route, the target is the host's gateway
+        # wherever it lives, so a reply may arrive entirely over some other
+        # interface. Binding the ping with -I is not the fix: an unnumbered
+        # bridge port has no source address to bind to and the check would fail
+        # on a perfectly healthy link.
+        if [[ $CHECK_HOST == auto && -z $SNAP_OWN_GATEWAY ]]; then
+            printf '      note: %s is the host default gateway, not one this\n' "$target"
+            printf '            interface owns, so a reply does not by itself\n'
+            printf '            prove %s recovered. --check-host sets it.\n' "$IFACE"
+        fi
     else
         printf '    no connectivity check\n'
+    fi
+
+    # The same comparison arm_rollback makes, repeated here because arm_rollback
+    # only runs under --yes -- i.e. the operator first saw this warning one step
+    # before the link went down, having already made the decision from a plan
+    # that printed "after 120s" and "worst case 150s" side by side and said
+    # nothing. The plan is the documented way to decide; the check belongs where
+    # the decision is made, and stays in arm_rollback so a failed run's log has
+    # it too.
+    if ((ROLLBACK_SECS > 0)) && ((ROLLBACK_SECS < $(verify_budget))); then
+        printf '    note: --rollback %ss is shorter than this, so the rollback may\n' "$ROLLBACK_SECS"
+        printf '          fire while the run is still verifying. Harmless (recovery\n'
+        printf '          is idempotent) but "Rollback cancelled" would then be\n'
+        printf '          reported for one that already ran. Raise --rollback.\n'
     fi
     printf '\n'
 }

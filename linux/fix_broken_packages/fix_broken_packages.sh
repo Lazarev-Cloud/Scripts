@@ -31,6 +31,8 @@ LOG_FILE="${LZC_FIX_BROKEN_PACKAGES_LOG:-/var/log/apt-repair.log}"
 LOG_MAX_BYTES="${LZC_FIX_BROKEN_PACKAGES_LOG_MAX_BYTES:-5242880}"
 LOCK_FILE="${LZC_FIX_BROKEN_PACKAGES_LOCK:-/run/lock/lzc-fix_broken_packages.lock}"
 DPKG_LOCK_TIMEOUT="${LZC_FIX_BROKEN_PACKAGES_DPKG_LOCK_TIMEOUT:-600}"
+ACQUIRE_RETRIES="${LZC_FIX_BROKEN_PACKAGES_ACQUIRE_RETRIES:-3}"
+LISTCHANGES_FRONTEND="${LZC_FIX_BROKEN_PACKAGES_LISTCHANGES_FRONTEND:-none}"
 CONFIGURE_TIMEOUT="${LZC_FIX_BROKEN_PACKAGES_CONFIGURE_TIMEOUT:-1800}"
 UPDATE_TIMEOUT="${LZC_FIX_BROKEN_PACKAGES_UPDATE_TIMEOUT:-600}"
 FIX_TIMEOUT="${LZC_FIX_BROKEN_PACKAGES_FIX_TIMEOUT:-1800}"
@@ -68,6 +70,11 @@ declare -a APT_OPTS=()
 declare -a APT_WRITE_OPTS=()
 JOURNAL_PENDING=0
 APT_CHECK_OK=1
+# Whether the probe behind each count actually ran. A failed inspection must
+# never be reported as a count of zero -- see count_label().
+BROKEN_KNOWN=1
+HELD_KNOWN=1
+JOURNAL_KNOWN=1
 PASSES_RUN=0
 LOG_READY=0
 LOG_SINK=/dev/null
@@ -117,6 +124,35 @@ banner() {
     printf '%s%s v%s%s\n\n' "$GN" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$CL"
 }
 
+# Renders a count only when the probe behind it actually ran. A bare "0" from a
+# failed inspection is indistinguishable from a "0" that means the system is
+# clean, and this summary is the entire product of the run -- so an unverified
+# count says so instead of quietly reading as good news.
+count_label() {
+    local known=$1 n=$2
+    if ((known)); then
+        printf '%d' "$n"
+    elif ((n)); then
+        printf '%d (incomplete: the check could not finish)' "$n"
+    else
+        printf 'unknown (the check could not run)'
+    fi
+}
+
+# The yes/no counterpart of count_label(), and it exists for the same reason:
+# "no" and "I could not look" are different facts, and printing the second as
+# the first is how an unverified system reads as a healthy one.
+yes_no_label() {
+    local known=$1 yes=$2
+    if ((!known)); then
+        printf 'unknown (the check could not run)'
+    elif ((yes)); then
+        printf 'yes'
+    else
+        printf 'no'
+    fi
+}
+
 usage() {
     cat <<EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
@@ -141,7 +177,9 @@ The repair sequence, in the order it has to happen:
 
 Verification is a fresh inspection: 'apt-get check' plus the dpkg status of
 every installed package. The exit status of the repair commands is never
-treated as proof that the repair worked.
+treated as proof that the repair worked. If an inspection cannot run, the
+result is reported as unknown and the run does NOT exit $EX_OK -- an
+unverifiable system is not a repaired one.
 
 Options:
   -y, --yes                 Run unattended; no prompts. Required with no TTY.
@@ -201,6 +239,8 @@ so \`env | grep LZC_\` lists everything you have configured:
   LZC_FIX_BROKEN_PACKAGES_PASSES=2     LZC_FIX_BROKEN_PACKAGES_SKIP_UPDATE=1
   LZC_FIX_BROKEN_PACKAGES_CONFFILE=old
   LZC_FIX_BROKEN_PACKAGES_DPKG_LOCK_TIMEOUT=600
+  LZC_FIX_BROKEN_PACKAGES_ACQUIRE_RETRIES=3
+  LZC_FIX_BROKEN_PACKAGES_LISTCHANGES_FRONTEND=none
   LZC_FIX_BROKEN_PACKAGES_CONFIGURE_TIMEOUT=1800
   LZC_FIX_BROKEN_PACKAGES_UPDATE_TIMEOUT=600
   LZC_FIX_BROKEN_PACKAGES_FIX_TIMEOUT=1800
@@ -340,7 +380,15 @@ validate_args() {
     [[ $CONFFILE =~ ^(old|new)$ ]] ||
         die "$EX_USAGE" "--conffile must be old or new, got '$CONFFILE'"
 
+    [[ $LISTCHANGES_FRONTEND =~ ^[a-z][a-z-]*$ ]] ||
+        die "$EX_USAGE" \
+            "LZC_FIX_BROKEN_PACKAGES_LISTCHANGES_FRONTEND must be an apt-listchanges frontend name (none, pager, text, mail, ...), got '$LISTCHANGES_FRONTEND'"
+
     normalise_int PASSES 1 '--passes (LZC_FIX_BROKEN_PACKAGES_PASSES)'
+
+    # 0 is meaningful here and is not a timeout: it means "do not retry a failed
+    # download at all", which is the right choice on a metered or air-gapped host.
+    normalise_int ACQUIRE_RETRIES 0 'LZC_FIX_BROKEN_PACKAGES_ACQUIRE_RETRIES'
 
     # Minimum 1, never 0: every one of these is handed to timeout(1), where 0
     # means "no limit" and would silently remove the protection the setting
@@ -481,6 +529,11 @@ setup_apt_env() {
     # A repair must not also restart every service on the box; list only.
     export NEEDRESTART_MODE=l
 
+    # apt-listchanges runs as an APT Pre-Install-Pkgs hook, outside everything
+    # DEBIAN_FRONTEND governs, and with `confirm=true` in its own configuration
+    # it asks a question on stdin. 'none' is its documented off switch.
+    export APT_LISTCHANGES_FRONTEND="$LISTCHANGES_FRONTEND"
+
     # ucf-managed conffiles are a separate mechanism from dpkg's, and neither
     # the Dpkg::Options below nor dpkg's own --force-conf* reach them. ucf's
     # variables are spelled with two Fs (ucf(1)): UCF_FORCE_CONFFOLD keeps the
@@ -494,6 +547,9 @@ setup_apt_env() {
     APT_OPTS=(
         -o "Dpkg::Use-Pty=0"
         -o "DPkg::Lock::Timeout=$DPKG_LOCK_TIMEOUT"
+        # A transient mirror or DNS blip should not abandon a repair that is
+        # already half done.
+        -o "Acquire::Retries=$ACQUIRE_RETRIES"
     )
     [[ -t 1 ]] || APT_OPTS+=(-q)
 
@@ -562,19 +618,60 @@ list_broken_packages() {
         '
 }
 
-list_held_packages() {
-    command -v apt-mark >/dev/null 2>&1 || return 0
-    timeout --foreground "$PROBE_TIMEOUT" apt-mark showhold 2>/dev/null
+# Fills HELD, and records in HELD_KNOWN whether the answer is real. apt-mark is
+# optional, so "not installed" and "installed but it failed" both have to render
+# as unknown rather than as a confident zero.
+collect_holds() {
+    local out rc=0
+    HELD=()
+    HELD_KNOWN=1
+
+    if ! command -v apt-mark >/dev/null 2>&1; then
+        HELD_KNOWN=0
+        return 0
+    fi
+    out=$(timeout --foreground "$PROBE_TIMEOUT" apt-mark showhold 2>/dev/null) || rc=$?
+    if ((rc != 0)); then
+        HELD_KNOWN=0
+        return 0
+    fi
+    # Guarded: `mapfile <<<""` yields one empty element, not zero, which would
+    # turn "no holds" into "one hold, named nothing".
+    [[ -n $out ]] && mapfile -t HELD <<<"$out"
+    return 0
 }
 
 # dpkg keeps a journal of an in-flight transaction here. Files left behind mean
 # dpkg was interrupted; `dpkg --configure -a` replays them. Never delete them.
-journal_pending() {
-    local dir="$DPKG_ADMIN_DIR/updates"
-    [[ -d $dir ]] || return 1
-    local -a entries=()
-    mapfile -t entries < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -print 2>/dev/null)
-    ((${#entries[@]} > 0))
+#
+# Sets JOURNAL_PENDING and JOURNAL_KNOWN. This directory is part of the very
+# database this script repairs, so "I could not look in it" is a real outcome
+# and must not render as "there is no interrupted transaction": that reading is
+# what lets a damaged /var/lib/dpkg report itself consistent and exit 0. The
+# dpkg package ships updates/ as a directory, so on an intact installation it is
+# always present -- its absence is a symptom, not an all-clear.
+check_journal() {
+    local dir="$DPKG_ADMIN_DIR/updates" out rc=0
+    JOURNAL_PENDING=0
+    JOURNAL_KNOWN=1
+
+    if [[ ! -d $dir ]]; then
+        JOURNAL_KNOWN=0
+        return 0
+    fi
+    # Command substitution, not `mapfile < <(find ...)`: that form discards
+    # find's exit status, and an unreadable directory then yields "no journal
+    # entries" -- indistinguishable from a finished transaction.
+    out=$(find "$dir" -mindepth 1 -maxdepth 1 -type f -print 2>/dev/null) || rc=$?
+    if [[ -n $out ]]; then
+        # Positive evidence is conclusive even from a scan that then failed: a
+        # journal file exists, so a transaction was interrupted. Only an empty
+        # result from a failed scan is genuinely unknown.
+        JOURNAL_PENDING=1
+    elif ((rc != 0)); then
+        JOURNAL_KNOWN=0
+    fi
+    return 0
 }
 
 # The authoritative verdict on dependencies. dpkg --audit is used only for
@@ -588,15 +685,42 @@ apt_dependencies_ok() {
 # The verdict from the most recent verify_state. Reads the cached state only;
 # it re-inspects nothing, so it is safe to call wherever the exit status has to
 # describe the system rather than the step that just ran.
+#
+# BROKEN_KNOWN is part of the verdict, not decoration: "I could not look" is not
+# the same answer as "I looked and it was fine", and only one of them may be
+# reported as a successful repair.
 state_is_clean() {
-    ((${#BROKEN[@]} == 0)) && ((JOURNAL_PENDING == 0)) && ((APT_CHECK_OK == 1))
+    ((BROKEN_KNOWN == 1)) && ((${#BROKEN[@]} == 0)) &&
+        ((JOURNAL_KNOWN == 1)) && ((JOURNAL_PENDING == 0)) &&
+        ((APT_CHECK_OK == 1))
 }
 
 # Re-inspects the system from scratch. 0 = consistent.
 verify_state() {
-    mapfile -t BROKEN < <(list_broken_packages)
-    JOURNAL_PENDING=0
-    journal_pending && JOURNAL_PENDING=1
+    local out rc=0
+    BROKEN=()
+    BROKEN_KNOWN=1
+
+    # The status of the probe matters here more than anywhere else in this
+    # script. `mapfile < <(cmd)` discards it, and a dpkg-query that failed then
+    # yields an empty BROKEN -- indistinguishable from a healthy system, on the
+    # exact corrupt-database case this script exists to repair. Command
+    # substitution keeps the status reachable.
+    out=$(list_broken_packages) || rc=$?
+    if ((rc != 0)); then
+        BROKEN_KNOWN=0
+        log WARN "Could not read the dpkg status database (dpkg-query exited $rc);" \
+            "the package state is unknown, not clean."
+    elif [[ -n $out ]]; then
+        # Guarded: `mapfile <<<""` yields one empty element, not zero.
+        mapfile -t BROKEN <<<"$out"
+    fi
+
+    check_journal
+    ((JOURNAL_KNOWN)) ||
+        log WARN "Could not inspect $DPKG_ADMIN_DIR/updates;" \
+            "whether a dpkg transaction was interrupted is unknown, not settled."
+
     APT_CHECK_OK=1
     apt_dependencies_ok || APT_CHECK_OK=0
 
@@ -608,14 +732,14 @@ diagnose() {
 
     log INFO "Inspecting the package database..."
     verify_state
-    mapfile -t HELD < <(list_held_packages)
+    collect_holds
 
     printf '\n'
     log INFO "Diagnosis:"
-    printf '  Packages in a bad state : %d\n' "${#BROKEN[@]}"
-    printf '  Interrupted transaction : %s\n' "$( ((JOURNAL_PENDING)) && printf yes || printf no)"
+    printf '  Packages in a bad state : %s\n' "$(count_label "$BROKEN_KNOWN" "${#BROKEN[@]}")"
+    printf '  Interrupted transaction : %s\n' "$(yes_no_label "$JOURNAL_KNOWN" "$JOURNAL_PENDING")"
     printf '  Dependencies satisfied  : %s\n' "$( ((APT_CHECK_OK)) && printf yes || printf no)"
-    printf '  Packages on hold        : %d\n' "${#HELD[@]}"
+    printf '  Packages on hold        : %s\n' "$(count_label "$HELD_KNOWN" "${#HELD[@]}")"
     printf '\n'
 
     if ((${#BROKEN[@]})); then
@@ -754,8 +878,8 @@ report() {
     log INFO "Result:"
     printf '  Repair passes run       : %d\n' "$PASSES_RUN"
     printf '  Steps that failed       : %d\n' "${#FAILED_STEPS[@]}"
-    printf '  Packages in a bad state : %d\n' "${#BROKEN[@]}"
-    printf '  Interrupted transaction : %s\n' "$( ((JOURNAL_PENDING)) && printf yes || printf no)"
+    printf '  Packages in a bad state : %s\n' "$(count_label "$BROKEN_KNOWN" "${#BROKEN[@]}")"
+    printf '  Interrupted transaction : %s\n' "$(yes_no_label "$JOURNAL_KNOWN" "$JOURNAL_PENDING")"
     printf '  Dependencies satisfied  : %s\n' "$( ((APT_CHECK_OK)) && printf yes || printf no)"
     printf '\n'
 
@@ -837,7 +961,10 @@ main() {
 
     diagnose
 
-    if verify_state && ((!FORCE)); then
+    # diagnose() has just run verify_state(); state_is_clean reads that result
+    # instead of paying for a second dpkg-query over every installed package and
+    # a second apt-get check.
+    if state_is_clean && ((!FORCE)); then
         log SUCCESS "Nothing to repair: the package database is consistent."
         log INFO "Run with --force to perform the repair sequence anyway."
         return "$EX_OK"
@@ -851,7 +978,11 @@ main() {
     if ((DRY_RUN)); then
         log INFO "Dry run: nothing was changed."
         state_is_clean && return "$EX_OK"
-        log ERROR "The package database is inconsistent. Re-run without -n to repair it."
+        if ((BROKEN_KNOWN)) && ((JOURNAL_KNOWN)); then
+            log ERROR "The package database is inconsistent. Re-run without -n to repair it."
+        else
+            log ERROR "The package database could not be fully inspected, so it cannot be called consistent."
+        fi
         return "$EX_BROKEN"
     fi
 
@@ -873,7 +1004,13 @@ main() {
         return "$EX_OK"
     fi
 
-    log ERROR "The package database is still inconsistent."
+    # "Could not verify" and "verified broken" are different facts, and the
+    # operator's next move differs between them.
+    if ((BROKEN_KNOWN)) && ((JOURNAL_KNOWN)); then
+        log ERROR "The package database is still inconsistent."
+    else
+        log ERROR "The package database could not be verified, so the repair is not confirmed."
+    fi
     next_steps
     return "$EX_BROKEN"
 }

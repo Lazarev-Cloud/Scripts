@@ -11,11 +11,15 @@
 # Origin:  https://github.com/Lazarev-Cloud/Scripts
 #
 # Error model: this is a linear script -- detect, decide, act -- that must abort
-# on the first unexpected failure rather than carry on towards an `rm`, so
-# `set -Eeuo pipefail` is the right choice and is used deliberately. On top of
-# that, every detection routine fails CLOSED: a lock whose state cannot be
-# determined is reported as held, and nothing is ever removed on the strength of
-# a check that did not actually run. Do not weaken either property.
+# rather than carry on towards an `rm`, so `set -Eeuo pipefail` is used
+# deliberately. Treat it as a backstop rather than as the safety mechanism:
+# much of the work below runs inside `if` and `||` conditions, and bash switches
+# errexit (and the ERR trap) off for the whole of a function called that way.
+#
+# The property that actually keeps this script safe is that every detection
+# routine fails CLOSED: a lock whose state cannot be determined is reported as
+# held, and nothing is ever removed on the strength of a check that did not
+# actually run. Do not weaken that.
 set -Eeuo pipefail
 # inherit_errexit is bash >= 4.4. Older shells simply miss the extra safety net;
 # every fallible command is checked explicitly regardless.
@@ -183,6 +187,28 @@ be whole; the value in brackets is what this run would use.
 Colour: NO_COLOR (any non-empty value) disables it, as does --color never.
 Colour is emitted only when stdout is a terminal unless --color always is given.
 
+How a lock is judged:
+  $PROC_LOCKS is the authority. It records every POSIX (fcntl), FLOCK and OFD
+  lock held in the kernel, so a lock is only called free when no record names
+  the file's inode. An OFD lock is reported by the kernel with a PID of -1,
+  which this script shows as an unidentified owner and treats as held.
+
+  APT takes its locks with fcntl(F_SETLK, F_WRLCK), which is
+  why 'flock -n /var/lib/dpkg/lock' is the wrong way to test one: flock(2) and
+  fcntl(2) locks do not interact, so that command succeeds while dpkg is
+  holding the file and tells you the opposite of the truth.
+
+  fuser and lsof are consulted as a second opinion, because they can see a
+  process holding the file OPEN without a lock, which $PROC_LOCKS cannot. If
+  neither is installed the report says the corroboration did not happen rather
+  than implying it passed; if either times out, that file is reported 'unknown'
+  and nothing is removed.
+
+  Independently of any file, an apt or dpkg process running anywhere on the
+  system blocks every removal, because dpkg releases and re-takes its locks
+  between the stages of a transaction -- "no lock held right now" is not the
+  same as "no transaction in flight".
+
 Blast radius:
   With --yes (or an answered prompt) this script can do exactly two things:
     1. delete lock files that no process holds or has open, from this list --
@@ -212,9 +238,10 @@ Exit status:
   130  interrupted (SIGINT/SIGTERM)
 
 75 is the interesting one for monitoring: the machine is busy, not broken, and
-cron and systemd both read it as "retry later". The exception is a lock path
-that is a symlink or not a regular file -- that is also 75 and will not clear on
-a retry, so look at the report before wiring a retry loop around it.
+cron and systemd both read it as "retry later". Three cases return 75 and will
+NOT clear on a retry, so read the report before wiring a retry loop around it:
+a lock path that is a symlink, one that is not a regular file, and one whose
+fuser/lsof probe timed out (usually a wedged NFS or FUSE mount).
 
 For unattended automation, do not schedule this script. Tell apt to wait
 instead:  apt-get -o DPkg::Lock::Timeout=600 upgrade
@@ -385,6 +412,16 @@ release_self_lock() {
 
 # --- Holder detection --------------------------------------------------------
 
+# Trims leading and trailing whitespace. `read` does this in one step via IFS;
+# `${var## }` strips exactly one space, which is not enough for the run of
+# padding that `ps -o etime=` emits or the trailing separator left behind when
+# a NUL-separated /proc/<pid>/cmdline is flattened.
+_trim() {
+    local trimmed
+    read -r trimmed <<<"$1" || trimmed=''
+    printf '%s' "$trimmed"
+}
+
 # Describes a PID from procfs. Returns 1 if the process has already gone.
 describe_pid() {
     local pid=$1 comm='' cmdline='' etime=''
@@ -408,8 +445,8 @@ describe_pid() {
         etime=$(ps -o etime= -p "$pid" 2>/dev/null) || etime=''
     fi
     # Trim the surrounding whitespace ps and cmdline leave behind.
-    etime=${etime## } etime=${etime%% }
-    cmdline=${cmdline%% }
+    etime=$(_trim "$etime")
+    cmdline=$(_trim "$cmdline")
     if ((${#cmdline} > CMDLINE_MAX)); then
         cmdline="${cmdline:0:CMDLINE_MAX}..."
     fi
@@ -449,21 +486,36 @@ locks_for_inode() {
             n = split(dev, part, ":")
             if (n >= 3 && part[n] == want) printf "%s %s\n", pid, kind
         }
-    ' "$PROC_LOCKS"
+    ' "$PROC_LOCKS" 2>/dev/null
+    # awk's own "cannot open file" goes to /dev/null on purpose: the non-zero
+    # status is what matters, and scan_path turns it into a clearer message that
+    # names the file and says the lock state is unknown. Two errors for one
+    # fault would only invite someone to treat the noisier one as the real one.
 }
 
-# Corroboration only. fuser and lsof report processes with the file OPEN, which
-# is a superset of the processes that have it LOCKED -- an open descriptor
-# without a lock does not block apt. They are consulted because they are the
-# tools an operator will reach for, and because a second opinion that disagrees
-# with /proc/locks is worth printing. Neither is required to be installed.
+# fuser and lsof report processes with the file OPEN, which is a superset of the
+# processes that have it LOCKED -- /proc/locks remains the authority on locks.
+# What these add is the process that holds the file open without a lock, which
+# /proc/locks cannot see.
+#
+# The caller must distinguish three outcomes, so they are returned separately:
+#   0  the probe ran; stdout is the (possibly empty) list of PIDs
+#   1  the tool is not installed, so no opinion was formed at all
+#   2  the probe ran but timed out, so the answer is genuinely UNKNOWN
+#
+# Collapsing 2 into 1 is what makes a wedged mount look like a clean bill of
+# health, so scan_path treats them differently.
+#
+# `--` is deliberately not passed: resolve_paths already guarantees every path is
+# absolute, so an end-of-options marker buys nothing here and dropping it avoids
+# depending on how each tool's own option parser treats one.
 openers_via_fuser() {
     local path=$1 out rc=0
     command -v fuser >/dev/null 2>&1 || return 1
-    out=$(timeout "$PROBE_TIMEOUT" fuser -- "$path" 2>/dev/null) || rc=$?
-    # fuser exits 1 when nothing has the file open, and >=124 when the timeout
-    # fired. Only the latter means "we do not know".
-    ((rc >= 124)) && return 1
+    out=$(timeout "$PROBE_TIMEOUT" fuser "$path" 2>/dev/null) || rc=$?
+    # fuser exits 1 when nothing has the file open -- that is an answer, not a
+    # failure. 124 is the timeout firing; 125-127 mean timeout could not run it.
+    ((rc >= 124)) && return 2
     printf '%s\n' "$out"
     return 0
 }
@@ -471,8 +523,8 @@ openers_via_fuser() {
 openers_via_lsof() {
     local path=$1 out rc=0
     command -v lsof >/dev/null 2>&1 || return 1
-    out=$(timeout "$PROBE_TIMEOUT" lsof -t -- "$path" 2>/dev/null) || rc=$?
-    ((rc >= 124)) && return 1
+    out=$(timeout "$PROBE_TIMEOUT" lsof -t "$path" 2>/dev/null) || rc=$?
+    ((rc >= 124)) && return 2
     printf '%s\n' "$out"
     return 0
 }
@@ -536,26 +588,52 @@ scan_path() {
         found=1
     done <<<"$records"
 
-    local opener out
+    local opener out prc probes_ran=0 probes_failed=0
     for opener in openers_via_fuser openers_via_lsof; do
-        if out=$("$opener" "$path"); then
-            for pid in $out; do
-                [[ $pid =~ ^[0-9]+$ ]] || continue
-                if desc=$(describe_pid "$pid"); then
-                    notes+=("has it open: $desc")
-                    found=1
-                fi
-            done
-        fi
+        prc=0
+        # The capture and the status read must stay one statement: a bare
+        # assignment followed by a separate `$?` read would abort under errexit.
+        out=$("$opener" "$path") || prc=$?
+        case $prc in
+            0)
+                probes_ran=1
+                for pid in $out; do
+                    [[ $pid =~ ^[0-9]+$ ]] || continue
+                    if desc=$(describe_pid "$pid"); then
+                        notes+=("has it open: $desc")
+                        found=1
+                    fi
+                done
+                ;;
+            2)
+                probes_failed=1
+                notes+=("${opener#openers_via_} probe timed out after ${PROBE_TIMEOUT}s")
+                ;;
+        esac
     done
+
+    # A probe that timed out is not the same as a probe that is not installed.
+    # The first means this file's state is genuinely unknown -- a wedged NFS or
+    # FUSE mount is the usual cause -- and must fail closed. The second is a
+    # known-absent capability, and /proc/locks is still authoritative for locks,
+    # so the verdict stands; the report just has to say the corroboration never
+    # happened rather than implying it passed.
+    if ((probes_failed)); then
+        STATE["$path"]=unknown
+        DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
+        return 0
+    fi
+    ((probes_ran)) ||
+        notes+=('open-file corroboration not performed: neither fuser (psmisc) nor lsof is installed')
 
     if ((found)); then
         STATE["$path"]=locked
-        DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
     else
         STATE["$path"]=free
-        DETAIL["$path"]="no lock record in $PROC_LOCKS (device $dev, inode $inode)"
+        notes=("no lock record in $PROC_LOCKS (device $dev, inode $inode)"
+            ${notes[@]+"${notes[@]}"})
     fi
+    DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
     return 0
 }
 
@@ -744,12 +822,20 @@ remove_stale_locks() {
     # whenever there is nothing to clear but the repair step still has to run.
     ((${#STALE[@]})) || return 0
     for path in "${STALE[@]}"; do
-        if ((DRY_RUN)); then
-            log INFO "[dry-run] Would remove stale lock $path"
-            continue
-        fi
+        # The safety gate runs in BOTH modes deliberately. --dry-run is the mode
+        # this script tells an operator to run first, so it has to print the plan
+        # the real run would actually follow. Announcing "would remove" for a path
+        # that safe_to_remove goes on to refuse -- reachable whenever --path or
+        # LZC_FIX_APT_LOCK_PATHS names something that is not shaped like a lock
+        # file -- makes the rehearsal claim a destruction that cannot happen, and
+        # exits 0 where the real run exits 1. scan_path is read-only, so running
+        # the gate early costs nothing but the probes.
         if ! safe_to_remove "$path"; then
             rc=1
+            continue
+        fi
+        if ((DRY_RUN)); then
+            log INFO "[dry-run] Would remove stale lock $path"
             continue
         fi
         if rm -f -- "$path"; then

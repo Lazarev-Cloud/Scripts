@@ -12,7 +12,9 @@ works the same by hand.
 
 Debian, Ubuntu, or a derivative (Devuan, Raspberry Pi OS, Mint, Pop!\_OS,
 elementary, Kali, Zorin). Needs `apt-get`, `timeout`, `flock`, `find` and `sed`.
-`apt-mark` and `needrestart` are optional and only improve the report.
+`apt-mark`, `needrestart` and `dpkg-query` are optional and only improve the
+report; where one is missing the value it would have supplied is reported as
+`unknown` rather than guessed.
 
 On anything that is not APT-based the script names the package manager that
 system actually uses and exits `3` without touching anything. A required tool
@@ -93,6 +95,19 @@ step it names, and each has a minimum of 1 because `timeout 0` means *no*
 limit: `LZC_UPDATE_UPGRADE_UPDATE_TIMEOUT` (600, `apt-get update`),
 `LZC_UPDATE_UPGRADE_CLEANUP_TIMEOUT` (600, autoremove and clean),
 `LZC_UPDATE_UPGRADE_PROBE_TIMEOUT` (120, each read-only inspection).
+
+Two more shape how apt behaves unattended:
+
+- `LZC_UPDATE_UPGRADE_ACQUIRE_RETRIES` (3) becomes `-o Acquire::Retries`, so a
+  transient mirror or DNS blip retries instead of failing a run nobody will
+  look at until morning. `0` disables retrying, which is what you want on a
+  metered connection. Unlike the timeouts, `0` is legal here.
+- `LZC_UPDATE_UPGRADE_LISTCHANGES_FRONTEND` (`none`) becomes
+  `APT_LISTCHANGES_FRONTEND`. `apt-listchanges` runs as an APT
+  `Pre-Install-Pkgs` hook, outside everything `DEBIAN_FRONTEND` governs, and
+  with `confirm=true` in its own configuration it asks a question on stdin.
+  `none` is its documented off switch. Set it to `pager`, `text` or `mail` if
+  you do want changelogs.
 
 And the rest: `LZC_UPDATE_UPGRADE_LOG_MAX_BYTES` (5242880),
 `LZC_UPDATE_UPGRADE_LOCK` (`/run/lock/lzc-update_upgrade.lock`),
@@ -176,25 +191,61 @@ them too, via `UCF_FORCE_CONFFOLD` / `UCF_FORCE_CONFFNEW`.
 The script never reboots. It reports that one is needed and lets you schedule
 it.
 
-Detection is `/run/reboot-required` or `/var/run/reboot-required`, which Ubuntu
-writes via `update-notifier-common`; the packages responsible are listed from
-`/run/reboot-required.pkgs`. Plain Debian does not ship that by default, so if
-`needrestart` is installed the script asks it instead (`needrestart -b -r l`,
-which is list-only and restarts nothing) and treats a kernel state of 2 or 3 as
-"reboot pending".
+Detection has **three** answers — `yes`, `no`, and `unknown` — because on many
+Debian systems there is nothing installed that could answer at all, and
+printing `no` there would be a false statement rather than a reassurance.
 
-If neither is present, reboot detection is simply unavailable. Install
-`update-notifier-common` or `needrestart` to get it.
+- `/run/reboot-required` or `/var/run/reboot-required` exists → **yes**, and
+  the packages responsible are listed from `/run/reboot-required.pkgs`.
+- No marker, but `needrestart` is installed → it is asked
+  (`needrestart -b -r l`, list-only, restarts nothing) and a kernel state
+  (`KSTA`) of 2 or 3 means **yes**, 1 means **no**.
+- No marker, no `needrestart`, and `update-notifier-common` is *not* installed
+  → **unknown**. Those markers are what that package writes; where nothing
+  writes them, their absence is silence, not a negative answer. Ubuntu
+  installs it by default, plain Debian does not.
+
+Install `update-notifier-common` or `needrestart` to turn `unknown` into a real
+answer.
+
+That yes/no/unknown inference assumes the **default** markers, since it is the
+`update-notifier-common` package that gives their absence any meaning. If you
+point `LZC_UPDATE_UPGRADE_REBOOT_MARKERS` at a flag file of your own, a present
+marker still means `yes`, but treat `no` and `unknown` as advisory — the script
+has no way to know whether your mechanism ran.
+
+The same rule governs every count in the summary: a check that could not run is
+reported as `unknown (the check could not run)`, and a scan that was cut short
+as `N (incomplete: the check could not finish)`. A bare number always means the
+check ran.
 
 A pending reboot exits `0`. It is not a failure, and there is no exit code
 outside the table below to signal it with. A wrapper that needs to act on it
-should test `/run/reboot-required` itself — that is the actual source of truth,
-and unlike an exit status it survives the run:
+should re-run the same test the script does — which, per the three cases above,
+is **not** always the marker file. Testing only `/run/reboot-required` on a
+minimal Debian silently never fires, even though the script correctly reported
+`yes` from `needrestart`:
 
 ```bash
+#!/bin/sh
 update_upgrade.sh --yes --autoclean || exit $?
-[ -e /run/reboot-required ] && echo "reboot pending on $(hostname)"
+
+reboot_pending() {
+  # Authoritative only where update-notifier-common writes the marker.
+  if dpkg-query -W -f='${db:Status-Status}' update-notifier-common 2>/dev/null \
+       | grep -qx installed; then
+    [ -e /run/reboot-required ] && return 0
+  fi
+  # Otherwise needrestart is the only mechanism: KSTA 2 = ABI, 3 = version.
+  command -v needrestart >/dev/null 2>&1 || return 1
+  needrestart -b -r l 2>/dev/null | grep -qE '^NEEDRESTART-KSTA: [23]$'
+}
+
+reboot_pending && echo "reboot pending on $(hostname)"
 ```
+
+If neither mechanism is present the wrapper cannot know either — that is what
+the summary's `unknown` is telling you, and the fix is to install one of them.
 
 ## Exit status
 

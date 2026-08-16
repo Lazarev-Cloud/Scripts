@@ -25,6 +25,32 @@ The honest order of operations when dnf says the lock is busy:
 
 This script automates step 3 and refuses to act during steps 1 and 2.
 
+### You probably need this less often than you think
+
+dnf already recovers from the usual "stale lock" on its own. `ProcessLock._try_lock`
+in `dnf/lock.py` reads the PID recorded inside the lock file and, when
+`/proc/<pid>/stat` no longer exists, **truncates the file and takes the lock
+over**:
+
+```python
+if not os.access('/proc/%d/stat' % old_pid, os.F_OK):
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(pid).encode('utf-8'))
+    return pid
+```
+
+It also unlinks its own lock file on a clean exit. So a `*_lock.pid` naming a
+dead process is not a condition dnf needs help with, and deleting it changes
+nothing dnf would not have done itself.
+
+The state dnf genuinely cannot recover from is a lock file whose contents are
+**not a PID at all** — it reports `Malformed lock file found: <path>` and tells
+you to remove the file or run `systemd-tmpfiles --remove dnf.conf`. That is the
+case this script exists for, and it clears it only after proving nothing holds
+the file. Run `-n` first: "nothing to clean up" is a normal, common, correct
+answer here.
+
 **Deleting an unheld lock file is a no-op for root.** Root is not blocked by
 file permissions, and an advisory lock with no holder blocks nothing. The
 removal is included because this situation is almost universally misdiagnosed as
@@ -33,23 +59,51 @@ gets replaced by a worse one. The value is in the refusal and the diagnosis.
 
 ## How it decides
 
-`/proc/locks` is the authority. It lists every POSIX and flock record the kernel
-is holding, so it answers the only question that matters: *is this file locked
-right now, and by which PID?* Lock records are matched by **inode**, because the
-`st_dev` → `major:minor` mapping is not reversible on btrfs, ZFS or overlayfs
-(anonymous devices can have a minor number above 255). Matching the inode alone
-can only ever over-report, and over-reporting refuses a removal — the safe
-direction. Under-reporting would permit one.
+`/proc/locks` is the authority. Per `proc_locks(5)` it lists every `POSIX`
+(`fcntl`) byte-range lock, every `FLOCK` (BSD `flock(2)`) lock and every `OFDLCK`
+open-file-description lock the kernel holds, so it answers the only question that
+matters: *is this file locked right now, and by which PID?* That covers dnf,
+which takes its `*_lock.pid` locks with `fcntl.flock(fd, LOCK_EX | LOCK_NB)` —
+a `FLOCK` record.
+
+Lock records are matched by **inode**, because the `st_dev` → `major:minor`
+mapping is not reversible on btrfs, ZFS or overlayfs (anonymous devices can have
+a minor number above 255). Matching the inode alone can only ever over-report,
+and over-reporting refuses a removal — the safe direction. Under-reporting would
+permit one. OFD locks are reported by the kernel with a PID of `-1`, which the
+script renders as an unidentified owner and treats as held.
+
+Reading the lock table is preferred over trying to take a lock (`flock -n`)
+because it names the holding process, and because finding out whether a lock
+*could* be taken by taking it is a side effect this script has no business
+having.
 
 Three further checks stack on top:
 
 - **The recorded PID.** dnf's lock files are pid files too. If the PID written
   inside names a live process, the lock is treated as held even when the lock
-  record is ambiguous. If it names a process that no longer exists, that is
-  reported as evidence the lock is stale.
+  record is ambiguous — the same `/proc/<pid>/stat` test dnf itself applies, so
+  the script is never more conservative than dnf is. If it names a process that
+  no longer exists, that is reported, with the note that dnf reclaims such a lock
+  by itself. Contents that are not a plain integer produce no recorded PID at
+  all, which is exactly right: that is dnf's unrecoverable "malformed lock file"
+  case, and it falls through to the normal lock checks.
 - **`fuser` and `lsof`**, when installed — neither is required. They report
   processes with the file merely *open*, a superset of those that have it
-  *locked*.
+  *locked*, so they add the one case `/proc/locks` cannot see. Their three
+  outcomes are kept distinct, because collapsing them is how a wedged mount comes
+  to look like a clean bill of health:
+
+  | Outcome | Effect on the verdict |
+  | --- | --- |
+  | Probe ran | Any PID it names is treated as a holder. |
+  | Tool not installed | The `/proc/locks` verdict stands; the report says the corroboration **did not happen** rather than implying it passed. |
+  | Probe timed out | That file is reported `unknown`, nothing is removed, exit 75. |
+
+  The middle row matters on minimal images — UBI minimal and similar ship neither
+  `psmisc` nor `lsof`, and that is exactly where stuck locks turn up. Refusing to
+  work there would make the script useless; the process scan below is the guard
+  that does not depend on either tool.
 - **Process and unit scan.** The script refuses when any `dnf`, `dnf-3`, `dnf5`,
   `yum`, `microdnf`, `tdnf`, `rpm` or PackageKit process exists anywhere on the
   system, and reports whether `dnf-automatic*.service`, `dnf-makecache.service`
@@ -163,8 +217,17 @@ holds or has open, from this list:
 
 Globs are expanded and non-matching entries are dropped, so a path that does not
 exist on your release costs nothing. All of these are recreated automatically.
-**dnf5** (Fedora 41+, RHEL 10) has not been confirmed to use these paths; add
-its lock with `--path` if your system differs.
+
+Two caveats on that list, both handled with `--path` rather than by guessing:
+
+- `/var/lib/rpm/.rpm.lock` assumes the default RPM database location. Confirm
+  yours with `rpm -E '%{_dbpath}'` and point `--path` at `<dbpath>/.rpm.lock` if
+  it differs.
+- **dnf5** (Fedora 41+, RHEL 10) has *not* been confirmed to use these paths —
+  it uses a different cache root (`/var/cache/libdnf5`) and its lock layout was
+  not verified while writing this, so nothing is asserted about it. If `dnf5` is
+  your package manager, find the lock it is actually holding
+  (`grep -i dnf /proc/locks`, or `lsof -p <pid>`) and pass it with `--path`.
 
 It then runs `dnf check`, which is read-only, to confirm the package manager can
 take its locks again. Skip with `--no-check`.
@@ -196,9 +259,16 @@ deleted.
 
 75 is the interesting one for monitoring: the machine is busy, not broken, and
 cron and systemd both read `EX_TEMPFAIL` as "retry later" rather than a fault.
-The exception is a lock path that is a symlink or not a regular file — that is
-also 75, and it will **not** clear on a retry, so read the report before wiring
-a retry loop around this.
+Four cases also return 75 but will **not** clear on a retry, so read the report
+before wiring a retry loop around this:
+
+- a lock path that is a symlink,
+- a lock path that is not a regular file,
+- a lock path whose `fuser`/`lsof` probe timed out — usually a wedged NFS or
+  FUSE mount, which needs fixing before any of this is meaningful,
+- a lock file whose recorded PID has been **reused** by an unrelated process.
+  The report prints that process's command line, so you can see it is not a
+  package manager.
 
 A non-zero `dnf check` does **not** fail the run. It reports RPM database
 problems that predate this script, and the fact that it ran at all proves the
@@ -221,6 +291,24 @@ warning.
   the script reports the lock as held and refuses. It prints the PID and command
   line so you can see that the holder is unrelated. This is deliberate: the
   alternative failure mode deletes a live lock.
+- **A recycled PID reads as a live holder.** If the PID recorded in a lock file
+  has since been reused by an unrelated process, the lock is reported held and
+  will stay that way across retries. dnf's own recovery path has the same
+  blind spot, so this is not extra caution — but it does mean a permanent 75 is
+  worth reading rather than retrying. The command line in the report tells you
+  which it is.
+- **`/proc/locks` cannot see an open-but-unlocked descriptor.** A process that
+  has a lock file open without holding a lock on it is not in a critical section
+  and does not block dnf, but it will re-lock that inode later. `fuser`/`lsof`
+  are what catch it, and on a host with neither installed that check simply does
+  not happen — the report says so. The system-wide scan for `dnf`, `yum`, `rpm`
+  and PackageKit is the backstop that always runs, so the uncovered case is a
+  *non-package-manager* process holding a dnf or rpm lock file open. That is
+  rare, and it is stated here rather than papered over.
+- **`/var/lib/rpm/.rpm.lock` is included on the strength of its name, not a
+  verified locking mechanism.** rpm's own lock implementation was not read while
+  writing this, so no claim is made about which API it uses. It does not matter
+  for detection: `/proc/locks` records `POSIX`, `FLOCK` and `OFDLCK` alike.
 - **There is no dnf equivalent of `dpkg --configure -a`.** RPM has no
   half-configured state to replay. If the RPM database is genuinely damaged, the
   recovery is `rpm --rebuilddb` after backing up `/var/lib/rpm` — a human-run

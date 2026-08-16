@@ -19,7 +19,7 @@
 set -uo pipefail
 
 readonly SCRIPT_NAME='System Log Cleaner'
-readonly SCRIPT_VERSION='2.0'
+readonly SCRIPT_VERSION='2.1'
 
 # Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
 # sysexits.h, which cron and systemd read as "retry later" rather than a fault.
@@ -176,6 +176,11 @@ Blast radius:
   \`journal\` are pruned. Roots such as /, /etc, /usr, /var and /home are
   refused outright.
 
+  The default patterns are deliberately narrow, and the digit classes are
+  bounded to one and two digits so that MySQL binary logs (mysql-bin.000001)
+  and similar numbered data files never match:
+    ${DEFAULT_PATTERNS[*]}
+
   With --truncate-active it additionally truncates -- not deletes -- live log
   files larger than --truncate-larger-than. That destroys their current
   contents. It is off by default.
@@ -193,6 +198,12 @@ Options:
   -d, --days N                 Delete archives older than N*24h (default: $MAX_AGE_DAYS).
                                N=0 means "older than 24 hours".
   -x, --exclude GLOB           Skip paths matching this glob. Repeatable.
+      --pattern GLOB           Filename glob that marks a rotated archive.
+                               Repeatable, and REPLACES the built-in list
+                               rather than adding to it. Matched against the
+                               file name only, never the directory.
+      --active-pattern GLOB    Same, for the live-log list --truncate-active
+                               works from (default: $ACTIVE_PATTERN_SPEC).
       --no-journal             Do not touch the systemd journal.
       --journal-size SIZE      Journal size to keep, journalctl syntax
                                (default: $JOURNAL_KEEP_SIZE).
@@ -212,6 +223,12 @@ Options:
 Colour is written only when stdout is a terminal, and never when NO_COLOR is
 set to a non-empty value. --color always overrides both.
 
+A flag beats the environment variable it shadows. For the list-valued options
+that means replace, not merge: any --path discards LZC_CLEAN_LOGS_PATHS, any
+--pattern discards LZC_CLEAN_LOGS_PATTERNS, any --active-pattern discards
+LZC_CLEAN_LOGS_ACTIVE_PATTERNS. --exclude is the exception and adds to
+LZC_CLEAN_LOGS_EXCLUDE, because an exclusion can only ever shrink the sweep.
+
 Every option has an environment variable, which is the easier route from cron
 or when piping this script in from the network. Boolean variables accept
 1/true/yes/on and 0/false/no/off, in any case:
@@ -220,8 +237,8 @@ or when piping this script in from the network. Boolean variables accept
   LZC_CLEAN_LOGS_JOURNAL=0    LZC_CLEAN_LOGS_JOURNAL_KEEP_SIZE=200M
   LZC_CLEAN_LOGS_JOURNAL_KEEP_TIME=14d
   LZC_CLEAN_LOGS_TRUNCATE=1   LZC_CLEAN_LOGS_TRUNCATE_MIN=104857600
-  LZC_CLEAN_LOGS_PATTERNS='*.gz *.[0-9]'
-  LZC_CLEAN_LOGS_ACTIVE_PATTERNS='*.log'
+  LZC_CLEAN_LOGS_PATTERNS='*.gz *.[0-9]'        (whitespace-separated globs)
+  LZC_CLEAN_LOGS_ACTIVE_PATTERNS='*.log'        (whitespace-separated globs)
   LZC_CLEAN_LOGS_LIST_LIMIT=50   LZC_CLEAN_LOGS_TIMEOUT=60
   LZC_CLEAN_LOGS_LOCK=/run/lock/lzc-clean_logs.lock
 
@@ -266,7 +283,13 @@ parse_args() {
     # Flag values go straight into arrays. Joining them into a
     # colon-separated string first would corrupt any path that contains a
     # colon; the env-var form is the one that has to accept a separator.
+    #
+    # Deliberately not named `pats`: matches_any() and build_name_expr() both
+    # declare `local -n pats=`, and a caller-side local of that name makes the
+    # nameref circular. Bash fails that at runtime and ShellCheck does not catch
+    # it.
     local -a path_flags=() exclude_flags=()
+    local -a pattern_flags=() active_pattern_flags=()
     while (($#)); do
         case $1 in
             -y | --yes) ASSUME_YES=1 ;;
@@ -284,6 +307,16 @@ parse_args() {
             -x | --exclude)
                 need_arg "$1" $# "${2-}"
                 exclude_flags+=("$2")
+                shift
+                ;;
+            --pattern)
+                need_arg "$1" $# "${2-}"
+                pattern_flags+=("$2")
+                shift
+                ;;
+            --active-pattern)
+                need_arg "$1" $# "${2-}"
+                active_pattern_flags+=("$2")
                 shift
                 ;;
             --no-journal) DO_JOURNAL=0 ;;
@@ -339,6 +372,20 @@ parse_args() {
     fi
     ((${#exclude_flags[@]})) && EXCLUDES+=("${exclude_flags[@]}")
 
+    # --pattern and --active-pattern REPLACE their lists rather than adding to
+    # them, matching --path and the env vars they shadow. Adding would be the
+    # dangerous direction for a delete filter: someone narrowing the sweep to
+    # `--pattern '*.gz'` means only that, and silently keeping the eight
+    # built-in patterns underneath would delete far more than they asked for.
+    if ((${#pattern_flags[@]})); then
+        PATTERNS=("${pattern_flags[@]}")
+        PATTERN_SPEC=''
+    fi
+    if ((${#active_pattern_flags[@]})); then
+        ACTIVE_PATTERNS=("${active_pattern_flags[@]}")
+        ACTIVE_PATTERN_SPEC=''
+    fi
+
     [[ $USE_COLOR =~ ^(auto|always|never)$ ]] || die "$EX_USAGE" "--color must be auto, always or never"
 
     # Minimums differ per option and are not interchangeable:
@@ -366,7 +413,20 @@ parse_args() {
         die "$EX_USAGE" "--journal-size must look like 200M, got '$JOURNAL_KEEP_SIZE'"
     # Derived after MAX_AGE_DAYS has been through 10#, so --days 08 becomes 8d
     # and not the 08d that journalctl would have to make sense of.
-    [[ -n $JOURNAL_KEEP_TIME ]] || JOURNAL_KEEP_TIME="${MAX_AGE_DAYS}d"
+    #
+    # Floored at 1d. --days 0 is documented as "older than 24 hours" for files,
+    # but 0d is not the journal equivalent of that: depending on the systemd
+    # release a zero retention is read either as "no time limit at all" or as
+    # "discard every archived file", and those are opposite outcomes. Neither is
+    # what --days 0 promises, so the derived value says what the flag means.
+    # An explicit --journal-time is never rewritten.
+    if [[ -z $JOURNAL_KEEP_TIME ]]; then
+        if ((MAX_AGE_DAYS < 1)); then
+            JOURNAL_KEEP_TIME='1d'
+        else
+            JOURNAL_KEEP_TIME="${MAX_AGE_DAYS}d"
+        fi
+    fi
     [[ $JOURNAL_KEEP_TIME =~ ^[0-9]+(s|m|h|d|w|month|y)$ ]] ||
         die "$EX_USAGE" "--journal-time must look like 14d, got '$JOURNAL_KEEP_TIME'"
 
@@ -534,7 +594,13 @@ preflight() {
 
     # -printf is a GNU findutils extension and the script's size accounting
     # depends on it. Fail loudly here rather than producing an empty report.
-    find -P . -maxdepth 0 -printf '' >/dev/null 2>&1 ||
+    #
+    # Probed against / and not against `.`: a cron job whose working directory
+    # has been deleted gets ENOENT from find, which is indistinguishable here
+    # from "no -printf support" and would report a missing-findutils error for
+    # what is really a missing cwd. -maxdepth 0 never descends, so naming / is
+    # a stat of one inode, not a walk of the filesystem.
+    find -P / -maxdepth 0 -printf '' >/dev/null 2>&1 ||
         die "$EX_PREREQ" "this find does not support -printf; GNU findutils is required"
 
     if ((APPLY)) && [[ $EUID -ne 0 ]]; then
@@ -558,7 +624,8 @@ preflight() {
     ((${#PATTERNS[@]})) || PATTERNS=("${DEFAULT_PATTERNS[@]}")
     split_globs ACTIVE_PATTERNS "$ACTIVE_PATTERN_SPEC"
     ((DO_TRUNCATE)) && ((${#ACTIVE_PATTERNS[@]} == 0)) &&
-        die "$EX_USAGE" "--truncate-active needs at least one pattern in LZC_CLEAN_LOGS_ACTIVE_PATTERNS"
+        die "$EX_USAGE" \
+            "--truncate-active needs at least one pattern from --active-pattern (LZC_CLEAN_LOGS_ACTIVE_PATTERNS)"
     split_spec EXCLUDES "$EXCLUDE_SPEC"
 
     TMP_DIR=$(mktemp -d 2>/dev/null) || die "$EX_FAIL" "cannot create a temporary directory"
@@ -633,10 +700,17 @@ scan_rotated() {
 # Adds this find's stderr line count to the unreadable tally. Both scans feed it,
 # so a permission error during the truncate scan is reported too rather than
 # being written to a file nothing ever reads.
+#
+# wc rather than grep: wc is coreutils, which preflight already requires, and
+# grep was otherwise this script's only use of a package it never checked for.
+# The redirection is deliberate -- `wc -l FILE` prints the file name too, and on
+# some implementations pads the count, so the digit filter below keeps this
+# robust either way rather than silently scoring every such run as zero.
 count_unreadable() {
     local n
-    n=$(grep -c . "$1" 2>/dev/null) || n=0
-    [[ $n =~ ^[0-9]+$ ]] || n=0
+    n=$(wc -l <"$1" 2>/dev/null) || n=0
+    n=${n//[!0-9]/}
+    [[ -n $n ]] || n=0
     UNREADABLE=$((UNREADABLE + n))
 }
 
@@ -895,7 +969,11 @@ main() {
         remove_files
         truncate_files
         if journal_available; then
-            vacuum_journal || true
+            # No `|| true` here on purpose. There is no `set -e` in this script,
+            # so a non-zero return is not fatal, and vacuum_journal has already
+            # logged and counted the failure into ERRORS by the time it returns.
+            # Appending `|| true` would only hide that from the next reader.
+            vacuum_journal
         fi
     fi
 

@@ -39,7 +39,7 @@ runs commands unbounded. `apt-get`, `dnf`/`yum`, `journalctl`,
 | `autoremove` | yes | Removes packages nothing needs any more. | **Purges packages and their config**, old kernels included. |
 | `clean-cache` | yes | Deletes downloaded package archives. | Cache only; all of it is re-downloadable. |
 | `clean-logs` | yes | Vacuums the journal, deletes aged rotated logs. | **Deletes log history permanently.** |
-| `clean-tmp` | yes | Cleans the temporary directories. | **Deletes files** in `/tmp` and `/var/tmp`. |
+| `clean-tmp` | yes | Cleans temporary files. | **Deletes files.** In `age` mode, in `--tmp-dirs`. In `tmpfiles` mode — the default under systemd — everywhere the distribution's `tmpfiles.d` policy covers, which is wider. |
 | `fix-packages` | yes | `dpkg --configure -a`, then `apt-get -f install`. | Completes half-finished package operations. Debian/Ubuntu only. |
 | `fix-locks` | no* | Diagnoses package-manager locks. | Read-only on Debian/Ubuntu. On RHEL it may delete a dnf pid file whose process is provably gone, and asks first. |
 | `routine` | yes | Group: `update`, `autoremove`, `clean-cache`, `report`. | The union of its members. |
@@ -91,17 +91,35 @@ retention. This task is for a filesystem that is already full.
 
 ### `clean-tmp`
 
-With systemd present it defers to `systemd-tmpfiles --clean`, which follows the
+Two modes, and **they do not have the same blast radius.** `auto` picks
+`tmpfiles` wherever systemd is running and `age` otherwise. Which one applies is
+resolved before the plan is printed, so the plan line you confirm names the
+behaviour you are actually getting. Force either with `--tmp-mode tmpfiles` or
+`--tmp-mode age`.
+
+**`tmpfiles` mode** defers to `systemd-tmpfiles --clean`, which follows the
 distribution's own `tmpfiles.d` policy — that policy already encodes which paths
-are safe to remove and which sockets must survive.
+are safe to remove, after how long, and which sockets must survive. The cost of
+delegating is that the policy is **wider than `--tmp-dirs`**: it can clean paths
+you did not name, and neither `--tmp-dirs` nor `--tmp-age` applies. List the
+rules that will be used with `systemd-tmpfiles --cat-config`.
 
-Without systemd it falls back to an age sweep: regular files whose **atime and
-mtime are both** older than `--tmp-age` days are deleted, then directories left
-empty are removed. Directories are never deleted for being old, only for being
-empty, so an old directory holding fresh files survives. Sockets and symlinks
-are left alone, as are names matching `--tmp-exclude`.
+`--dry-run` in this mode runs `systemd-tmpfiles --clean --dry-run` and shows you
+the real file list. That option arrived in systemd 249, so support is probed
+rather than assumed; on an older systemd (Debian 11 ships 247) the dry run says
+it cannot preview and changes nothing, rather than guessing. Use `--tmp-mode age`
+there if you need a previewable sweep.
 
-Force either behaviour with `--tmp-mode tmpfiles` or `--tmp-mode age`.
+A preview is a query, not work: if `systemd-tmpfiles --clean --dry-run` exits
+non-zero — which an unprivileged preview will, since it cannot stat everything
+the policy covers — the status is reported as a warning and the task still
+counts as succeeded. Every task's `--dry-run` returns `0`.
+
+**`age` mode** deletes regular files under `--tmp-dirs` whose **atime and mtime
+are both** older than `--tmp-age` days, then removes directories left empty.
+Directories are never deleted for being old, only for being empty, so an old
+directory holding fresh files survives. Sockets and symlinks are left alone, as
+are names matching `--tmp-exclude`.
 
 ### `fix-locks`
 
@@ -147,13 +165,14 @@ repo-wide namespace, so `env | grep LZC_` shows everything that is configurable.
 | `--tmp-age DAYS` | `LZC_MAINTENANCE_TMP_AGE_DAYS` | `10` | Age threshold, `age` mode only. |
 | `--tmp-mode MODE` | `LZC_MAINTENANCE_TMP_MODE` | `auto` | `auto`, `tmpfiles`, or `age`. |
 | `--tmp-exclude LIST` | `LZC_MAINTENANCE_TMP_EXCLUDE` | X11/ICE sockets, `systemd-private*` | Names `clean-tmp` must not touch. |
+| `--needrestart-mode M` | `LZC_MAINTENANCE_NEEDRESTART_MODE` | `l` | After an update, what to do about services still running old libraries: `l` lists them, `a` **restarts** them, `i` asks. |
 | `--log-file PATH` | `LZC_MAINTENANCE_LOG` | `/var/log/maintenance.log` | This script's own log. |
 | `--lock-file PATH` | `LZC_MAINTENANCE_LOCK` | `/run/lock/lzc-maintenance.lock` | Concurrency lock. |
 | `--color WHEN` | `LZC_MAINTENANCE_COLOR` | `auto` | `auto`, `always`, `never`. |
 | `-V, --version` | — | — | Print version and exit. |
 | `-h, --help` | — | — | Print help and exit. |
 
-Environment-only settings: `LZC_MAINTENANCE_NEEDRESTART_MODE` (default `l`),
+Environment-only settings:
 `LZC_MAINTENANCE_FS_EXCLUDE` (default `tmpfs devtmpfs squashfs overlay efivarfs`),
 `LZC_MAINTENANCE_ETC_DIR` (default `/etc`), `LZC_MAINTENANCE_LOG_MAX_BYTES`
 (default `5242880`), `LZC_MAINTENANCE_PATH`
@@ -170,6 +189,14 @@ Numeric values are validated and read as decimal, so a zero-padded `08` means
 eight, not an invalid octal literal. `--timeout` and `--probe-timeout` have a
 minimum of `1`: `timeout 0` means *no* limit, so accepting `0` would silently
 remove the protection the option exists to provide.
+
+`--log-dir` and every entry in `--tmp-dirs` is a **sweep root**: files beneath it
+are deleted, as root. A typo there is not recoverable, so each is required to be
+an absolute path, with no `.` or `..` component, that is not `/` and not a
+top-level system directory such as `/usr` or `/var`. `/tmp` is allowed — it is
+the one top-level directory whose contents are disposable by definition, and it
+is a default. Anything rejected exits `2` naming the value; name the directory
+inside it that you meant.
 
 ### Colour
 
@@ -218,7 +245,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/sbin/maintenance.sh --yes --quiet routine
 TimeoutStartSec=2h
-SuccessExitStatus=0 3 75
+SuccessExitStatus=0 75
 Nice=10
 IOSchedulingClass=idle
 ```
@@ -240,6 +267,11 @@ WantedBy=timers.target
 `Persistent=true` catches up a run missed while the machine was off.
 `RandomizedDelaySec=` stops a fleet hitting the mirror in lockstep.
 
+`SuccessExitStatus=` lists `75` and nothing else. `75` means another instance
+already holds the lock, which is genuinely not a fault. Do **not** add `3` to
+that list: `3` means a prerequisite is missing — no `flock`, for instance — and a
+host in that state runs no maintenance at all while its unit stays green.
+
 ### cron
 
 ```
@@ -251,10 +283,10 @@ WantedBy=timers.target
 failed, so mail means something. The script sets its own `PATH` and never
 prompts, so it needs nothing from the crontab environment.
 
-Concurrent runs are refused via `flock` on `/run/lock/maintenance.lock` (exit
-75). The lock is only taken when a task will actually change something, so a
-`report` is never blocked by an update already in progress. The script's own log
-rotates once past `MAINT_LOG_MAX_BYTES`.
+Concurrent runs are refused via `flock` on `/run/lock/lzc-maintenance.lock`
+(exit 75). The lock is only taken when a task will actually change something, so
+a `report` is never blocked by an update already in progress. The script's own
+log rotates once past `LZC_MAINTENANCE_LOG_MAX_BYTES`.
 
 ## Running from the network
 
@@ -285,19 +317,22 @@ settings through a pipe, since `bash -c "$script" arg` assigns the first
 argument to `$0`:
 
 ```bash
-MAINT_YES=1 MAINT_QUIET=1 bash -c "$s"
+LZC_MAINTENANCE_YES=1 LZC_MAINTENANCE_QUIET=1 bash -c "$s" -- routine
 ```
 
 ## Notes and limits
 
 - Package transactions are given a generous timeout rather than a short one,
   because killing `dpkg` mid-transaction is itself a way to break a system. If
-  the timeout does fire, run `fix-packages` to replay the dpkg journal. Set
-  `--timeout 0` to disable the bound entirely.
+  the timeout does fire, run `fix-packages` to replay the dpkg journal. The bound
+  cannot be switched off — `--timeout 0` is rejected, because `timeout 0` means
+  *no* limit and accepting it would silently remove the protection. Raise it
+  instead (`--timeout 86400`).
 - `update` defaults to `upgrade`, which never removes a package. `dist-upgrade`
   can remove packages to satisfy dependencies; ask for it deliberately.
-- Service restarts are listed, not performed (`NEEDRESTART_MODE=l`). Set
-  `MAINT_NEEDRESTART_MODE=a` if a maintenance window means restarts are fine.
+- Service restarts are listed, not performed. Pass `--needrestart-mode a` (or
+  `LZC_MAINTENANCE_NEEDRESTART_MODE=a`) if a maintenance window means restarting
+  services still running old libraries is fine.
 - Config changes shipped by packages are not applied: apt runs with
   `--force-confdef --force-confold`, so your edited files stay. `report` lists
   the `.dpkg-dist`/`.rpmnew` files this leaves behind — reconcile them yourself.

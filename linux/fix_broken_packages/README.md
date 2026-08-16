@@ -13,7 +13,8 @@ re-inspecting the system rather than trusting the repair's exit status.
 
 Debian, Ubuntu, or a derivative. Needs `apt-get`, `dpkg`, `dpkg-query`,
 `timeout`, `awk`, `find` and `flock`. `apt-mark` and `fuser` (from `psmisc`)
-are optional and only improve the report.
+are optional and only improve the report; where one is missing the value it
+would have supplied is reported as `unknown` rather than guessed.
 
 On anything that is not APT-based the script names the equivalent repair tool
 for that system and exits `3` without touching anything. A required tool that
@@ -42,9 +43,12 @@ repair — the exact failure being repaired.
 
 ## What "verified" means
 
-Two independent checks, both re-run from scratch after every pass:
+Three independent checks, all re-run from scratch after every pass:
 
 - `apt-get check` — the authoritative verdict on broken dependencies.
+- `/var/lib/dpkg/updates/` — dpkg's journal of an in-flight transaction. Any
+  file left there means dpkg was interrupted and `dpkg --configure -a` still
+  has work to replay.
 - The dpkg status of every installed package, via
   `dpkg-query -W -f='${binary:Package}\t${Status}\n'`. Anything whose error
   flag is not `ok`, or whose state is `half-installed`, `half-configured`,
@@ -55,6 +59,23 @@ Two independent checks, both re-run from scratch after every pass:
 `dpkg --audit` output is shown as human-readable detail, but nothing branches
 on it: it has no documented exit-status contract, so treating a zero exit as
 "clean" would report success on a still-broken system.
+
+**An inspection that cannot run is not a pass.** If `dpkg-query` itself fails —
+entirely possible on the corrupt-database case this script exists for — an
+empty result would otherwise be indistinguishable from a healthy system. Instead
+the script warns, reports `Packages in a bad state : unknown (the check could
+not run)`, and exits `1` with "could not be verified" rather than "repaired".
+
+The same rule governs the journal check. `Interrupted transaction` has three
+answers, not two: if `/var/lib/dpkg/updates/` cannot be listed — or is missing
+entirely, which on an intact installation it never is, since the `dpkg` package
+ships it — the line reads `unknown (the check could not run)` and the system is
+not called consistent. A directory nobody could read is not proof that no
+transaction was interrupted. A journal file that *was* seen still reads `yes`
+even if the scan then failed: positive evidence is conclusive.
+
+Same for the optional `apt-mark` hold list: absent or failing renders as
+`unknown`, never as `0`.
 
 ## Running it
 
@@ -121,6 +142,18 @@ step it names, and each has a minimum of 1 because `timeout 0` means *no*
 limit: `LZC_FIX_BROKEN_PACKAGES_CONFIGURE_TIMEOUT` (1800, `dpkg --configure -a`),
 `LZC_FIX_BROKEN_PACKAGES_UPDATE_TIMEOUT` (600, `apt-get update`),
 `LZC_FIX_BROKEN_PACKAGES_PROBE_TIMEOUT` (120, each read-only inspection).
+
+Two more shape how apt behaves unattended:
+
+- `LZC_FIX_BROKEN_PACKAGES_ACQUIRE_RETRIES` (3) becomes `-o Acquire::Retries`,
+  so a transient mirror or DNS blip does not abandon a repair that is already
+  half done. `0` disables retrying. Unlike the timeouts, `0` is legal here.
+- `LZC_FIX_BROKEN_PACKAGES_LISTCHANGES_FRONTEND` (`none`) becomes
+  `APT_LISTCHANGES_FRONTEND`. `apt-listchanges` runs as an APT
+  `Pre-Install-Pkgs` hook, outside everything `DEBIAN_FRONTEND` governs, and
+  with `confirm=true` in its own configuration it asks a question on stdin —
+  which would hang the very repair you are running. `none` is its documented
+  off switch.
 
 And the rest: `LZC_FIX_BROKEN_PACKAGES_LOG_MAX_BYTES` (5242880),
 `LZC_FIX_BROKEN_PACKAGES_LOCK` (`/run/lock/lzc-fix_broken_packages.lock`),
@@ -206,7 +239,7 @@ The repository-wide table. These are the only statuses this script returns.
 | Code | Meaning |
 | --- | --- |
 | 0 | Success — the system verifies consistent, whether it already was or was repaired. |
-| 1 | The work ran but something in it failed: the system is still inconsistent after the repair, the repair was declined at the prompt, or it was only simulated with `-n`. Details and next steps printed. |
+| 1 | The work ran but the system is not confirmed consistent: still inconsistent after the repair, the state could not be verified, the repair was declined at the prompt, or it was only simulated with `-n`. Details and next steps printed. |
 | 2 | Usage error — unknown flag, missing or invalid argument value. |
 | 3 | Unsupported platform or a missing prerequisite tool: not an APT-based system, or a required binary is absent. Nothing was changed. |
 | 4 | Must be run as root. |

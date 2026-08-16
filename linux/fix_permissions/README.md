@@ -33,7 +33,11 @@ What it deliberately does **not** do:
 - never follows a symlink. Links get `chown -h` and are never `chmod`'ed, so a
   link pointing at `/etc/shadow` cannot be used to drag the script outside the
   home directory
-- never touches `/` or a system directory, whatever `/etc/passwd` claims
+- never touches `/`, a system directory, or anything *inside* one, whatever
+  `/etc/passwd` claims — and refuses the directories that merely hold homes
+  (`/home`, `/srv`, `/var`), so a missing or mistyped user name cannot widen the
+  target from one home to all of them. See [Which directories it
+  refuses](#which-directories-it-refuses)
 - never crosses a filesystem boundary unless asked
 - never runs two applying instances at once: `--apply` takes an exclusive
   `flock` and exits 75 if another run holds it
@@ -42,8 +46,14 @@ What it deliberately does **not** do:
 
 GNU `find` (the `-printf` extension), `timeout`, and `xargs`. `flock`
 (util-linux) as well, for `--apply` — a dry run takes no lock and does not need
-it. `getfacl`/`setfacl` from the `acl` package are optional but strongly
-recommended — without them there is no snapshot and the run cannot be undone.
+it.
+
+`getfacl`/`setfacl` from the `acl` package are **required for `--apply`**,
+because they are what records the undo point. An applying run on a host without
+them stops at exit 3 before it scans or prompts, rather than making thousands of
+irreversible changes with nothing recorded. Pass `--no-backup` if you want that
+trade anyway — it just has to be asked for. A dry run never needs `acl`.
+
 Changing ownership needs root; a dry run works as any user, but only sees the
 paths that user can read.
 
@@ -107,7 +117,7 @@ environment file cannot turn an invocation destructive.
 | `--cross-filesystems` | `LZC_FIX_PERMISSIONS_CROSS_FILESYSTEMS` | Descend into mounted filesystems. |
 | `--no-chown` | `LZC_FIX_PERMISSIONS_CHOWN=0` | Fix modes only. |
 | `--no-chmod` | `LZC_FIX_PERMISSIONS_CHMOD=0` | Fix ownership only. |
-| `--no-backup` | `LZC_FIX_PERMISSIONS_BACKUP=0` | Skip the `getfacl` snapshot. |
+| `--no-backup` | `LZC_FIX_PERMISSIONS_BACKUP=0` | Skip the `getfacl` snapshot and accept an irreversible run. Without it, a host with no `getfacl` refuses to apply (exit 3). |
 | `--backup-dir PATH` | `LZC_FIX_PERMISSIONS_BACKUP_DIR` | Snapshot location (`/var/backups/fix-permissions`). |
 | `--timeout SECONDS` | `LZC_FIX_PERMISSIONS_SCAN_TIMEOUT` | Bounds the scan of the home directory: the single `find` walk that builds the plan (600). |
 | `--apply-timeout SEC` | `LZC_FIX_PERMISSIONS_APPLY_TIMEOUT` | Bounds each `chown`/`chmod` batch on its own, not the apply phase as a whole (1800). |
@@ -162,7 +172,7 @@ match what the dry run reported.
 | 0 | Nothing to change, dry run finished, or every change applied. |
 | 1 | The work ran but something in it failed. |
 | 2 | Usage error: unknown flag, missing or invalid argument value. |
-| 3 | A required tool is missing: GNU `find`, `timeout`, `xargs`, or `flock`. |
+| 3 | A required tool is missing: GNU `find`, `timeout`, `xargs`, `flock`, or `getfacl` when a snapshot was not waived with `--no-backup`. |
 | 4 | Must be run as root. |
 | 5 | Changes pending, but no terminal to confirm at and no `--yes`. |
 | 75 | Another instance holds the lock. |
@@ -175,14 +185,64 @@ snapshot fails, the run stops before touching anything rather than proceed
 irreversibly — raise `--backup-timeout` if it ran out of time, or pass
 `--no-backup` to accept that trade deliberately.
 
-Code 2 covers an unknown user or group and a home directory that is `/` or a
-system directory, whether that came from `--home` or from `/etc/passwd`. In both
-cases the fix is the invocation: pass a different `--user`, or point `--home`
-somewhere real. System accounts whose passwd home is `/nonexistent` land here by
-design.
+Code 2 covers an unknown user or group and a refused home directory, whether
+that came from `--home` or from `/etc/passwd` — see [Which directories it
+refuses](#which-directories-it-refuses). The fix is the invocation: pass a
+different `--user`, or point `--home` somewhere real.
+
+The `/etc/passwd` half of that matters more than it looks, because several stock
+system accounts have a system directory as their home. `--user daemon`
+(`/usr/sbin`), `--user backup` (`/var/backups`), `--user sys` (`/dev`) and
+`--user nobody` (`/nonexistent`) all exit 2 without a `--home` flag anywhere in
+the command. That is deliberate: those accounts have no home to repair, and a
+mistyped user name must not turn into a recursive `chown` of the operating
+system. `--user www-data` still works, because `/var/www` is a real home.
 
 Code 4 is only reached when the run would change ownership. `--no-chown --apply`
 works as an ordinary user on files that user already owns.
+
+## Which directories it refuses
+
+The target is checked *after* being resolved with `readlink -f`, so
+`--home /home/x/../..` and a symlinked home are judged on where they actually
+land, not on how they were spelled. Two lists, because "is the operating system"
+and "contains home directories" need opposite rules.
+
+**Refused, and so is everything beneath them** — these hold the OS, so nothing
+inside one is a home:
+
+```
+/bin  /boot  /dev  /etc  /lib  /lib32  /lib64  /libx32  /proc  /sbin  /sys  /usr
+/var/backups  /var/cache  /var/log  /var/spool  /var/tmp
+```
+
+**Refused themselves, but their children are fine** — each of these legitimately
+holds home directories one level down:
+
+```
+/home  /media  /mnt  /opt  /run  /srv  /tmp  /var
+/var/lib  /var/local  /var/mail  /var/opt
+/nonexistent  /var/empty
+```
+
+So `--home /home` is refused while `--home /home/alice` works;
+`--home /var/lib` is refused while `--home /var/lib/postgresql` works. `/var`
+stays in the second list rather than the first so that `www-data`'s `/var/www`
+keeps working, and `/var/lib` is in it because service accounts really do live
+under it.
+
+`/` is refused on its own. `/root` is deliberately on neither list: it is root's
+real home, and refusing it would make the script useless for the account most
+likely to need it.
+
+On a usrmerge system `/bin`, `/sbin` and `/lib` resolve to `/usr/...` before the
+check, so they are caught by the `/usr` entry.
+
+This is an enumeration, not a proof. The self-only rules necessarily admit some
+small runtime and spool directories that a few daemon accounts use as a home —
+`/run/ircd` for `irc`, `/var/list` for `list`. Tightening those would start
+eroding the legitimate service-home case that `/var/lib/postgresql` and
+`/var/www` depend on, so the list stops where it does. Read the dry run.
 
 ## Concurrency
 
@@ -213,6 +273,11 @@ already owns, and the operation is idempotent. Point
 exits 5 rather than guess. Excluding large caches keeps the scan short. If the
 previous week's run is somehow still going, this one exits 75 and cron treats it
 as a retryable condition rather than a failure.
+
+Install the `acl` package before scheduling this. Without `getfacl` the run
+stops at exit 3 instead of applying anything, which is the safe outcome but is
+still a broken cron job — and cron reports it by mailing the error, so you will
+hear about it on the first run rather than after a silent irreversible one.
 
 ## Excluding subtrees
 
@@ -246,9 +311,11 @@ this appears" pass the pattern twice:
 - A dry run as a non-root user only reports the paths that user can read; the
   count of unreadable paths is printed so a partial view is not mistaken for a
   clean one.
-- `--home` accepts any directory that is not `/` and not on the system deny
-  list. It is the escape hatch for homes that are not in `/etc/passwd`, and it
-  is also the sharpest edge in the script.
+- `--home` accepts any directory the deny list above does not refuse. It is the
+  escape hatch for homes that are not in `/etc/passwd`, and it is also the
+  sharpest edge in the script: the deny list stops it aiming at the operating
+  system, but it cannot tell a real home from any other directory you own. Read
+  the dry run before adding `--apply`.
 - **Not safe against an actively hostile target user.** Linux has no `lchmod`,
   so between the scan and the apply the user could replace a regular file with
   a symlink and redirect one `chmod` outside the home. Run this when the target
@@ -261,7 +328,10 @@ this appears" pass the pattern twice:
   `chown -h` applied to those. Symlinks are excluded deliberately: `getfacl`
   reports a link's target, so including them would let a restore write outside
   the home.
-- Without `getfacl` on the host the snapshot is skipped with a warning and the
-  run proceeds anyway, so a host lacking the `acl` package is the one case where
-  `--yes` applies changes with nothing recorded. Install `acl` before scheduling
-  this, or pass `--no-backup` so that choice is at least explicit.
+- Awkward file names are not a gap. `getfacl` escapes them rather than writing
+  them raw -- a newline becomes `\012` and a literal backslash becomes `\\` --
+  and `setfacl --restore` decodes both, so a name containing a newline, tab,
+  quote or leading dash round trips through the undo unchanged.
+- The snapshot is a full structural listing of the home, so it is written under
+  `umask 0077` and ends up mode `0600` in `--backup-dir`. Set `--backup-dir` to
+  somewhere only root can read if the default does not already satisfy that.

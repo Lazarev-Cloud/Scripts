@@ -19,7 +19,7 @@
 set -uo pipefail
 
 readonly SCRIPT_NAME='Linux Maintenance Runner'
-readonly SCRIPT_VERSION='2.0'
+readonly SCRIPT_VERSION='2.1'
 readonly PROG='maintenance.sh'
 
 # Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
@@ -168,13 +168,26 @@ Tasks:
                   files are never touched, and --log-exclude (default:
                   $LOG_EXCLUDE) is skipped.
 
-  clean-tmp       Clean --tmp-dirs. With systemd present this defers to
-                  'systemd-tmpfiles --clean', which follows the distribution's
-                  own policy; otherwise regular files whose atime and mtime are
-                  both older than --tmp-age days are deleted and empty
-                  directories pruned.
-                  Blast radius: DELETES files in $TMP_DIRS. Sockets, symlinks
-                  and --tmp-exclude entries are left alone.
+  clean-tmp       Clean temporary files. Two different behaviours, and they do
+                  not have the same blast radius -- the plan printed before the
+                  run names the one that will apply on this host:
+                    tmpfiles mode (the default wherever systemd is running):
+                      defers to 'systemd-tmpfiles --clean', which follows the
+                      distribution's own tmpfiles.d policy.
+                      Blast radius: DELETES aged files EVERYWHERE that policy
+                      covers, which is more than --tmp-dirs; --tmp-dirs and
+                      --tmp-age do not apply. 'systemd-tmpfiles --cat-config'
+                      lists the rules that will be used.
+                      --dry-run runs 'systemd-tmpfiles --clean --dry-run' to
+                      show the real file list where systemd is new enough
+                      (249+); on an older one it says so and previews nothing
+                      rather than guessing. A preview is a query, so it reports
+                      a non-zero status as a warning and never fails the run.
+                    age mode (no systemd, or --tmp-mode age):
+                      regular files whose atime and mtime are both older than
+                      --tmp-age days are deleted and empty directories pruned.
+                      Blast radius: DELETES files in $TMP_DIRS. Sockets,
+                      symlinks and --tmp-exclude entries are left alone.
 
   fix-packages    Repair an interrupted package installation:
                   'dpkg --configure -a' then 'apt-get -f install'.
@@ -223,6 +236,9 @@ Options:
       --tmp-age DAYS        Age threshold for clean-tmp (default: $TMP_AGE_DAYS).
       --tmp-mode MODE       auto | tmpfiles | age (default: $TMP_MODE).
       --tmp-exclude LIST    Space-separated names clean-tmp must not touch.
+      --needrestart-mode M  l | i | a. What to do about services still running
+                            old libraries after an update: l lists them, a
+                            RESTARTS them, i asks (default: $NEEDRESTART_CHOICE).
       --log-file PATH       This script's own log (default: $LOG_FILE).
       --lock-file PATH      Concurrency lock (default: $LOCK_FILE).
       --color WHEN          auto | always | never (default: $USE_COLOR).
@@ -251,6 +267,11 @@ script in from the network. Every one is named LZC_MAINTENANCE_*, so
 The boolean variables (YES, DRY_RUN, QUIET) accept 1/true/yes/on and
 0/false/no/off in any case. Anything else is a usage error rather than a
 silently wrong default.
+
+--log-dir and every --tmp-dirs entry is a sweep root: files under it are
+deleted, as root. Each must therefore be an absolute path with no '.' or '..'
+component, and must not be '/' or a top-level system directory such as /usr or
+/var. Name the directory inside one that you meant instead.
 
 Exit status:
   0    success: every task that applied to this host succeeded
@@ -323,7 +344,17 @@ task_blast_radius() {
         autoremove) printf '%s' 'PURGES packages no longer required, old kernels included' ;;
         clean-cache) printf '%s' 'deletes downloaded package archives (re-downloadable)' ;;
         clean-logs) printf '%s' "DELETES rotated logs in $LOG_DIR older than ${LOG_AGE_DAYS}d and vacuums the journal" ;;
-        clean-tmp) printf '%s' "DELETES aged files in $TMP_DIRS" ;;
+        # TMP_MODE is resolved from 'auto' in preflight(), before the plan is
+        # printed, so this reports the behaviour that will actually apply. The
+        # two modes have genuinely different blast radii and saying "$TMP_DIRS"
+        # for both understates the one that runs by default on a systemd host.
+        clean-tmp)
+            if [[ $TMP_MODE == tmpfiles ]]; then
+                printf '%s' "DELETES aged files everywhere the distribution tmpfiles.d policy covers, which is more than $TMP_DIRS (systemd-tmpfiles --clean)"
+            else
+                printf '%s' "DELETES files in $TMP_DIRS untouched for more than ${TMP_AGE_DAYS}d"
+            fi
+            ;;
         fix-packages) printf '%s' 'completes interrupted dpkg/apt operations' ;;
         fix-locks) printf '%s' 'reports lock holders; may delete a dead dnf pid file' ;;
         *) printf '%s' 'unknown' ;;
@@ -356,6 +387,8 @@ setting_label() {
         TMP_AGE_DAYS) printf '%s' '--tmp-age / LZC_MAINTENANCE_TMP_AGE_DAYS' ;;
         LOG_MAX_BYTES) printf '%s' 'LZC_MAINTENANCE_LOG_MAX_BYTES' ;;
         LOG_DIR) printf '%s' '--log-dir / LZC_MAINTENANCE_LOG_DIR' ;;
+        TMP_DIRS) printf '%s' '--tmp-dirs / LZC_MAINTENANCE_TMP_DIRS' ;;
+        NEEDRESTART_CHOICE) printf '%s' '--needrestart-mode / LZC_MAINTENANCE_NEEDRESTART_MODE' ;;
         ETC_DIR) printf '%s' 'LZC_MAINTENANCE_ETC_DIR' ;;
         LOG_FILE) printf '%s' '--log-file / LZC_MAINTENANCE_LOG' ;;
         LOCK_FILE) printf '%s' '--lock-file / LZC_MAINTENANCE_LOCK' ;;
@@ -400,6 +433,43 @@ _normalise_int() {
     [[ -z $max ]] || ((value <= max)) ||
         die "$EX_USAGE" "$(setting_label "$name") must be at most $max, got '${!name}'"
     printf -v "$name" '%s' "$value"
+}
+
+# clean-logs and clean-tmp delete files under a directory the caller names, as
+# root. That makes a sweep root the one setting where a typo is unrecoverable:
+# '--log-dir /' deletes every '*.gz' and '*.[0-9]' on the root device -- the
+# whole man page tree included -- and '--tmp-dirs /' deletes every regular file
+# on it that is older than the age threshold.
+#
+# The guard is stated as a principle rather than a blacklist of bad values: a
+# sweep root must be absolute, must not contain traversal, and must never be a
+# directory that IS the operating system.
+assert_sweep_root() {
+    local label=$1 dir=$2 trimmed
+    [[ $dir == /* ]] || die "$EX_USAGE" "$label must be an absolute path, got '$dir' (a relative path is resolved against the working directory, which cron does not set)"
+    [[ $dir != *//* ]] || die "$EX_USAGE" "$label must not contain '//', got '$dir'"
+    trimmed=${dir%/}
+    # '.' and '..' walk straight through every check below: '/tmp/../' is
+    # absolute, is not literally a system directory, and still resolves to '/'
+    # by the time find(1) sees it. Reject traversal outright rather than trying
+    # to enumerate the paths it can reach.
+    case $trimmed/ in
+        */../* | */./*)
+            die "$EX_USAGE" "$label must not contain '.' or '..' components, got '$dir'"
+            ;;
+    esac
+    # '/tmp' is deliberately absent from the list below: it is the one top-level
+    # directory whose contents are disposable by definition, and it is a default
+    # sweep root. Every other name here is the operating system itself.
+    case $trimmed in
+        '')
+            die "$EX_USAGE" "$label must not be '/': sweeping the root filesystem would delete the operating system"
+            ;;
+        /bin | /boot | /dev | /etc | /home | /lib | /lib32 | /lib64 | /libx32 | \
+            /proc | /root | /run | /sbin | /srv | /sys | /usr | /var)
+            die "$EX_USAGE" "$label must not be '$trimmed': that is a system directory, not a sweep root. Name the directory inside it that you meant."
+            ;;
+    esac
 }
 
 parse_args() {
@@ -488,6 +558,11 @@ parse_args() {
                 TMP_MODE=$2
                 shift
                 ;;
+            --needrestart-mode)
+                need_value "$#" "$1"
+                NEEDRESTART_CHOICE=$2
+                shift
+                ;;
             --tmp-exclude)
                 need_value "$#" "$1"
                 TMP_EXCLUDE=$2
@@ -532,6 +607,13 @@ parse_args() {
     [[ $USE_COLOR =~ ^(auto|always|never)$ ]] || die "$EX_USAGE" "--color must be auto, always or never, got '$USE_COLOR'"
     [[ $UPGRADE_MODE =~ ^(upgrade|dist-upgrade)$ ]] || die "$EX_USAGE" "--upgrade-mode must be upgrade or dist-upgrade, got '$UPGRADE_MODE'"
     [[ $TMP_MODE =~ ^(auto|tmpfiles|age)$ ]] || die "$EX_USAGE" "--tmp-mode must be auto, tmpfiles or age, got '$TMP_MODE'"
+    # Validated like every other setting rather than passed through: this value
+    # is exported into the environment of the package transaction, and 'a' means
+    # "restart running services", which is the most disruptive thing this script
+    # can be asked to do. An unrecognised value must be a usage error, not an
+    # undefined behaviour that surfaces mid-upgrade.
+    [[ $NEEDRESTART_CHOICE =~ ^[lia]$ ]] ||
+        die "$EX_USAGE" "$(setting_label NEEDRESTART_CHOICE) must be l (list), i (interactive) or a (auto-restart), got '$NEEDRESTART_CHOICE'"
     [[ $JOURNAL_SIZE =~ ^[0-9]+[KMGT]?$ ]] || die "$EX_USAGE" "--journal-size must look like 500M, got '$JOURNAL_SIZE'"
     [[ $JOURNAL_AGE =~ ^[0-9]+(s|m|h|d|w|month|y)?$ ]] || die "$EX_USAGE" "--journal-age must look like 30d, got '$JOURNAL_AGE'"
 
@@ -559,9 +641,21 @@ parse_args() {
     _normalise_int LOG_AGE_DAYS 0
     _normalise_int TMP_AGE_DAYS 0
 
-    for name in LOG_DIR ETC_DIR LOG_FILE LOCK_FILE; do
+    for name in ETC_DIR LOG_FILE LOCK_FILE; do
         [[ ${!name} == /* ]] ||
             die "$EX_USAGE" "$(setting_label "$name") must be an absolute path, got '${!name}'"
+    done
+
+    # Both sweep roots get the floor guard. LOG_DIR is a single path; TMP_DIRS
+    # is a list, and every entry is swept, so every entry is checked.
+    assert_sweep_root "$(setting_label LOG_DIR)" "$LOG_DIR"
+    local -a tmp_toks=()
+    read -r -a tmp_toks <<<"$TMP_DIRS"
+    ((${#tmp_toks[@]})) ||
+        die "$EX_USAGE" "$(setting_label TMP_DIRS) must name at least one directory"
+    local dir
+    for dir in "${tmp_toks[@]}"; do
+        assert_sweep_root "$(setting_label TMP_DIRS)" "$dir"
     done
 
     ((${#TASKS[@]})) || TASKS=(report)
@@ -643,6 +737,17 @@ preflight() {
 
     detect_family || log WARN "No apt-get, dnf or yum found; package tasks will be skipped"
 
+    # Resolved here, before print_plan runs, so that the blast radius shown to
+    # the operator and the code that does the deleting read the same value.
+    # Deciding it inside the task instead would leave the plan guessing.
+    if [[ $TMP_MODE == auto ]]; then
+        if have systemd-tmpfiles && [[ -d /run/systemd/system ]]; then
+            TMP_MODE=tmpfiles
+        else
+            TMP_MODE=age
+        fi
+    fi
+
     # Rotate before opening, so an unattended host does not grow the log without
     # bound between logrotate runs.
     if [[ -f $LOG_FILE ]]; then
@@ -699,6 +804,15 @@ run_cmd() {
     fi
 
     log RUN "$*"
+    exec_cmd "$secs" "$@"
+}
+
+# The execution half of run_cmd, without the --dry-run gate. Called directly
+# only for a command that is itself a preview and therefore has to run during a
+# dry run -- 'systemd-tmpfiles --clean --dry-run' is the one case.
+exec_cmd() {
+    local secs=$1
+    shift
     local rc
     if ((QUIET)); then
         if ((HAVE_TIMEOUT && secs > 0)); then
@@ -889,11 +1003,25 @@ report_updates() {
     section 'Pending updates'
     case $FAMILY in
         debian)
-            local count
             # Debug::NoLocking lets this run while another apt process holds the
             # lock, so a health check never blocks on an in-flight upgrade.
-            count=$(probe apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst ' || true)
-            printf '  Upgradable    : %s package(s)\n' "${count:-unknown}"
+            #
+            # The simulation is captured and its status checked before anything
+            # is counted. Piping it straight into `grep -c` loses that status:
+            # grep prints "0" for empty input whether apt found no upgrades or
+            # failed outright, so a broken sources.list, an unreachable mirror
+            # or a probe timeout would all be reported as "0 package(s)" -- a
+            # health check answering "all clear" because it could not look. The
+            # rhel branch below already reads its status; this now matches.
+            local sim rc
+            sim=$(probe apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null)
+            rc=$?
+            if ((rc == 0)); then
+                printf '  Upgradable    : %s package(s)\n' \
+                    "$(printf '%s\n' "$sim" | grep -c '^Inst ' || true)"
+            else
+                printf '  Upgradable    : unknown (apt-get -s upgrade exited %s)\n' "$rc"
+            fi
             if have apt-mark; then
                 local held
                 held=$(probe apt-mark showhold 2>/dev/null)
@@ -1286,25 +1414,65 @@ prune_empty_dirs() {
     return 0
 }
 
-task_clean_tmp() {
-    local mode=$TMP_MODE rc=0
-    if [[ $mode == auto ]]; then
-        if have systemd-tmpfiles && [[ -d /run/systemd/system ]]; then
-            mode=tmpfiles
-        else
-            mode=age
-        fi
-    fi
+# systemd-tmpfiles grew --dry-run in systemd 249. Older releases are still in
+# service (Debian 11 ships 247), so support is probed rather than assumed, and
+# the absence of it is reported instead of being papered over.
+# The help text is captured and matched in the shell rather than piped into
+# `grep -q`. Under `pipefail`, `producer | grep -q` reports the pipeline as
+# failed whenever grep exits on the first match before the producer has finished
+# writing: the producer gets SIGPIPE and dies with 141, which pipefail promotes.
+# That would make a systemd that DOES support --dry-run look as though it does
+# not, and silently drop the preview -- and it only bites once the help text
+# outgrows the pipe buffer, so it is the kind of bug that appears on someone
+# else's distribution and never in a test.
+tmpfiles_has_dry_run() {
+    local help_text
+    help_text=$(probe systemd-tmpfiles --help 2>/dev/null) || return 1
+    [[ $help_text == *--dry-run* ]]
+}
 
-    if [[ $mode == tmpfiles ]]; then
+task_clean_tmp() {
+    # TMP_MODE has already been resolved from 'auto' by preflight, so this is
+    # the same value the plan showed the operator.
+    local rc=0
+
+    if [[ $TMP_MODE == tmpfiles ]]; then
         have systemd-tmpfiles || {
             log ERROR "systemd-tmpfiles not found; use --tmp-mode age"
             return 1
         }
         # The distribution's own tmpfiles.d policy already encodes which paths
         # are safe to remove and after how long, including the sockets that must
-        # survive. Deferring to it beats re-deriving the rules here.
-        log INFO "Using the distribution tmpfiles.d policy; --tmp-age does not apply"
+        # survive. Deferring to it beats re-deriving the rules here -- but it
+        # also means the set of files at risk is the whole policy, not --tmp-dirs.
+        log INFO "Using the distribution tmpfiles.d policy: --tmp-dirs and --tmp-age do not apply, and paths outside them may be cleaned. 'systemd-tmpfiles --cat-config' lists the rules."
+        if ((DRY_RUN)); then
+            if tmpfiles_has_dry_run; then
+                log DRY 'systemd-tmpfiles --clean --dry-run (lists what it would remove; removes nothing)'
+                # Deliberately not run_cmd: this argv is the preview itself, so
+                # printing "would run" instead of running it would make
+                # --dry-run useless for the default clean-tmp path.
+                #
+                # Its status is reported but does not fail the task. A preview is
+                # a query: --dry-run deliberately skips the root check so an
+                # unprivileged operator can decide whether to run this at all,
+                # and such a run cannot stat everything the policy covers.
+                # Marking the maintenance run failed because a preview was
+                # incomplete would be wrong, and every other task's --dry-run
+                # returns 0 as well.
+                local prc=0
+                exec_cmd "$TASK_TIMEOUT" systemd-tmpfiles --clean --dry-run || prc=$?
+                ((prc == 0)) ||
+                    log WARN "systemd-tmpfiles --clean --dry-run exited $prc; the list above may be incomplete (a full preview needs root)."
+                return 0
+            else
+                # No preview available. Say so and change nothing -- never fall
+                # through to the real --clean to produce some output.
+                log DRY 'would run: systemd-tmpfiles --clean'
+                log WARN "This systemd-tmpfiles predates --dry-run (systemd 249), so the file list cannot be previewed. Inspect the policy with 'systemd-tmpfiles --cat-config', or use --tmp-mode age for a previewable sweep."
+            fi
+            return "$rc"
+        fi
         run_cmd "$TASK_TIMEOUT" systemd-tmpfiles --clean || rc=1
         return "$rc"
     fi
@@ -1505,14 +1673,20 @@ run_task() {
     esac
 }
 
+# force=1 prints the plan even under --quiet. A confirmation prompt exists to
+# show the operator the blast radius before they answer it, so suppressing the
+# plan and then asking "Proceed? [y/N]" would leave nothing to consent to.
+# --quiet still silences the plan for the runs it was meant for: --yes and
+# --dry-run, neither of which asks a question.
 print_plan() {
-    local task
-    say ''
-    say "Plan for $(hostname 2>/dev/null || printf 'this host'):"
+    local force=${1:-0} task
+    ((QUIET)) && ((!force)) && return 0
+    printf '\n'
+    printf 'Plan for %s:\n' "$(hostname 2>/dev/null || printf 'this host')"
     for task in "${TASKS[@]}"; do
-        say "  $(printf '%-13s' "$task") $(task_blast_radius "$task")"
+        printf '  %-13s %s\n' "$task" "$(task_blast_radius "$task")"
     done
-    say ''
+    printf '\n'
 }
 
 confirm_plan() {
@@ -1535,7 +1709,12 @@ confirm_step() {
     ((DRY_RUN)) && return 0
     ((ASSUME_YES)) && return 0
     if can_prompt; then
-        say "About to $what."
+        # printf, not say(): say() is silenced by --quiet, and a confirmation
+        # prompt with nothing above it gives the operator nothing to consent to.
+        # Same reasoning as print_plan's force flag. This is the only gate
+        # fix-locks has -- it is not a mutating task, so the whole-run gate in
+        # main() never fires for it.
+        printf 'About to %s.\n' "$what"
         confirm_plan && return 0
         log INFO "Skipped: $what"
         return 1
@@ -1608,12 +1787,16 @@ main() {
         die "$EX_NOROOT" "These tasks must run as root. Try: sudo $PROG ${TASKS[*]}"
     fi
 
-    print_plan
+    # Decided before the plan is printed, because the answer is what decides
+    # whether --quiet is allowed to suppress it.
+    local will_prompt=0
+    ((!DRY_RUN)) && ((mutating)) && ((!ASSUME_YES)) && can_prompt && will_prompt=1
+    print_plan "$will_prompt"
 
     if ((DRY_RUN)); then
         log INFO 'Dry run: nothing will be changed.'
     elif ((mutating)) && ((!ASSUME_YES)); then
-        if can_prompt; then
+        if ((will_prompt)); then
             confirm_plan || {
                 log INFO 'Cancelled.'
                 return 0
