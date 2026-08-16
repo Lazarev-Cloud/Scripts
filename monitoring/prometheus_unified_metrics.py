@@ -8,6 +8,9 @@
 #
 # License: MIT
 # Origin:  https://github.com/Lazarev-Cloud/Scripts
+# Requires: Python 3.9+ and prometheus_client. psutil, smartmontools and the
+#           NVIDIA utilities are all optional; each one only affects its own
+#           collector.
 #
 # Error model: a scrape must never fail because one subsystem is broken or
 # absent. Every collector runs inside a guard that converts any exception,
@@ -17,6 +20,12 @@
 # line (exit 2), and failure to bind the listen socket or write the textfile
 # (exit 1). A signal stops the server cleanly and exits 130. Nothing here
 # installs software, and nothing writes outside the path given to --textfile.
+#
+# One rule follows from that model rather than from taste: which mode the
+# process runs in is decided on the command line and nowhere else. An
+# environment variable may supply a value, never select a mode - see
+# resolve_textfile() for why a service that can be turned into a one-shot by an
+# environment file is a service that can die without failing.
 
 """Unified host metrics exporter for Prometheus.
 
@@ -29,6 +38,7 @@ import argparse
 import errno
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -84,7 +94,7 @@ except ImportError as _exc:  # pragma: no cover - exercised only without the dep
     raise SystemExit(3)
 
 SCRIPT_NAME = "prometheus_unified_metrics.py"
-SCRIPT_VERSION = "2.0"
+SCRIPT_VERSION = "2.1"
 
 # Single-word application prefix, per Prometheus naming practices. Deliberately
 # NOT configurable: metric names are a contract with every dashboard and alert
@@ -121,9 +131,23 @@ DEFAULT_PORT = os.environ.get("LZC_EXPORTER_PORT", "9105")
 DEFAULT_TIMEOUT = os.environ.get("LZC_EXPORTER_TIMEOUT", "8")
 DEFAULT_SMART_INTERVAL = os.environ.get("LZC_EXPORTER_SMART_INTERVAL", "60")
 DEFAULT_LOG_LEVEL = os.environ.get("LZC_EXPORTER_LOG_LEVEL", "info")
+# Supplies the path for a bare `--textfile`. It cannot select textfile mode on
+# its own; resolve_textfile() refuses that and says why.
 DEFAULT_TEXTFILE = os.environ.get("LZC_EXPORTER_TEXTFILE", "")
+# Permissions for the file --textfile writes. node_exporter usually runs under
+# its own account, so the default is world-readable: prometheus_client's writer
+# creates the file with the ambient umask, and a service with UMask=0077 or a
+# root cron job would otherwise produce a 0600 file that node_exporter reports
+# as node_textfile_scrape_error 1 rather than as an error from this script.
+DEFAULT_TEXTFILE_MODE = os.environ.get("LZC_EXPORTER_TEXTFILE_MODE", "0644")
 DEFAULT_COLLECTORS = os.environ.get("LZC_EXPORTER_COLLECTORS", "")
 DEFAULT_DISABLED = os.environ.get("LZC_EXPORTER_DISABLE_COLLECTORS", "")
+# External tools, overridable because a service PATH is not a login PATH:
+# smartctl lives in /usr/sbin or /usr/local/sbin on different distributions, and
+# a collector that can only say "not on PATH" is a collector you cannot fix
+# without editing this file.
+DEFAULT_SMARTCTL = os.environ.get("LZC_EXPORTER_SMARTCTL", "smartctl")
+DEFAULT_NVIDIA_SMI = os.environ.get("LZC_EXPORTER_NVIDIA_SMI", "nvidia-smi")
 # Pseudo, container and snap mounts. Without this a Docker or Proxmox host grows
 # one filesystem series per container layer, which is unbounded cardinality.
 DEFAULT_MOUNT_EXCLUDE = os.environ.get(
@@ -372,15 +396,28 @@ class ExporterCollector(Collector):
         self._subsystems = list(subsystems)
 
     def collect(self) -> Iterator[Metric]:
+        # A cache hit in Subsystem.run() replays the stored (families, up,
+        # duration) triple, so these two families are served from the cache
+        # alongside the data they describe. Saying "the last attempt" without
+        # that qualifier reads as a scrape-time signal, which is exactly the
+        # misreading the cache note on the disk families exists to prevent.
+        # Conditional, so the wording stays true when nothing caches (no smart
+        # collector, or --smart-interval 0).
+        note = (
+            " Where a collector caches (see --smart-interval), this describes "
+            "the cached attempt rather than the current scrape."
+            if any(getattr(s, "cache_seconds", 0) > 0 for s in self._subsystems)
+            else ""
+        )
         up = GaugeMetricFamily(
             "%s_collector_up" % NS,
             "1 if this collector gathered its data on the last attempt, 0 if the "
-            "required tool was missing or the attempt failed.",
+            "required tool was missing or the attempt failed." + note,
             labels=["collector"],
         )
         duration = GaugeMetricFamily(
             "%s_collector_duration_seconds" % NS,
-            "Seconds the last collection attempt for this collector took.",
+            "Seconds the last collection attempt for this collector took." + note,
             labels=["collector"],
         )
         for subsystem in self._subsystems:
@@ -734,23 +771,47 @@ class SmartCollector(Subsystem):
 
     name = "smart"
 
-    def __init__(self, timeout: float, cache_seconds: float) -> None:
+    def __init__(self, timeout: float, cache_seconds: float, smartctl: str = DEFAULT_SMARTCTL) -> None:
         super().__init__()
         self._timeout = timeout
         self.cache_seconds = cache_seconds
+        self._smartctl = smartctl
 
     def unavailable_reason(self) -> Optional[str]:
-        if shutil.which("smartctl") is None:
-            return "smartctl is not on PATH (install smartmontools >= 7.0)"
+        if shutil.which(self._smartctl) is None:
+            return (
+                "%s is not on PATH and is not an executable path (install "
+                "smartmontools >= 7.0, or point --smartctl at it)" % self._smartctl
+            )
         if hasattr(os, "geteuid") and os.geteuid() != 0:
             return "not running as root; smartctl needs raw device access"
         return None
 
+    def _cache_note(self) -> str:
+        """The HELP suffix that declares this family is served from a cache.
+
+        The Prometheus exporter guidelines require a metric that is cached
+        rather than read at scrape time to say so in its HELP string, because
+        the alternative is an operator reading a 60-second-old temperature as if
+        it were current. Generated from the configured interval rather than
+        written out, so the text cannot drift from the behaviour.
+        """
+        if self.cache_seconds <= 0:
+            return ""
+        # Deliberately terse: it is appended to twelve HELP strings, and the
+        # reason caching exists at all belongs in the class docstring, not
+        # twelve times in the exposition.
+        return (
+            " Cached: read at most every %g seconds (--smart-interval), so it "
+            "can lag the scrape by that much." % self.cache_seconds
+        )
+
     def _devices(self) -> List[Tuple[str, str]]:
-        result = run_command(["smartctl", "--json", "--scan-open"], self._timeout)
+        result = run_command([self._smartctl, "--json", "--scan-open"], self._timeout)
         if result is None:
             raise SubsystemUnavailable(
-                "smartctl is not on PATH, or it did not respond within the timeout"
+                "%s is not on PATH, or it did not respond within the timeout"
+                % self._smartctl
             )
         _rc, stdout = result
         payload = parse_json(stdout, "smartctl --scan-open")
@@ -774,7 +835,7 @@ class SmartCollector(Subsystem):
 
     def _device_payload(self, name: str, dev_type: str) -> Optional[dict]:
         result = run_command(
-            ["smartctl", "--json", "-H", "-i", "-A", "-d", dev_type, name],
+            [self._smartctl, "--json", "-H", "-i", "-A", "-d", dev_type, name],
             self._timeout,
         )
         if result is None:
@@ -797,75 +858,79 @@ class SmartCollector(Subsystem):
     def collect_families(self) -> Iterable[Metric]:
         devices = self._devices()
 
+        # Every family below is built through these helpers so the cache note is
+        # appended in one place. A metric added later cannot accidentally omit
+        # it.
+        note = self._cache_note()
+
+        def gauge(suffix: str, help_text: str) -> GaugeMetricFamily:
+            return GaugeMetricFamily(
+                "%s_%s" % (NS, suffix), help_text + note, labels=["device"]
+            )
+
+        def counter(suffix: str, help_text: str) -> CounterMetricFamily:
+            return CounterMetricFamily(
+                "%s_%s" % (NS, suffix), help_text + note, labels=["device"]
+            )
+
         info = InfoMetricFamily(
             "%s_disk" % NS,
             "Drive identity. Join on `device` to attach model and serial to the "
-            "other disk metrics without repeating them on every series.",
+            "other disk metrics without repeating them on every series." + note,
             labels=["device"],
         )
-        healthy = GaugeMetricFamily(
-            "%s_disk_health_ok" % NS,
+        healthy = gauge(
+            "disk_health_ok",
             "1 if the drive's SMART overall-health self-assessment passed, 0 if "
             "it failed.",
-            labels=["device"],
         )
-        temperature = GaugeMetricFamily(
-            "%s_disk_temperature_celsius" % NS,
+        temperature = gauge(
+            "disk_temperature_celsius",
             "Current drive temperature (smartctl temperature.current).",
-            labels=["device"],
         )
-        power_on = CounterMetricFamily(
-            "%s_disk_power_on_seconds_total" % NS,
+        power_on = counter(
+            "disk_power_on_seconds_total",
             "Cumulative powered-on time (smartctl power_on_time.hours, "
             "converted from hours to seconds).",
-            labels=["device"],
         )
-        power_cycles = CounterMetricFamily(
-            "%s_disk_power_cycles_total" % NS,
+        power_cycles = counter(
+            "disk_power_cycles_total",
             "Cumulative power cycle count.",
-            labels=["device"],
         )
-        spare_ratio = GaugeMetricFamily(
-            "%s_disk_available_spare_ratio" % NS,
+        spare_ratio = gauge(
+            "disk_available_spare_ratio",
             "NVMe available spare capacity as a ratio of 0-1 (smartctl "
             "nvme_smart_health_information_log.available_spare, converted from "
             "percent).",
-            labels=["device"],
         )
-        wear_ratio = GaugeMetricFamily(
-            "%s_disk_endurance_used_ratio" % NS,
+        wear_ratio = gauge(
+            "disk_endurance_used_ratio",
             "NVMe endurance consumed as a ratio of 0-1 (smartctl "
             "nvme_smart_health_information_log.percentage_used, converted from "
             "percent). Values above 1 are legal and mean the rated endurance is "
             "exhausted.",
-            labels=["device"],
         )
-        media_errors = CounterMetricFamily(
-            "%s_disk_media_errors_total" % NS,
+        media_errors = counter(
+            "disk_media_errors_total",
             "NVMe media and data integrity errors.",
-            labels=["device"],
         )
-        realloc = CounterMetricFamily(
-            "%s_disk_reallocated_sectors_total" % NS,
+        realloc = counter(
+            "disk_reallocated_sectors_total",
             "ATA SMART attribute 5 (Reallocated_Sector_Ct) raw value.",
-            labels=["device"],
         )
-        pending = GaugeMetricFamily(
-            "%s_disk_pending_sectors" % NS,
+        pending = gauge(
+            "disk_pending_sectors",
             "ATA SMART attribute 197 (Current_Pending_Sector) raw value. A "
             "gauge, not a counter: pending sectors clear when reallocated.",
-            labels=["device"],
         )
-        uncorrectable = GaugeMetricFamily(
-            "%s_disk_uncorrectable_sectors" % NS,
+        uncorrectable = gauge(
+            "disk_uncorrectable_sectors",
             "ATA SMART attribute 198 (Offline_Uncorrectable) raw value.",
-            labels=["device"],
         )
-        crc_errors = CounterMetricFamily(
-            "%s_disk_interface_crc_errors_total" % NS,
+        crc_errors = counter(
+            "disk_interface_crc_errors_total",
             "ATA SMART attribute 199 (UDMA_CRC_Error_Count) raw value. Usually "
             "a cable or backplane fault rather than a failing drive.",
-            labels=["device"],
         )
 
         read_count = 0
@@ -895,8 +960,8 @@ class SmartCollector(Subsystem):
             # Almost always "not running as root": smartctl needs ATA_12/ATA_16
             # SCSI passthrough, and membership of the `disk` group is not enough.
             raise SubsystemUnavailable(
-                "smartctl found %d device(s) but could read none of them; "
-                "this collector needs root" % len(devices)
+                "%s found %d device(s) but could read none of them; "
+                "this collector needs root" % (self._smartctl, len(devices))
             )
 
         yield info
@@ -1012,15 +1077,19 @@ class GpuCollector(Subsystem):
         "power.limit",
     )
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(self, timeout: float, nvidia_smi: str = DEFAULT_NVIDIA_SMI) -> None:
         super().__init__()
         self._timeout = timeout
+        self._nvidia_smi = nvidia_smi
         self._nvml: Optional[Any] = None
         self._nvml_initialised = False
 
     def unavailable_reason(self) -> Optional[str]:
-        if import_optional("pynvml") is None and shutil.which("nvidia-smi") is None:
-            return "neither the pynvml module nor nvidia-smi is available"
+        if import_optional("pynvml") is None and shutil.which(self._nvidia_smi) is None:
+            return (
+                "neither the pynvml module nor %s is available"
+                % self._nvidia_smi
+            )
         return None
 
     def collect_families(self) -> Iterable[Metric]:
@@ -1029,8 +1098,9 @@ class GpuCollector(Subsystem):
             readings = self._read_nvidia_smi()
         if readings is None:
             raise SubsystemUnavailable(
-                "neither NVML nor nvidia-smi returned data; install nvidia-ml-py "
-                "or the NVIDIA driver utilities, or disable this collector"
+                "neither NVML nor %s returned data; install nvidia-ml-py or the "
+                "NVIDIA driver utilities, point --nvidia-smi at the binary, or "
+                "disable this collector" % self._nvidia_smi
             )
         if not readings:
             # A working driver with zero GPUs is a successful, empty collection.
@@ -1119,7 +1189,7 @@ class GpuCollector(Subsystem):
     def _read_nvidia_smi(self) -> Optional[List[Dict[str, Any]]]:
         result = run_command(
             [
-                "nvidia-smi",
+                self._nvidia_smi,
                 "--query-gpu=%s" % ",".join(self._SMI_FIELDS),
                 "--format=csv,noheader,nounits",
             ],
@@ -1129,7 +1199,7 @@ class GpuCollector(Subsystem):
             return None
         returncode, stdout = result
         if returncode != 0:
-            LOG.warning("nvidia-smi exited %d", returncode)
+            LOG.warning("%s exited %d", self._nvidia_smi, returncode)
             return None
 
         readings: List[Dict[str, Any]] = []
@@ -1419,8 +1489,8 @@ def build_registry(args: argparse.Namespace, selected: Sequence[str]) -> Collect
     factories: Dict[str, Callable[[], Subsystem]] = {
         "host": lambda: HostCollector(mount_exclude, netdev_exclude),
         "sensors": SensorsCollector,
-        "smart": lambda: SmartCollector(args.timeout, args.smart_interval),
-        "gpu": lambda: GpuCollector(args.timeout),
+        "smart": lambda: SmartCollector(args.timeout, args.smart_interval, args.smartctl),
+        "gpu": lambda: GpuCollector(args.timeout, args.nvidia_smi),
     }
 
     subsystems: List[Subsystem] = []
@@ -1471,23 +1541,150 @@ def split_list(value: str) -> List[str]:
     return [item.strip() for item in value.replace(",", " ").split() if item.strip()]
 
 
-def positive_number(text: str) -> float:
+def resolve_textfile(args: argparse.Namespace) -> Optional[str]:
+    """Decide whether this run writes a textfile, and where. Never guesses.
+
+    `--textfile` is nargs="?", so the namespace distinguishes three cases that a
+    plain `default=` would collapse into one:
+
+      absent          -> None      -> serve
+      bare flag       -> the value of LZC_EXPORTER_TEXTFILE
+      flag with value -> that path
+
+    The case this exists for is the fourth: LZC_EXPORTER_TEXTFILE set and
+    --textfile absent. Reading the variable there would mean an environment file
+    can change the mode of the process. That is not a theoretical objection --
+    the installed unit loads /etc/default/<name>.local, the documentation invites
+    operators to put LZC_EXPORTER_* settings in it, and the result is an exporter
+    that writes a file, exits 0, is not restarted by Restart=on-failure, and
+    leaves the port unserved with no unit in a failed state for an alert to find.
+    A refusal is loud, and loud beats silent.
+    """
+    if args.textfile is None:
+        if DEFAULT_TEXTFILE.strip():
+            usage_error(
+                "LZC_EXPORTER_TEXTFILE is set (%s) but --textfile was not given. "
+                "The variable supplies the path; only the command line selects "
+                "the mode, because letting an environment file do it turns a "
+                "running exporter into a one-shot that exits 0 and stops serving "
+                "without ever failing. Add --textfile to use that path, "
+                "--textfile PATH to override it, or unset the variable to serve."
+                % DEFAULT_TEXTFILE.strip()
+            )
+        return None
+
+    path = args.textfile.strip()
+    if not path:
+        usage_error(
+            "--textfile needs a path: give one, or set LZC_EXPORTER_TEXTFILE and "
+            "pass --textfile with no value"
+        )
+    return path
+
+
+def write_textfile(path: str, mode: int, registry: CollectorRegistry) -> bool:
+    """Write the exposition to `path` atomically, then set its permissions.
+
+    prometheus_client writes through a temporary file in the same directory and
+    renames it, so node_exporter never reads a half-written file. What it does
+    not do is set a mode: the file is created with the ambient umask, so under a
+    unit carrying UMask=0077 -- or a root cron job -- the result is 0600 and
+    node_exporter, running under its own account, reports
+    node_textfile_scrape_error 1 instead of these metrics. The chmod makes
+    readability a property of this script rather than of whatever umask happened
+    to be in force.
+    """
+    try:
+        write_to_textfile(path, registry)
+    except Exception:  # noqa: BLE001 - OSError is expected; anything else is a bug
+        # LOG.exception keeps the traceback, so nothing is hidden, while the
+        # process still exits with the documented 1 rather than an unhandled
+        # traceback's 1 plus a stack dump as the only explanation.
+        LOG.exception("cannot write %s", path)
+        return False
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        # The metrics are on disk and correct; only the mode is not what was
+        # asked for. That is a warning, not a failed run.
+        LOG.warning("wrote %s but could not set mode %04o: %s", path, mode, exc)
+    else:
+        LOG.info("wrote %s (mode %04o)", path, mode)
+    return True
+
+
+def write_exposition(registry: CollectorRegistry) -> None:
+    """Write one exposition to stdout as bytes.
+
+    generate_latest() already returns UTF-8. Decoding it so that the text layer
+    can encode it again is how a drive model or GPU name with a non-ASCII byte
+    becomes a UnicodeEncodeError on a host where stdout is not UTF-8 (LC_ALL=C
+    with an interpreter old enough to honour it, a redirected pipe on Windows).
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    payload = generate_latest(registry)
+    if buffer is None:  # stdout replaced by something text-only
+        sys.stdout.write(payload.decode("utf-8"))
+        sys.stdout.flush()
+        return
+    buffer.write(payload)
+    buffer.flush()
+
+
+def _finite(text: str) -> float:
+    """float(), but 'nan' and 'inf' are rejected rather than accepted.
+
+    float('nan') passes every ordering test, because every comparison against
+    NaN is False: `nan <= 0` and `nan < 0` are both False, so a bare range check
+    lets it straight through. A NaN reaching subprocess timeout= removes the one
+    mechanism that stops a wedged disk stalling every scrape, and a NaN reaching
+    the SMART cache interval silently disables caching. float('inf') is the
+    mirror image: an infinite tool timeout never fires, and an infinite cache
+    interval serves the first reading forever.
+    """
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError("%r is not a number" % text)
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            "must be a finite number, got %r" % text
+        )
+    return value
+
+
+def positive_number(text: str) -> float:
+    value = _finite(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0, got %r" % text)
     return value
 
 
 def non_negative_number(text: str) -> float:
-    try:
-        value = float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError("%r is not a number" % text)
+    value = _finite(text)
     if value < 0:
         raise argparse.ArgumentTypeError("must be 0 or greater, got %r" % text)
+    return value
+
+
+def octal_mode(text: str) -> int:
+    """Parse a file mode written the way chmod(1) is written, i.e. in octal.
+
+    int(text, 8) rather than int(text): '0644' read as decimal is 644, which is
+    0o1204 - group-writable, setuid-adjacent nonsense that nobody would have
+    typed on purpose. Anything outside 0-0o777 is a usage error rather than
+    something to silently mask.
+    """
+    try:
+        value = int(text.strip(), 8)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            "%r is not an octal file mode (for example 0644)" % text
+        )
+    if not 0 <= value <= 0o777:
+        raise argparse.ArgumentTypeError(
+            "must be between 0 and 0777, got %r" % text
+        )
     return value
 
 
@@ -1536,18 +1733,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "collector and nothing else changes; the scrape still succeeds."
         ),
         epilog=(
-            "Modes:\n"
+            "Modes, chosen on the command line and nowhere else:\n"
             "  (default)          serve /metrics over HTTP until SIGTERM/SIGINT.\n"
             "  --once             print one exposition to stdout and exit.\n"
             "  --textfile PATH    write one exposition to PATH atomically and exit.\n"
+            "  --textfile         same, using the path in LZC_EXPORTER_TEXTFILE.\n"
             "  --once and --textfile combine; giving either one suppresses the server.\n"
+            "\n"
+            "Setting LZC_EXPORTER_TEXTFILE without naming --textfile is a usage\n"
+            "error (exit 2), not a mode change. An environment file is read by\n"
+            "every unit that references it, so allowing it to select one-shot mode\n"
+            "would let one line in /etc/default turn a running exporter into a\n"
+            "process that writes a file, exits 0, and leaves nothing listening --\n"
+            "which Restart=on-failure does not restart and no alert can see.\n"
             "\n"
             "Environment variables (flags win over them):\n"
             "  LZC_EXPORTER_BIND                 default for --bind\n"
             "  LZC_EXPORTER_PORT                 default for --port\n"
             "  LZC_EXPORTER_TIMEOUT              default for --timeout\n"
             "  LZC_EXPORTER_SMART_INTERVAL       default for --smart-interval\n"
-            "  LZC_EXPORTER_TEXTFILE             default for --textfile\n"
+            "  LZC_EXPORTER_TEXTFILE             path used by a bare --textfile\n"
+            "  LZC_EXPORTER_TEXTFILE_MODE        default for --textfile-mode\n"
+            "  LZC_EXPORTER_SMARTCTL             default for --smartctl\n"
+            "  LZC_EXPORTER_NVIDIA_SMI           default for --nvidia-smi\n"
             "  LZC_EXPORTER_COLLECTORS           default for --collector (comma separated)\n"
             "  LZC_EXPORTER_DISABLE_COLLECTORS   default for --no-collector (comma separated)\n"
             "  LZC_EXPORTER_MOUNT_EXCLUDE        default for --mount-exclude\n"
@@ -1564,7 +1772,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "  1    the work ran but something in it failed: could not bind the\n"
             "       port, or could not write the textfile\n"
             "  2    usage error (unknown flag, missing or invalid argument value,\n"
-            "       unknown collector)\n"
+            "       unknown collector, or LZC_EXPORTER_TEXTFILE set without\n"
+            "       --textfile)\n"
             "  3    missing prerequisite: prometheus_client is not installed\n"
             "  130  interrupted (SIGINT/SIGTERM), after shutting down cleanly.\n"
             "       A systemd unit therefore needs SuccessExitStatus=130, which\n"
@@ -1574,6 +1783,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "nvidia-smi read-only. It never installs packages, never loads kernel\n"
             "modules, and writes exactly one file - the --textfile path, when you\n"
             "ask for it. Requires root only for smartctl.\n"
+            "\n"
+            "Note on --port: 9105 is the default here and in the installer, but\n"
+            "the Prometheus default-port-allocations wiki assigns it to the Mesos\n"
+            "exporter. Change both sides with --port if you run one.\n"
             "\n"
             "License MIT. Origin https://github.com/Lazarev-Cloud/Scripts"
         ),
@@ -1606,12 +1819,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--textfile",
-        default=DEFAULT_TEXTFILE,
+        nargs="?",
+        default=None,
+        const=DEFAULT_TEXTFILE,
         metavar="PATH",
-        help="Write one exposition to PATH and exit. The write is atomic "
-        "(temporary file plus rename), so point it at a .prom file inside "
-        "node_exporter's --collector.textfile.directory and run it from a "
-        "systemd timer. Default: unset.",
+        help="Write one exposition to PATH and exit instead of serving. The "
+        "write is atomic (temporary file plus rename), so point it at a .prom "
+        "file inside node_exporter's --collector.textfile.directory and run it "
+        "from a systemd timer. Passing the flag with no value uses "
+        "LZC_EXPORTER_TEXTFILE; setting only that variable is refused, because "
+        "an environment file must not be able to turn a running service into a "
+        "one-shot. Default: unset, i.e. serve.",
+    )
+    parser.add_argument(
+        "--textfile-mode",
+        type=octal_mode,
+        default=DEFAULT_TEXTFILE_MODE,
+        metavar="MODE",
+        help="Octal permissions for the file --textfile writes (default: "
+        "%(default)s). The default is world-readable because node_exporter "
+        "usually runs under a different account and would otherwise report "
+        "node_textfile_scrape_error rather than your metrics.",
     )
     parser.add_argument(
         "--collector",
@@ -1630,6 +1858,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Disable a collector; repeatable. Wins over --collector. On a Linux "
         "host already running node_exporter, --no-collector host removes the "
         "duplicated CPU/memory/filesystem/network series.",
+    )
+    parser.add_argument(
+        "--smartctl",
+        default=DEFAULT_SMARTCTL,
+        metavar="PATH",
+        help="Name or absolute path of the smartctl binary (default: "
+        "%(default)s). A service PATH is not a login PATH, and smartctl lives "
+        "in /usr/sbin or /usr/local/sbin depending on the distribution.",
+    )
+    parser.add_argument(
+        "--nvidia-smi",
+        default=DEFAULT_NVIDIA_SMI,
+        metavar="PATH",
+        help="Name or absolute path of the nvidia-smi binary (default: "
+        "%(default)s). Only used when the in-process NVML bindings are absent.",
     )
     parser.add_argument(
         "--timeout",
@@ -1737,7 +1980,12 @@ def configure_logging(level: str, color: str) -> None:
     fmt = "%(levelname)s %(message)s" if under_systemd else "%(asctime)s %(levelname)s %(message)s"
     handler = logging.StreamHandler(sys.stderr)
     formatter_class = LevelColorFormatter if want_color(color) else logging.Formatter
-    formatter = formatter_class(fmt, datefmt="%Y-%m-%dT%H:%M:%S%z")
+    # A literal Z, not %z. The converter below is time.gmtime, but strftime
+    # renders %z from the *local* standard offset regardless of the struct_time
+    # it is handed: on a UTC+2 host in summer this printed the correct UTC time
+    # stamped "+0100", i.e. an instant an hour earlier than the one it names.
+    # Verified, and the reason every log line was quietly misdated.
+    formatter = formatter_class(fmt, datefmt="%Y-%m-%dT%H:%M:%SZ")
     formatter.converter = time.gmtime
     handler.setFormatter(formatter)
     LOG.handlers[:] = [handler]
@@ -1749,27 +1997,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     configure_logging(args.log_level, args.color)
 
+    # Resolve the mode before building anything. A usage error has to be the
+    # first thing in the journal: construct the collectors first and an operator
+    # sees four "will report up=0" warnings followed by a usage error, which
+    # reads as though the warnings caused it.
+    textfile = resolve_textfile(args)
+    one_shot = bool(args.once or textfile)
+
     selected = select_collectors(args)
     registry = build_registry(args, selected)
-
-    one_shot = bool(args.once or args.textfile)
 
     if not one_shot:
         # Process metrics are meaningful for a long-lived daemon and misleading
         # for a one-shot run, so they are registered only when serving.
         ProcessCollector(registry=registry)
 
-    if args.textfile:
-        try:
-            write_to_textfile(args.textfile, registry)
-        except OSError as exc:
-            LOG.error("cannot write %s: %s", args.textfile, exc)
-            return EXIT_FAILURE
-        LOG.info("wrote %s", args.textfile)
+    if textfile and not write_textfile(textfile, args.textfile_mode, registry):
+        return EXIT_FAILURE
 
     if args.once:
-        sys.stdout.write(generate_latest(registry).decode("utf-8"))
-        sys.stdout.flush()
+        try:
+            write_exposition(registry)
+        except BrokenPipeError:
+            # `--once | head` closes the pipe early. That is the reader's
+            # choice, not a failure, and it must not print a traceback. stderr
+            # is left alone so the shutdown flush cannot raise a second time.
+            LOG.debug("stdout closed before the exposition finished")
 
     if one_shot:
         return EXIT_OK

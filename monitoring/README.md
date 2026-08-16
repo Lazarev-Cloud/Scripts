@@ -62,11 +62,24 @@ python3 prometheus_unified_metrics.py --bind 0.0.0.0
 python3 prometheus_unified_metrics.py \
     --textfile /var/lib/prometheus/node-exporter/hostwatch.prom
 
+# Same, taking the path from LZC_EXPORTER_TEXTFILE.
+python3 prometheus_unified_metrics.py --textfile
+
 # Skip what node_exporter already covers.
 python3 prometheus_unified_metrics.py --no-collector host
 ```
 
 `--once` and `--textfile` combine; passing either one suppresses the server.
+
+**Which mode runs is decided on the command line and nowhere else.** Setting
+`LZC_EXPORTER_TEXTFILE` without also passing `--textfile` is a usage error
+(exit 2), not a mode change. The variable supplies the path; the flag selects
+the mode. This is not pedantry: the installed unit loads
+`/etc/default/prometheus-unified-exporter.local`, and if that file could switch
+the mode, one line in it would turn the running exporter into a process that
+writes a file, exits **0**, and leaves nothing listening — which
+`Restart=on-failure` does not restart and no alert can see. Refusing to start is
+loud; that is the point.
 
 HTTP routes are `/metrics`, `/` (a link to it), `/-/healthy` and `/-/ready`.
 Anything else returns 404 rather than quietly serving metrics, so a typo in a
@@ -81,11 +94,14 @@ Every option has an environment variable. Flags win over the environment.
 | `--bind ADDR` | `LZC_EXPORTER_BIND` | `127.0.0.1` | Listen address, IPv4 or IPv6. |
 | `--port PORT` | `LZC_EXPORTER_PORT` | `9105` | Listen port. |
 | `--once` | — | off | Print one exposition to stdout and exit. |
-| `--textfile PATH` | `LZC_EXPORTER_TEXTFILE` | unset | Write one exposition to PATH and exit. |
+| `--textfile [PATH]` | `LZC_EXPORTER_TEXTFILE` | unset | Write one exposition to PATH and exit. With no value, uses the variable. The variable **alone** is a usage error — see [Modes](#modes). |
+| `--textfile-mode MODE` | `LZC_EXPORTER_TEXTFILE_MODE` | `0644` | Octal permissions for that file. Read as octal, so `640` means `0640`. |
 | `--collector NAME` | `LZC_EXPORTER_COLLECTORS` | all | Enable only these. Repeatable; env var is comma separated. |
 | `--no-collector NAME` | `LZC_EXPORTER_DISABLE_COLLECTORS` | none | Disable these. Repeatable. Wins over `--collector`. |
-| `--timeout SECONDS` | `LZC_EXPORTER_TIMEOUT` | `8` | Hard timeout for **each external tool invocation** (`smartctl`, `nvidia-smi`, `nvme`). Must be greater than 0. |
-| `--smart-interval SECONDS` | `LZC_EXPORTER_SMART_INTERVAL` | `60` | Serve cached SMART data for this long. `0` queries every scrape. |
+| `--smartctl PATH` | `LZC_EXPORTER_SMARTCTL` | `smartctl` | Name or absolute path of the `smartctl` binary. |
+| `--nvidia-smi PATH` | `LZC_EXPORTER_NVIDIA_SMI` | `nvidia-smi` | Name or absolute path of the `nvidia-smi` binary. |
+| `--timeout SECONDS` | `LZC_EXPORTER_TIMEOUT` | `8` | Hard timeout for **each external tool invocation** (`smartctl`, `nvidia-smi`). Must be finite and greater than 0. |
+| `--smart-interval SECONDS` | `LZC_EXPORTER_SMART_INTERVAL` | `60` | Serve cached SMART data for this long. `0` queries every scrape. Must be finite. |
 | `--mount-exclude REGEX` | `LZC_EXPORTER_MOUNT_EXCLUDE` | pseudo, container and snap mounts | Skip matching mountpoints. Empty keeps everything. |
 | `--netdev-exclude REGEX` | `LZC_EXPORTER_NETDEV_EXCLUDE` | `veth`, `tap`, `fwbr`, `fwln`, `fwpr`, `vnet`, `docker`, `br-`, `virbr`, `cali`, `lxcbr` prefixes | Skip matching interfaces. Empty keeps everything. |
 | `--log-level LEVEL` | `LZC_EXPORTER_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error`. Case insensitive. |
@@ -112,7 +128,14 @@ The two exclude patterns are not cosmetic. On a Proxmox or Docker host, per-gues
 each one would otherwise become a permanent time series.
 
 Keep `--timeout` well below your Prometheus `scrape_timeout`. It is the mechanism
-that stops one dying disk from wedging the exporter.
+that stops one dying disk from wedging the exporter. `nan` and `inf` are rejected
+rather than accepted: both pass a naive range check (`nan <= 0` is false), and
+either one silently removes the protection the setting exists to provide.
+
+`--smartctl` and `--nvidia-smi` exist because a service `PATH` is not a login
+`PATH`. If a collector reports `up 0` with "not on PATH" and you know the tool is
+installed, point these at it — an absolute path is accepted and is checked for
+executability, so a typo still degrades to `up 0` rather than crashing a scrape.
 
 ## Exit status
 
@@ -123,7 +146,7 @@ exporter can produce:
 | --- | --- |
 | 0 | Success — a one-shot mode succeeded. |
 | 1 | The work ran but something in it failed: could not bind the port, or could not write the textfile. |
-| 2 | Usage error: unknown flag, missing or invalid argument value, unknown collector, unresolvable bind address. |
+| 2 | Usage error: unknown flag, missing or invalid argument value, unknown collector, unresolvable bind address, or `LZC_EXPORTER_TEXTFILE` set without `--textfile`. |
 | 3 | Unsupported platform or a missing prerequisite tool — here, `prometheus_client` is not installed. |
 | 130 | Interrupted (SIGINT/SIGTERM). |
 
@@ -279,6 +302,12 @@ you need.
 
 A drive that `--scan-open` reports twice under two `-d` types is emitted once.
 
+Every one of these is read at most once per `--smart-interval` and served from
+cache in between, so a value can be up to that many seconds old. Each `HELP`
+string says so, with the interval you configured — the exposition is the place a
+reader finds out, not this file. Set `--smart-interval 0` to read on every scrape
+and the note disappears with the caching.
+
 This is a small, vendor-comparable subset of SMART. For every attribute of every
 drive, run [`smartctl_exporter`](https://github.com/prometheus-community/smartctl_exporter).
 
@@ -364,8 +393,22 @@ DevicePolicy=closed
 DeviceAllow=block-sd rw
 DeviceAllow=block-blkext rw
 DeviceAllow=char-nvme rw
-UMask=0022
 ```
+
+Two lines carry more weight than they look:
+
+- `ReadWritePaths=` is **required** whenever `ProtectSystem=strict` is set.
+  Without it the whole hierarchy is read-only, the write fails with `EROFS`, and
+  the unit fails — which at least is loud, unlike the mode below.
+- `--textfile PATH` is on the command line, not `LZC_EXPORTER_TEXTFILE` in an
+  environment file. That is deliberate and enforced; see [Modes](#modes).
+
+`UMask=` is deliberately absent: the exporter `chmod`s the file to
+`--textfile-mode` (`0644`) after writing it. node_exporter runs under its own
+account, and a file created under the daemon unit's `UMask=0077` — or a root
+cron job — would be `0600` and unreadable to it. The symptom there is
+`node_textfile_scrape_error 1` on the *other* exporter rather than any error
+from this one, which is why the mode is set explicitly rather than inherited.
 
 ```ini
 # /etc/systemd/system/hostwatch-textfile.timer
@@ -392,9 +435,14 @@ time() - node_textfile_mtime_seconds{file="hostwatch.prom"} > 900
 
 ## Design notes
 
+- The mode — serve, `--once`, `--textfile` — is chosen on the command line and
+  nowhere else. Environment variables supply values; they never select a mode.
+  A daemon that an environment file can turn into a one-shot is a daemon that
+  can stop serving while exiting 0, which no supervisor and no alert will catch.
 - Collection is synchronous: everything happens inside the scrape, under a hard
   timeout, with no background refresh thread. The one exception is the SMART
-  cache, which exists so scrapes never sit in a disk spin-up path.
+  cache, which exists so scrapes never sit in a disk spin-up path, and which
+  every affected `HELP` string declares.
 - Metrics are rebuilt on every scrape, so a device that disappears stops
   producing series instead of reporting its last value forever.
 - No metric carries a timestamp; Prometheus assigns those.
@@ -621,12 +669,35 @@ on the next run. The unit reads a second, optional file immediately after it:
 /etc/default/prometheus-unified-exporter.local
 ```
 
-The installer never writes, reads or deletes that one. Put your own settings —
-the exporter's other `LZC_EXPORTER_*` variables, for instance — there and they survive
-re-installs and uninstalls. Later files win, so it can also override
-`LZC_EXPORTER_BIND` and `LZC_EXPORTER_PORT`. A systemd drop-in
+The installer never writes, reads for configuration or deletes that one. Put your
+own settings — the exporter's other `LZC_EXPORTER_*` variables, for instance —
+there and they survive re-installs and uninstalls. A systemd drop-in
 (`systemctl edit prometheus-unified-exporter`) works the same way for anything
 that is not an environment variable.
+
+Three variables are the exception, because the unit is **rendered from
+install-time values** while `.local` is **read at start time**:
+
+| Variable | What `.local` can and cannot do |
+| --- | --- |
+| `LZC_EXPORTER_TEXTFILE` | Setting it here stops the service starting. The exporter refuses with a usage error (exit 2) when this variable is set and `--textfile` is not passed — deliberately, so an environment file cannot turn a running service into a one-shot that exits `0` and silently stops serving. Unset it, or write a separate `Type=oneshot` unit and timer that passes `--textfile` explicitly; see [Textfile-collector mode](#textfile-collector-mode). |
+| `LZC_EXPORTER_BIND` | Moves the listener but **not** the installer's own health check, which is built from the install-time address — so the next `setup_prometheus_exporter.sh` run fetches the old endpoint, gets nothing and exits `1` for a service that is in fact healthy. Crossing from a loopback bind to a routable one is worse: the unit keeps the `IPAddressDeny=any` + `IPAddressAllow=localhost` pair it was rendered with, and systemd drops the non-local traffic regardless. |
+| `LZC_EXPORTER_PORT` | The same stale-health-check problem, and crossing below 1024 additionally fails the bind with `EACCES` and crash-loops: only an install rendered for a privileged port is granted `CAP_NET_BIND_SERVICE`. |
+
+Change the bind address or the port by re-running the installer with
+`--listen-address` / `--port`. That moves the unit, the managed environment file
+and the health check together, which is the only way the three stay consistent.
+
+A re-run reads `.local` and warns when it finds any of the three set there. It
+never edits or removes the file.
+
+The unit deliberately does **not** strip `LZC_EXPORTER_TEXTFILE` from the
+environment. The exporter only accepts a textfile path named on the command line
+(see [Modes](#modes)), so the variable reaching it produces a loud exit-2
+refusal; the unit lands in `failed`, which an alert can see. Removing the
+variable in the unit instead would silently ignore what the operator asked for.
+The installer's warning on re-run is the second layer, and it fires at install
+time — before the service is ever started.
 
 `Type=exec` is used on systemd 240+, so a missing interpreter or an unusable
 service account fails `systemctl start` instead of reporting success and dying
@@ -657,6 +728,10 @@ Two directives are deliberately absent:
 `PrivateTmp=yes` **is** set, which means a host with `/tmp` or `/var/tmp` on a
 separate filesystem will not report those two mounts.
 
+The daemon's *mode* cannot be changed from an environment file, but that is
+enforced by the exporter refusing such a configuration rather than by the unit
+filtering the environment — see the table above.
+
 ### Hardware access
 
 | What you want | What you get |
@@ -672,6 +747,11 @@ to block devices. That is not a preference — `smartctl` issues ATA_12/ATA_16
 SCSI passthrough commands, and membership of the `disk` group is not sufficient.
 The rest of the sandbox stays on, so the hardening there buys containment, not
 privilege reduction. Leave it off unless you want disk temperatures.
+
+`--disk-health` is only useful with `smartctl` installed. Combining it with
+`--sensors no` or `--skip-packages` on a host that does not already have
+`smartmontools` gives you a service running as root that still reports no disk
+temperatures, so the installer warns when it sees that combination.
 
 GPU support is enabled automatically when `/dev/nvidia*` exists, `nvidia-smi` is
 on `PATH`, or `lspci` reports an NVIDIA device. The unit then gets
@@ -733,9 +813,12 @@ set `--listen-address 0.0.0.0`, anyone who can reach the port can read your
 host's hardware telemetry. Put it behind the firewall, a reverse proxy, or
 scrape it over a private network.
 
-Port 9105 is not registered in the Prometheus
-[default port allocations](https://github.com/prometheus/prometheus/wiki/Default-port-allocations);
-change it with `--port` if it collides with something you already run.
+Port 9105 is listed in the Prometheus
+[default port allocations](https://github.com/prometheus/prometheus/wiki/Default-port-allocations)
+as the Mesos exporter's port. Nothing enforces that registry, and the collision
+only matters if you actually run a Mesos exporter on the same host — but if you
+have a central Prometheus and a port convention, pick your own with `--port`
+(and `--port` on the exporter, or `LZC_EXPORTER_PORT`, for a hand-run copy).
 
 ## Troubleshooting
 
@@ -768,6 +851,15 @@ EOF
 systemctl restart prometheus-unified-exporter
 ```
 
+`LZC_EXPORTER_TEXTFILE` is the one variable that does **not** work here. The
+unit does not strip it; the exporter refuses to start (usage error, exit `2`)
+when it is set without `--textfile`, so setting it here stops the daemon rather
+than configuring it. See the table in
+[What the service looks like](#what-the-service-looks-like), and
+[Textfile-collector mode](#textfile-collector-mode) for the supported way to
+produce a `.prom` file. `LZC_EXPORTER_BIND` and `LZC_EXPORTER_PORT` carry the
+caveats in that same table — re-run the installer instead.
+
 ```bash
 systemctl edit prometheus-unified-exporter
 # [Service]
@@ -782,7 +874,10 @@ A drop-in survives re-installs; edits to the generated unit do not.
 ## Notes and limits
 
 - Concurrent installer runs are refused via `flock` on
-  `/run/lock/prometheus-exporter-setup.lock` (exit 75).
+  `/run/lock/lzc-exporter.lock` (exit 75), overridable with `LZC_EXPORTER_LOCK`.
+  The path is a fixed default rather than one derived from `--service-name`, so
+  two installs on the same host serialise even under different service names —
+  which is what you want, because they share one package manager.
 - The installer ignores `SIGHUP`, so a dropped SSH session cannot interrupt it
   mid-`dpkg` and leave the package database half-configured.
 - Only the Linux install path is covered here. On Windows or macOS, run the

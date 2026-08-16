@@ -212,6 +212,29 @@ LZC_EXPORTER_BIND and LZC_EXPORTER_PORT are shared with the exporter itself:
 they are what this installer writes into the environment file, and they are the
 defaults the exporter reads for --bind and --port.
 
+$ENV_DIR/$SERVICE_NAME.local is yours: this installer never writes, reads for
+configuration or removes it, and the unit sources it after the managed file, so
+settings there survive re-installs. Three variables are the exception, because
+the unit is rendered from install-time values while that file is read at start
+time:
+  LZC_EXPORTER_TEXTFILE   the exporter refuses to start (exit 2) when this is
+                          set without --textfile, so an environment file cannot
+                          turn the service into a one-shot. Use a separate
+                          Type=oneshot unit and timer that passes --textfile.
+  LZC_EXPORTER_BIND       moves the listener but not this installer's health
+                          check, which is aimed at the install-time address, so
+                          a re-run reports a failure for a healthy service.
+                          Going from a loopback bind to a routable one is worse
+                          still: the unit keeps IPAddressAllow=localhost and
+                          systemd drops the non-local traffic anyway.
+  LZC_EXPORTER_PORT       same: the health check keeps using the install-time
+                          port. Crossing below 1024 also fails the bind with
+                          EACCES, because only a unit rendered for a privileged
+                          port is granted CAP_NET_BIND_SERVICE.
+Change the bind address or the port by re-running this installer with
+--listen-address / --port, which moves the unit and the check together. A re-run
+warns when it finds any of the three set in that file.
+
 Timeouts, in seconds. Each bounds a different thing, so they are listed with
 what they actually cover. All must be at least 1: \`timeout 0\` means NO limit
 and would silently remove the protection.
@@ -634,6 +657,14 @@ report_hardware() {
     if has_block_disk; then
         if ((DISK_HEALTH)); then
             log INFO "Local disks present and --disk-health is on: SMART/NVMe temperatures enabled"
+            # --disk-health exists only to run smartctl. If this run will not
+            # install it and it is not already here, the service ends up running
+            # as root for nothing -- say so rather than let it look enabled.
+            if ! have smartctl && { [[ $SENSORS_MODE == no ]] || ((SKIP_PACKAGES)); }; then
+                log WARN "--disk-health needs smartctl, which is absent and will not be installed"
+                log WARN "here (--sensors no / --skip-packages). Install smartmontools, or the"
+                log WARN "service will run as root and still report no disk temperatures."
+            fi
         else
             log INFO "Local disks present, but --disk-health is off: disk temperatures will be absent"
         fi
@@ -1050,8 +1081,8 @@ fix_permissions() {
 
 # --- systemd -----------------------------------------------------------------
 
-listen_address_is_loopback() {
-    case $LISTEN_ADDRESS in
+address_is_loopback() {
+    case $1 in
         127.* | ::1 | '[::1]' | localhost) return 0 ;;
         *) return 1 ;;
     esac
@@ -1065,9 +1096,105 @@ render_env_content() {
 # instance -- in the file below, which this installer never writes and never
 # removes:
 #   $ENV_FILE.local
+#
+# Three variables are NOT freely overridable there, because the unit is rendered
+# from the values below at install time while that file is read at start time:
+#   LZC_EXPORTER_TEXTFILE  the exporter refuses to start (exit 2) when this is
+#                          set without --textfile, so this file cannot turn the
+#                          service into a one-shot. Use a timer for that.
+#   LZC_EXPORTER_BIND      moves the listener but not the installer's health
+#                          check, so a re-install reports a failure for a
+#                          healthy service. Crossing from loopback to a routable
+#                          address also leaves IPAddressAllow=localhost behind.
+#   LZC_EXPORTER_PORT      the same, and crossing below 1024 fails the bind:
+#                          only a unit rendered for a privileged port gets
+#                          CAP_NET_BIND_SERVICE.
+# Re-run the installer with --listen-address / --port instead: that moves the
+# unit, this file and the health check together.
 LZC_EXPORTER_BIND=$LISTEN_ADDRESS
 LZC_EXPORTER_PORT=$LISTEN_PORT
 EOF
+}
+
+# Reads the effective value of one KEY out of an environment file, without
+# sourcing it: that file is operator-authored, and sourcing would execute it.
+# systemd takes the last assignment of a name, so this takes the last non-empty
+# one. Returns 1 when the key is absent.
+env_file_value() {
+    local file=$1 key=$2 value
+    [[ -r $file ]] || return 1
+    value=$(sed -n "s/^[[:space:]]*${key}=//p" "$file" 2>/dev/null) || return 1
+    [[ -n $value ]] || return 1
+    value=${value##*$'\n'}
+    value=${value%$'\r'}
+    # systemd skips the whitespace between '=' and the value and ignores what
+    # trails it, so `LZC_EXPORTER_BIND=  127.0.0.1` reaches the exporter as
+    # `127.0.0.1`. Trim the same way: the checks below have to judge the value
+    # the service will actually see, not the bytes in the file. An all-whitespace
+    # value trims to empty and is reported absent, which is what systemd does
+    # with it too.
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    value=${value#[\"\']}
+    value=${value%[\"\']}
+    [[ -n $value ]] || return 1
+    printf '%s' "$value"
+}
+
+# The unit is rendered from install-time values, but <env-file>.local is read at
+# start time. Most variables are harmless there -- that is the whole point of the
+# file -- but three change the *shape* the unit was rendered for, and the result
+# is a service that starts and then misbehaves in a way with no obvious cause.
+# Warn, never fail: an ineffective variable is not a reason to refuse an install,
+# and the operator may be mid-migration.
+check_local_env_overrides() {
+    local local_file="$ENV_FILE.local" value effective_addr effective_port
+    [[ -r $local_file ]] || return 0
+
+    if value=$(env_file_value "$local_file" LZC_EXPORTER_TEXTFILE); then
+        log WARN "$local_file sets LZC_EXPORTER_TEXTFILE=$value. The exporter refuses to start"
+        log WARN "(usage error, exit 2) when that is set without --textfile, so an environment"
+        log WARN "file cannot turn this service into a one-shot. Unset it, or write a separate"
+        log WARN "Type=oneshot unit and timer that passes --textfile explicitly."
+    fi
+
+    if value=$(env_file_value "$local_file" LZC_EXPORTER_BIND); then
+        if address_is_loopback "$LISTEN_ADDRESS" && ! address_is_loopback "$value"; then
+            log WARN "$local_file sets LZC_EXPORTER_BIND=$value, but this unit is rendered for a"
+            log WARN "loopback bind and carries IPAddressAllow=localhost. The exporter would listen"
+            log WARN "on $value while systemd still dropped non-local traffic. Re-run this installer"
+            log WARN "with --listen-address $value instead."
+        fi
+    fi
+
+    if value=$(env_file_value "$local_file" LZC_EXPORTER_PORT); then
+        if [[ $value =~ ^[0-9]+$ ]] && ((10#$value < 1024 && LISTEN_PORT >= 1024)); then
+            log WARN "$local_file sets LZC_EXPORTER_PORT=$value, a privileged port, but this unit"
+            log WARN "was rendered for an unprivileged one and so carries no CAP_NET_BIND_SERVICE."
+            log WARN "The bind would fail with EACCES. Re-run this installer with --port $value instead."
+        fi
+    fi
+
+    # Staying inside the class is still not free, and this is the case the two
+    # checks above miss. The unit takes --bind/--port from the environment at
+    # start time, but verify_service builds its URL from the install-time values,
+    # so ANY difference -- 9105 to 9200 is enough -- aims the health check at an
+    # endpoint nothing is listening on. The service comes up, answers on the port
+    # the operator asked for, and the install still exits 1 having reported it
+    # dead. Warn rather than resolve it here: an environment file is not the only
+    # way to override the two (a `systemctl edit` drop-in does it as well), so
+    # nothing short of asking systemd what it resolved could be relied upon.
+    effective_addr=$(env_file_value "$local_file" LZC_EXPORTER_BIND) ||
+        effective_addr=$LISTEN_ADDRESS
+    effective_port=$(env_file_value "$local_file" LZC_EXPORTER_PORT) ||
+        effective_port=$LISTEN_PORT
+    if [[ $effective_addr != "$LISTEN_ADDRESS" || $effective_port != "$LISTEN_PORT" ]]; then
+        log WARN "$local_file points the service at $effective_addr:$effective_port, but this run"
+        log WARN "verifies $(metrics_url), which is where the install-time values point. The service"
+        log WARN "can be perfectly healthy and this install still fail. Re-run with"
+        log WARN "--listen-address $effective_addr --port $effective_port to move the whole install,"
+        log WARN "or drop those two from $local_file."
+    fi
 }
 
 # Device rules for the unit. Empty output means "no device access at all", which
@@ -1122,6 +1249,13 @@ render_unit_content() {
     # put here survive re-installs, whereas the managed file above is rendered
     # whole every time. Later files win, so it can also override the two values.
     printf 'EnvironmentFile=-%s.local\n' "$ENV_FILE"
+    # Nothing here strips LZC_EXPORTER_TEXTFILE from the environment. The
+    # exporter refuses to start (usage error, exit 2) when that variable is set
+    # without --textfile, precisely so an environment file cannot turn a running
+    # service into a one-shot. Unsetting it here would swallow that deliberate,
+    # self-explaining refusal and silently ignore what the operator asked for.
+    # A loud failure the operator can read beats a silent one they cannot.
+    # check_local_env_overrides warns about it at install time as well.
     # shellcheck disable=SC2016 # ${LZC_EXPORTER_BIND}/${LZC_EXPORTER_PORT} must
     # reach the unit file literally: systemd expands them from EnvironmentFile at
     # start time, so an operator can change the bind address with a drop-in and a
@@ -1148,7 +1282,18 @@ render_unit_content() {
         # smartctl_exporter states plainly that the disk group is not enough and
         # root is required. Hardening here buys containment, not privilege
         # reduction -- say so rather than pretending otherwise.
-        printf 'CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_OVERRIDE\n'
+        #
+        # The bounding set caps root as well: systemd applies it before execve,
+        # and a uid-0 process comes out of exec with exactly the capabilities
+        # left in it. So a privileged port needs CAP_NET_BIND_SERVICE listed
+        # here too -- running as root does not grant it back. Without it,
+        # `--disk-health --port 80` binds nothing, fails with EACCES and
+        # crash-loops under Restart=on-failure.
+        local caps='CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_OVERRIDE'
+        if ((LISTEN_PORT < 1024)); then
+            caps+=' CAP_NET_BIND_SERVICE'
+        fi
+        printf 'CapabilityBoundingSet=%s\n' "$caps"
         printf 'SystemCallFilter=@system-service @raw-io\n'
     elif ((LISTEN_PORT < 1024)); then
         # A privileged port is an explicit operator choice, so grant exactly the
@@ -1194,7 +1339,7 @@ render_unit_content() {
         printf 'PrivateDevices=yes\n'
     fi
 
-    if listen_address_is_loopback; then
+    if address_is_loopback "$LISTEN_ADDRESS"; then
         printf 'IPAddressDeny=any\n'
         printf 'IPAddressAllow=localhost\n'
     fi
@@ -1281,7 +1426,13 @@ diagnose_failure() {
             log WARN "Could not read the journal"
     fi
     log ERROR "Running the exporter directly to capture the underlying error:"
-    timeout 30 "$VENV_PYTHON" "$INSTALL_DIR/$PAYLOAD_NAME" --once >/dev/null ||
+    # -u LZC_EXPORTER_TEXTFILE: the exporter refuses to start (exit 2) when that
+    # variable is set without --textfile. This diagnostic inherits the
+    # installer's environment, not the unit's, so an operator who exported it
+    # would get that usage error here instead of the traceback they came for --
+    # a misleading diagnosis at the exact moment the real one matters.
+    timeout 30 env -u LZC_EXPORTER_TEXTFILE \
+        "$VENV_PYTHON" "$INSTALL_DIR/$PAYLOAD_NAME" --once >/dev/null ||
         log ERROR "The exporter itself failed to run (output above)"
 }
 
@@ -1310,7 +1461,7 @@ verify_service() {
     done
 
     diagnose_failure
-    die "$SERVICE_NAME is active but $url did not answer within ${HEALTH_RETRIES}s."
+    die "$SERVICE_NAME is active but $url did not answer in $HEALTH_RETRIES attempts (${HEALTH_TIMEOUT}s each, one second apart)."
 }
 
 # --- Uninstall ---------------------------------------------------------------
@@ -1332,6 +1483,15 @@ remove_service_account() {
 
     # Never `userdel -r`: a misconfigured home directory would take a real
     # directory with it. The account is created with no home anyway.
+    #
+    # Returned before the call rather than left to `run`: `run` reports success
+    # in --dry-run, and the branch below would then print "[OK] Removed the
+    # account" for an account nothing touched. render_file returns early for the
+    # same reason.
+    if ((DRY_RUN)); then
+        log DRYRUN "would remove the account $SERVICE_USER (userdel $SERVICE_USER)"
+        return 0
+    fi
     if run userdel "$SERVICE_USER"; then
         log SUCCESS "Removed the account $SERVICE_USER"
     else
@@ -1437,6 +1597,7 @@ show_plan() {
 do_install() {
     log STEP "Checking the host"
     report_hardware
+    check_local_env_overrides
     ensure_system_packages
     locate_payload
     show_plan
