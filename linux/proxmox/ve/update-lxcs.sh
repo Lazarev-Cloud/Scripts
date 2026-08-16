@@ -939,10 +939,29 @@ run_remote_node() {
 
 run_cluster() {
     local -a nodes=()
+    local listing rc
     if [[ -n $NODES_SPEC ]]; then
         IFS=', ' read -r -a nodes <<<"$NODES_SPEC"
     else
-        mapfile -t nodes < <(cluster_nodes)
+        # Same process-substitution trap as run_local_node: cluster_nodes
+        # signals "membership could not be read" with a non-zero status, and
+        # `mapfile < <(...)` would drop it.
+        listing=$(cluster_nodes)
+        rc=$?
+
+        # On a working node /etc/pve/nodes always contains at least this host,
+        # so reaching here means /etc/pve is not mounted -- a cluster whose
+        # members cannot be read, not a standalone host. Degrading to "just do
+        # the local node" would silently patch one node and report success for
+        # a run the operator asked to cover the whole cluster.
+        if ((rc != 0)); then
+            log ERROR "Cannot determine cluster membership: pvecm reported no members and /etc/pve/nodes could not be read"
+            log ERROR "Pass --nodes to name them explicitly, or --local-only for a deliberate single-node run"
+            NODES_FAILED+=("$(hostname): cluster membership unreadable")
+            return "$EX_FAIL"
+        fi
+
+        [[ -n $listing ]] && mapfile -t nodes <<<"$listing"
     fi
 
     if ((${#nodes[@]} == 0)); then
@@ -989,9 +1008,26 @@ cluster_summary() {
 # --- Main --------------------------------------------------------------------
 
 run_local_node() {
-    local ids=() id
+    local ids=() id listing rc
 
-    mapfile -t ids < <(list_container_ids)
+    # Capture the status before the array. `pipefail` already gives
+    # list_container_ids a non-zero status when `pct list` fails, but
+    # `mapfile < <(...)` discards the status of a process substitution, so
+    # reading it straight into the array throws that away.
+    listing=$(list_container_ids)
+    rc=$?
+
+    # "Could not enumerate" is not "there is nothing here". `pct` still exists
+    # when pvedaemon or pve-cluster is down, so preflight passes and this is the
+    # first thing that notices. Reporting success would mean a node whose
+    # containers were never even listed looks patched.
+    if ((rc != 0)); then
+        log ERROR "Cannot list containers on $(hostname): pct list failed (status $rc)"
+        FAILED+=("$(hostname): pct list failed (status $rc); no container was inspected")
+        return "$EX_FAIL"
+    fi
+
+    [[ -n $listing ]] && mapfile -t ids <<<"$listing"
     COUNT_TOTAL=${#ids[@]}
 
     if ((COUNT_TOTAL == 0)); then
