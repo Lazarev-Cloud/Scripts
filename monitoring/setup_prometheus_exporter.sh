@@ -1023,13 +1023,15 @@ install_tree() {
 }
 
 ensure_venv() {
-    local created=0
+    # Written only after pip exits 0, and read to decide whether pip can be
+    # skipped. It lives inside the venv because it describes what is installed
+    # in the venv; if the venv is rebuilt it goes with it.
+    local stamp="$VENV_DIR/.requirements.installed"
 
     log STEP "Preparing the Python virtual environment"
     if [[ -x $VENV_PYTHON ]]; then
         log INFO "Virtual environment already present at $VENV_DIR"
     else
-        created=1
         # Plain `python3 -m venv`: the bundled pip from ensurepip is installed
         # offline. `--upgrade-deps` would fetch an unpinned pip from PyPI on
         # every run, which is exactly the kind of unpinned network fetch this
@@ -1043,10 +1045,22 @@ ensure_venv() {
         return 0
     fi
 
-    # pip runs only when the requirements changed, the venv was just built, or
-    # the operator forced it. That is what makes a re-run offline and instant.
-    if ((created == 0 && FILE_CHANGED == 0 && FORCE_PIP == 0)); then
-        log INFO "Requirements unchanged; skipping pip"
+    # pip is skipped only against proof that pip already installed exactly this
+    # requirement set into this venv. That proof cannot be
+    # $INSTALL_DIR/requirements.txt: install_tree renders it BEFORE pip runs, so
+    # after a failed pip the new pins are already on disk and the next run reads
+    # them back as "Unchanged", skips pip, and goes on to enable, start and
+    # verify the service. Since the exporter degrades rather than dies when an
+    # optional dependency is missing, that run prints "Serving metrics" and
+    # exits 0 having never installed anything -- a silent no-op reported as
+    # convergence, and one that re-running could not repair.
+    #
+    # The stamp is a copy of the requirements the last successful pip actually
+    # installed, so a failed pip simply leaves no proof and the next run tries
+    # again. This keeps the re-run offline and instant in the normal case.
+    if ((FORCE_PIP == 0)) && [[ -f $stamp ]] &&
+        cmp -s "$stamp" "$INSTALL_DIR/requirements.txt"; then
+        log INFO "Requirements already installed in $VENV_DIR; skipping pip"
         return 0
     fi
 
@@ -1069,6 +1083,12 @@ ensure_venv() {
     log INFO "Installing Python dependencies (PEP 668-safe: inside the venv, never the system Python)"
     timeout "$PIP_TIMEOUT" "$VENV_DIR/bin/pip" "${pip_args[@]}" ||
         die "pip failed to install $INSTALL_DIR/requirements.txt"
+
+    # Only now is the skip above safe to take. If this write fails the next run
+    # simply reinstalls, so it is not fatal -- but it is not silent either,
+    # because a stamp that never appears means every run pays for pip.
+    install -m 0644 -o root -g root "$INSTALL_DIR/requirements.txt" "$stamp" ||
+        log WARN "Could not record $stamp; the next run will re-run pip"
 }
 
 # The venv is built by root but read by an unprivileged service account. A root

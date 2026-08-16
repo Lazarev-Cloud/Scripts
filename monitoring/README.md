@@ -788,9 +788,16 @@ Requirements are resolved in this order:
    `LZC_EXPORTER_GPU_PIP_PACKAGES`.
 
 The installer logs which of the three it used. The resolved list is copied to
-`<install-dir>/requirements.txt`, and pip runs
-only when that file changed, the virtual environment was just created, or
-`--force-pip` was passed. That is what makes a re-run offline.
+`<install-dir>/requirements.txt`, and pip is skipped only against proof that it
+already installed exactly that list into this virtual environment: a copy of the
+requirements written to `<install-dir>/venv/.requirements.installed` *after* pip
+exits 0. A re-run whose requirements match that copy skips pip and stays
+offline; `--force-pip` runs it regardless.
+
+The proof deliberately is not `requirements.txt` itself. That file is written
+before pip runs, so a failed pip would leave the new pins on disk with nothing
+installed, and the next run would read them back as unchanged and skip the
+install it was asked to perform.
 
 Pinned versions still trust PyPI to serve the same artefact. If you need more
 than that, supply a hash-pinned requirements file (`pip-compile
