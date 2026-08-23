@@ -332,11 +332,14 @@ this appears" pass the pattern twice:
   running. Anything dropped by the re-check is reported, not skipped quietly.
   Ownership changes were never affected — those use `chown -h` throughout.
 
-  The `getfacl` snapshot is taken before this re-check and does follow symlinks,
-  so a path swapped during that step records the target's ownership and mode
-  under the in-home name. The snapshot is a superset of what is actually
-  changed, so it never misses an undo; but a `setfacl --restore` run against a
-  home that was being tampered with is not trustworthy on its own.
+  The `getfacl` snapshot gets the same re-check, and needs it for two reasons.
+  `getfacl -p` follows symlinks, so a swapped path would record the *target's*
+  ownership and mode under the in-home name — a file from outside the home
+  smuggled into an undo file, which `setfacl --restore` would later write back
+  through the link. And `getfacl` exits non-zero on a path it cannot stat,
+  which this script treats as a failed snapshot and aborts on, so a single
+  dangling link was enough for anyone who could write in the home to stop the
+  run. Both are gone; paths dropped from the snapshot are reported.
 - The snapshot records ownership and permission bits for the files and
   directories being changed. It does not record file contents, ACLs beyond the
   base entries, extended attributes, symlinks, or the other inode types
