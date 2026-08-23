@@ -1,0 +1,59 @@
+name: Pages
+
+# Publishes the documentation site from the repository's own README files.
+# Runs only when documentation changes, so a script-only commit does not
+# redeploy the site.
+#
+# Actions are pinned by commit SHA for the same reason this repo tells you to
+# fetch update-lxcs.sh by SHA rather than by branch: a tag is a movable
+# pointer, a commit is content-addressed. The trailing comment records which
+# release the SHA belongs to; keep the two in step when bumping.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - '_config.yml'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Allow one deployment at a time; do not cancel a run that is mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697 # v1.0.13
+        with:
+          source: ./
+          destination: ./_site
+
+      # From v4 this action drops hidden files from the artifact. That is a
+      # no-op here because _config.yml already excludes every dotfile from the
+      # build, so nothing beginning with `.` reaches _site. If that exclude
+      # list ever changes, set `include-hidden-files: true` rather than
+      # wondering why a file vanished between the build and the deploy.
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

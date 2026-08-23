@@ -1,2 +1,14 @@
-
 /universal scripts
+
+# Python bytecode from running the monitoring exporter in place
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

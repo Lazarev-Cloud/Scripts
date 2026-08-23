@@ -1,88 +1,52 @@
-# Windows Maintenance Scripts Collection
+# Windows Scripts
 
-## Overview
+PowerShell utilities for common Windows maintenance and troubleshooting. Each
+lives in its own subfolder with a README covering parameters, environment
+variables, exit codes and blast radius.
 
-This repository contains a collection of PowerShell scripts designed to simplify and automate common Windows maintenance and troubleshooting tasks. Each script is located in its respective subfolder with a detailed README file explaining its purpose, features, and usage instructions.
+Every script supports `SupportsShouldProcess`: `-WhatIf` previews the change and
+`-Confirm`/`-Force` gates it. Read-only reporting is the default action almost
+everywhere — you have to ask for a change. Run `Get-Help .\Script.ps1 -Full`
+for the authoritative reference.
 
----
+## Scripts
 
-## Contents
-
-### 1. **Clear-WindowsUpdateCache**
-- **Description**: Clears the Windows Update cache to resolve update-related errors and free up disk space.
-- **Key Features**:
-  - Stops the Windows Update service.
-  - Deletes cached update files.
-  - Restarts the Windows Update service.
-
-### 2. **Clean-Disk**
-- **Description**: Cleans up temporary files and system junk to free up disk space and improve system performance.
-- **Key Features**:
-  - Removes temporary files from system and user directories.
-  - Clears the Windows Update cache.
-
-### 3. **Winget Troubleshooting**
-- **Description**: Fixes common issues with the Windows Package Manager (`winget`) and automates package upgrades.
-- **Key Features**:
-  - Validates and fixes `winget` paths and registry configurations.
-  - Automates package upgrades for all installed applications.
-
-### 4. **Windows Features Management**
-- **Description**: Enables or disables optional Windows features.
-- **Key Features**:
-  - Uses PowerShell cmdlets to manage features.
-  - Provides feedback and error handling for all operations.
-
-### 5. **Graphics Driver Restart**
-- **Description**: Restarts the Windows graphics driver by restarting the `dwm` (Desktop Window Manager) process.
-- **Key Features**:
-  - Resolves minor graphical issues without a full reboot.
-  - Simple and quick to execute.
-
-### 6. **Network Reset**
-- **Description**: Resets the Winsock catalog and TCP/IP stack to their default settings to resolve network connectivity issues.
-- **Key Features**:
-  - Clears custom configurations in Winsock.
-  - Restores the TCP/IP stack.
-
-### 7. **Service Management**
-- **Description**: Manages and restarts a specified Windows service.
-- **Key Features**:
-  - Checks service status.
-  - Automatically restarts the service if needed.
-
-### 8. **System File Repair**
-- **Description**: Uses SFC (System File Checker) and DISM (Deployment Image Servicing and Management) tools to repair corrupted or missing system files.
-- **Key Features**:
-  - Automates both SFC and DISM scans.
-  - Detects and attempts to repair issues with system integrity.
-
-### 9. **Windows Store Apps Re-Registration**
-- **Description**: Re-registers all Windows Store apps to resolve issues with app functionality or missing apps.
-- **Key Features**:
-  - Targets all users on the system.
-  - Resolves corrupted app registrations.
-
-### 10. **Windows Firewall Reset**
-- **Description**: Resets the Windows Firewall to its default settings and enables it for all profiles.
-- **Key Features**:
-  - Clears custom firewall rules.
-  - Ensures firewall protection is active for Domain, Private, and Public profiles.
-
----
-
-## How to Use
-
-1. Navigate to the subfolder containing the desired script.
-2. Read the included `README.md` file for detailed instructions on how to execute the script.
-3. Open PowerShell as an administrator and follow the steps outlined in the documentation.
-
----
+| Folder | What it does | Env prefix |
+| --- | --- | --- |
+| [`Clean-Disk/`](Clean-Disk/) | Deletes stale files from temporary directories and reports the space freed. Refuses drive roots and system directories; will not escape the cleaning root through a junction. | `LZC_CLEAN_DISK_` |
+| [`Updates/`](Updates/) | `Clear-WindowsUpdateCache.ps1` — stops the services holding handles inside `SoftwareDistribution`, clears the download cache, restarts them, and reports the space freed. | `LZC_UPDATES_` |
+| [`Winget/`](Winget/) | Reports on winget, removes stale App Installer directories from the system `PATH`, resets package sources, and optionally upgrades installed packages. The `PATH` edit is backed up and verified before it is written. | `LZC_WINGET_` |
+| [`Features/`](Features/) | Lists Windows optional features; enables or disables a named feature with confirmation. Read-only with no arguments. | `LZC_WINDOWSFEATURES_` |
+| [`GraphicsDriver/`](GraphicsDriver/) | Reports graphics adapter and display-driver-recovery (TDR) state, and can restart the Desktop Window Manager for the current session. | `LZC_GRAPHICSDRIVER_` |
+| [`ResetNetwork/`](ResetNetwork/) | Resets selected networking components — DNS client cache, Winsock catalog, IPv4/IPv6 stacks — after saving a rollback snapshot. Defaults to `DnsCache`, the only non-disruptive scope. Winsock and stack resets need a reboot. | `LZC_RESETNETWORK_` |
+| [`ResetFirewall/`](ResetFirewall/) | Exports, resets or restores the Windows Defender Firewall policy. It refuses to reset unless it has exported a backup you can import again, unless you explicitly pass `-SkipBackup`. | `LZC_RESETFIREWALL_` |
+| [`ManageService/`](ManageService/) | Reports on or changes the state of a single named Windows service, with protection for services the system depends on. `Status` is the default action, is read-only, and needs no elevation. | `LZC_MANAGESERVICE_` |
+| [`RepairSystemFiles/`](RepairSystemFiles/) | Repairs the component store with DISM, then repairs protected system files with SFC, and reports the real exit codes and log paths. DISM runs first, because SFC repairs from the component store. | `LZC_REPAIRSYSTEMFILES_` |
+| [`ReRegisterWindowsApps/`](ReRegisterWindowsApps/) | Repairs a single named Microsoft Store app for the current user via the supported `Reset-AppxPackage` path. It refuses an ambiguous name rather than acting on several packages. | `LZC_REREGISTERWINDOWSAPPS_` |
 
 ## Notes
 
-- **Administrative Privileges**: Most scripts require administrator permissions. Run PowerShell as an administrator to ensure proper execution.
-- **Compatibility**: Scripts are designed for PowerShell 5.1 or later.
-- **Caution**: Review each script's README for details on the changes it makes. Backup important data or configurations when necessary.
-
-This collection is intended to simplify Windows maintenance tasks and provide tools for resolving common system issues.
+- **Elevation.** Most changes need an elevated session; the read-only actions
+  generally do not. A script that needs elevation and does not have it refuses
+  with a documented exit code instead of failing partway.
+- **Compatibility.** Windows PowerShell 5.1, which is what CI analyses them
+  against.
+- **Backups.** `ResetFirewall` and `ResetNetwork` write a backup before the
+  destructive step; `Winget` checks its `PATH` backup is non-empty before
+  editing the registry, and `ResetFirewall` refuses to continue if the export
+  failed.
+- **Blast radius is documented per script.** `Clean-Disk -IncludeRecycleBin`
+  and the `ResetNetwork` stack scopes destroy user-visible state; read the
+  folder README before running either.
+- **Exit codes** come from the [repo-wide table](../docs/exit-codes.md): `0`
+  success, `1` partial failure, `2` usage, `3` unsupported platform or missing
+  prerequisite, `4` not elevated, `5` confirmation needed but the session is
+  not interactive, `75` another instance holds the lock, `130` interrupted. Not
+  every script can return every code — the ones it can are in its README. The
+  guard order is the same everywhere: configuration, then platform, then
+  elevation, then interactivity, then the work.
+  `ResetNetwork.ps1` additionally returns `3010` when a reset needs a reboot to
+  finish — the only code in the repo outside that table.
+- **Every parameter has an `LZC_<SCRIPT>_<SETTING>` environment variable**, for
+  Intune, SCCM and Task Scheduler where passing arguments is awkward. A
+  parameter given on the command line always wins over the variable.

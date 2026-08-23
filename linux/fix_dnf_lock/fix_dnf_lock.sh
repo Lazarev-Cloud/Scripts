@@ -1,7 +1,1073 @@
-#!/bin/bash
-echo "Fixing DNF lock issues..."
+#!/usr/bin/env bash
+#
+# DNF/YUM/RPM lock doctor.
+#
+# Works out whether the dnf, yum and rpm locks are genuinely held, refuses to
+# touch anything while a package manager is alive, clears only locks that are
+# provably orphaned, and then checks that the package manager can take its locks
+# again.
+#
+# License: MIT
+# Origin:  https://github.com/Lazarev-Cloud/Scripts
+#
+# Error model: this is a linear script -- detect, decide, act -- that must abort
+# rather than carry on towards an `rm`, so `set -Eeuo pipefail` is used
+# deliberately. Treat it as a backstop rather than as the safety mechanism:
+# much of the work below runs inside `if` and `||` conditions, and bash switches
+# errexit (and the ERR trap) off for the whole of a function called that way.
+#
+# The property that actually keeps this script safe is that every detection
+# routine fails CLOSED: a lock whose state cannot be determined is reported as
+# held, and nothing is ever removed on the strength of a check that did not
+# actually run. Do not weaken that.
+set -Eeuo pipefail
+# inherit_errexit is bash >= 4.4. Older shells simply miss the extra safety net;
+# every fallible command is checked explicitly regardless.
+shopt -s inherit_errexit 2>/dev/null || true
 
-sudo rm -f /var/run/yum.pid
-sudo rm -f /var/run/dnf.pid
+# cron and systemd start with a near-empty environment. Keep the script
+# self-contained rather than depending on the caller's PATH.
+PATH="${PATH:-}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
-echo "DNF lock issue resolved."
+readonly SCRIPT_NAME='DNF lock doctor'
+readonly SCRIPT_VERSION='2.0'
+
+# --- Exit codes --------------------------------------------------------------
+# Shared by every script in this repository. 75 is EX_TEMPFAIL from sysexits.h,
+# which cron and systemd read as "retry later" rather than a real fault -- which
+# is exactly what "a package manager is busy right now" means.
+readonly EX_OK=0 EX_FAIL=1 EX_USAGE=2 EX_PREREQ=3 EX_NOROOT=4
+readonly EX_NOCONFIRM=5 EX_LOCKED=75 EX_INTERRUPT=130
+
+# --- Tunables (env overridable, then flag overridable) -----------------------
+# Globs are expanded and non-matching entries are dropped, so listing a path
+# that does not exist on this release costs nothing. dnf-3 keeps its cache locks
+# under a per-repo-config subdirectory on some releases and directly in
+# /var/cache/dnf on others, hence both spellings. dnf5 (Fedora 41+, RHEL 10) has
+# not been confirmed to use these paths -- add its lock with --path if needed.
+LOCK_PATHS_SPEC="${LZC_FIX_DNF_LOCK_PATHS:-/var/cache/dnf/metadata_lock.pid /var/cache/dnf/*/metadata_lock.pid /var/cache/dnf/download_lock.pid /var/cache/dnf/*/download_lock.pid /var/lib/dnf/rpmdb_lock.pid /var/lib/rpm/.rpm.lock /run/dnf.pid /run/yum.pid}"
+PROC_LOCKS="${LZC_FIX_DNF_LOCK_PROC_LOCKS:-/proc/locks}"
+SELF_LOCK="${LZC_FIX_DNF_LOCK_SELF_LOCK:-/run/lock/lzc-fix-dnf-lock.lock}"
+WAIT_SECONDS="${LZC_FIX_DNF_LOCK_WAIT:-0}"
+POLL_SECONDS="${LZC_FIX_DNF_LOCK_POLL:-5}"
+PROBE_TIMEOUT="${LZC_FIX_DNF_LOCK_PROBE_TIMEOUT:-10}"
+CHECK_TIMEOUT="${LZC_FIX_DNF_LOCK_CHECK_TIMEOUT:-300}"
+CMDLINE_MAX="${LZC_FIX_DNF_LOCK_CMDLINE_MAX:-160}"
+ASSUME_YES="${LZC_FIX_DNF_LOCK_YES:-0}"
+DO_CHECK="${LZC_FIX_DNF_LOCK_CHECK:-1}"
+DRY_RUN="${LZC_FIX_DNF_LOCK_DRY_RUN:-0}"
+USE_COLOR="${LZC_FIX_DNF_LOCK_COLOR:-auto}"
+
+# --- Paths this script must never remove -------------------------------------
+# Deliberately NOT configurable. LZC_FIX_DNF_LOCK_PATHS lets an operator point
+# the scanner at extra lock files; it must never become a way to aim `rm` at the
+# RPM database. Losing rpmdb.sqlite means the system no longer knows what is
+# installed; losing history.sqlite loses `dnf history` and every rollback point.
+readonly -a NEVER_REMOVE=(
+    /var/lib/rpm/Packages
+    /var/lib/rpm/Name
+    /var/lib/rpm/Basenames
+    /var/lib/rpm/Providename
+    /var/lib/rpm/Requirename
+)
+readonly -a NEVER_REMOVE_PREFIX=(
+    /var/lib/rpm/rpmdb.sqlite
+    /var/lib/rpm/__db.
+    /var/lib/dnf/history.sqlite
+    /var/lib/dnf/groups.json
+)
+# An allow-list of basenames is the stronger half of the guard: a deny-list has
+# to anticipate every file worth protecting, whereas this refuses everything
+# that is not shaped like a lock file in the first place.
+readonly -a REMOVABLE_BASENAMES=(
+    '.rpm.lock'
+    '*_lock.pid'
+    '*.lock'
+    dnf.pid
+    yum.pid
+)
+
+# --- Runtime state -----------------------------------------------------------
+declare -a PATHS=()
+declare -a STALE=()
+declare -A STATE=()
+declare -A DETAIL=()
+declare -a BUSY_REASONS=()
+LOCK_FD=-1
+CHANGED=0
+YW='' BL='' RD='' GN='' CL=''
+
+# --- Output ------------------------------------------------------------------
+
+setup_color() {
+    # NO_COLOR is honoured per no-color.org: any non-empty value disables
+    # colour. It is consulted only under 'auto', so an explicit --color always
+    # still wins -- an operator asking for colour outright gets it.
+    if [[ $USE_COLOR == never ]] ||
+        { [[ $USE_COLOR == auto ]] && { [[ -n ${NO_COLOR:-} ]] || [[ ! -t 1 ]]; }; }; then
+        return 0
+    fi
+    YW=$'\033[33m' BL=$'\033[36m' RD=$'\033[01;31m' GN=$'\033[1;92m' CL=$'\033[m'
+    return 0
+}
+
+# Human-facing narration goes to stderr so that stdout stays parseable; the
+# state report is the script's actual output and goes to stdout.
+log() {
+    local level=$1
+    shift
+    case $level in
+        ERROR) printf '%s[Error]%s %s\n' "$RD" "$CL" "$*" >&2 ;;
+        WARN) printf '%s[Warning]%s %s\n' "$YW" "$CL" "$*" >&2 ;;
+        INFO) printf '%s[Info]%s %s\n' "$BL" "$CL" "$*" >&2 ;;
+        SUCCESS) printf '%s[OK]%s %s\n' "$GN" "$CL" "$*" >&2 ;;
+        *) printf '%s\n' "$*" >&2 ;;
+    esac
+    return 0
+}
+
+die() {
+    local code=$1
+    shift
+    log ERROR "$*"
+    exit "$code"
+}
+
+usage() {
+    cat <<EOF
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Diagnoses a stuck "Waiting for process with pid NNNN to finish" or a dnf run
+that will not start, and clears the lock only when no process holds it.
+
+WHY THIS IS NOT A ONE-LINE 'rm': dnf and rpm locks are advisory locks taken on
+a file. Deleting one while a package manager holds it does not stop that
+package manager -- it lets a second one start alongside it, and two concurrent
+rpm transactions are what corrupt the RPM database. This script therefore
+identifies the process holding each lock and refuses to remove anything while
+one is alive.
+
+WHEN YOU ACTUALLY NEED THIS: less often than the internet suggests. dnf already
+recovers from the common case by itself -- when a *_lock.pid file records a PID
+that no longer exists, dnf truncates the file and takes the lock over, and it
+unlinks its own lock on a clean exit. The state dnf cannot recover from is a
+lock file whose contents are not a PID at all; it reports "Malformed lock file
+found" and tells you to remove the file, which is what this script does after
+proving nothing holds it. Run with --dry-run first: "nothing to clean up" is a
+perfectly normal and common answer here.
+
+Usage:
+  fix_dnf_lock.sh [options]
+
+Options:
+  -n, --dry-run           Report the state and the plan; change nothing.
+  -y, --yes               Run unattended; skip the confirmation prompt.
+  -w, --wait SECONDS      If a lock is held, wait up to this long for it to be
+                          released instead of giving up (default: $WAIT_SECONDS).
+                          0 means do not wait.
+      --no-check          Do not run 'dnf check' afterwards.
+      --path PATH         Additional lock file to inspect. Repeatable, globs OK.
+      --timeout SECONDS   Time limit for the post-clean 'dnf check' run, and
+                          nothing else (default: $CHECK_TIMEOUT). Minimum 1:
+                          'timeout 0' means no limit at all.
+      --color WHEN        auto | always | never (default: auto).
+  -V, --version           Print version and exit.
+  -h, --help              Print this help and exit.
+
+Every option also has an environment variable, which is the easier route when
+piping this script in from the network. Booleans accept 1/true/yes/on and
+0/false/no/off, case-insensitively; anything else is a usage error. Numbers must
+be whole; the value in brackets is what this run would use.
+
+  LZC_FIX_DNF_LOCK_YES             bool: skip the confirmation prompt [$ASSUME_YES]
+  LZC_FIX_DNF_LOCK_DRY_RUN         bool: report only, change nothing [$DRY_RUN]
+  LZC_FIX_DNF_LOCK_CHECK           bool: run 'dnf check' after clearing [$DO_CHECK]
+  LZC_FIX_DNF_LOCK_WAIT            seconds to wait for a held lock, 0 to not
+                                   wait at all [$WAIT_SECONDS]
+  LZC_FIX_DNF_LOCK_POLL            seconds between --wait polls, min 1 [$POLL_SECONDS]
+  LZC_FIX_DNF_LOCK_CHECK_TIMEOUT   bounds the 'dnf check' run, min 1 [$CHECK_TIMEOUT]
+  LZC_FIX_DNF_LOCK_PROBE_TIMEOUT   bounds each fuser, lsof and systemctl
+                                   probe, min 1 [$PROBE_TIMEOUT]
+  LZC_FIX_DNF_LOCK_CMDLINE_MAX     characters of a holder's command line to
+                                   print, min 1 [$CMDLINE_MAX]
+  LZC_FIX_DNF_LOCK_COLOR           auto | always | never [$USE_COLOR]
+  LZC_FIX_DNF_LOCK_PATHS           whitespace-separated lock files to inspect,
+                                   globs allowed
+  LZC_FIX_DNF_LOCK_SELF_LOCK       this script's own lock file [$SELF_LOCK]
+  LZC_FIX_DNF_LOCK_PROC_LOCKS      kernel lock table to read [$PROC_LOCKS]
+
+Colour: NO_COLOR (any non-empty value) disables it, as does --color never.
+Colour is emitted only when stdout is a terminal unless --color always is given.
+
+How a lock is judged:
+  $PROC_LOCKS is the authority. It records every POSIX (fcntl), FLOCK and OFD
+  lock held in the kernel, so a lock is only called free when no record names
+  the file's inode. An OFD lock is reported by the kernel with a PID of -1,
+  which this script shows as an unidentified owner and treats as held.
+
+  That covers both mechanisms in play here: dnf takes its
+  *_lock.pid locks with flock(2), and it is read rather than probed because
+  reading names the holding process and does not require taking a lock to find
+  out whether one could be taken.
+
+  For dnf's own lock files the recorded PID is used as a second check, the same
+  test dnf itself applies. fuser and lsof are consulted as a third, because they
+  can see a process holding the file OPEN without a lock, which $PROC_LOCKS
+  cannot. If neither is installed the report says the corroboration did not
+  happen rather than implying it passed; if either times out, that file is
+  reported 'unknown' and nothing is removed.
+
+  Independently of any file, a dnf, yum or rpm process running anywhere on the
+  system blocks every removal, because an rpm transaction releases and re-takes
+  its locks between stages -- "no lock held right now" is not the same as "no
+  transaction in flight".
+
+Blast radius:
+  With --yes (or an answered prompt) this script deletes lock files that no
+  process holds or has open, from this list --
+    ${LOCK_PATHS_SPEC}
+  All of them are recreated automatically by dnf, yum or rpm. Deleting an unheld
+  lock is a no-op for root; it is included because the situation this script
+  diagnoses is usually misdiagnosed as needing it.
+
+  It then runs 'dnf check', which is read-only, to confirm the package manager
+  can take its locks again. Skip that with --no-check.
+
+  It never removes a held lock, never installs, updates or removes a package,
+  never runs 'rpm --rebuilddb', and never touches /var/lib/rpm/rpmdb.sqlite*,
+  /var/lib/rpm/Packages or /var/lib/dnf/history.sqlite.
+
+Exit status:
+  0    success -- nothing needed changing, or every change succeeded
+  1    the work ran but something in it failed: a removal was refused or failed
+  2    usage error (unknown flag, missing or invalid argument value)
+  3    unsupported platform or a missing prerequisite tool
+  4    must be run as root
+  5    refused: confirmation was needed, but there is no TTY and --yes was not
+       given -- nothing was changed
+  75   temporary failure, retry later (EX_TEMPFAIL): a package manager is
+       running, another copy of this script holds $SELF_LOCK,
+       or a lock's state could not be determined -- nothing was changed
+  130  interrupted (SIGINT/SIGTERM)
+
+75 is the interesting one for monitoring: the machine is busy, not broken, and
+cron and systemd both read it as "retry later". Four cases return 75 and will
+NOT clear on a retry, so read the report before wiring a retry loop around it:
+a lock path that is a symlink, one that is not a regular file, one whose
+fuser/lsof probe timed out (usually a wedged NFS or FUSE mount), and a lock file
+whose recorded PID has been reused by an unrelated process -- the report shows
+that process's command line, so you can see it is not a package manager.
+
+A non-zero 'dnf check' does not fail the run: it reports RPM database problems
+that predate this script, and the fact that it ran proves the locks are usable.
+
+For unattended automation, do not schedule this script. dnf already waits for a
+lock by default; raise the ceiling with:  dnf --setopt=lock_timeout=600 upgrade
+EOF
+    return 0
+}
+
+# --- Argument parsing --------------------------------------------------------
+
+parse_args() {
+    while (($#)); do
+        case $1 in
+            -n | --dry-run) DRY_RUN=1 ;;
+            -y | --yes) ASSUME_YES=1 ;;
+            -w | --wait)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--wait requires a value in seconds"
+                WAIT_SECONDS=$2
+                shift
+                ;;
+            --no-check) DO_CHECK=0 ;;
+            --path)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--path requires a file path"
+                LOCK_PATHS_SPEC="$LOCK_PATHS_SPEC $2"
+                shift
+                ;;
+            --timeout)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--timeout requires a value in seconds"
+                CHECK_TIMEOUT=$2
+                shift
+                ;;
+            --color)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--color requires auto, always or never"
+                USE_COLOR=$2
+                shift
+                ;;
+            -V | --version)
+                printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+                exit "$EX_OK"
+                ;;
+            -h | --help)
+                usage
+                exit "$EX_OK"
+                ;;
+            --)
+                shift
+                continue
+                ;;
+            *) die "$EX_USAGE" "Unknown option: $1 (try --help)" ;;
+        esac
+        shift
+    done
+
+    [[ $USE_COLOR =~ ^(auto|always|never)$ ]] ||
+        die "$EX_USAGE" "--color must be auto, always or never"
+
+    # Booleans first: every one of these reaches an arithmetic context below, and
+    # a bare word there is fatal under 'set -u'. The label is the name the
+    # operator actually typed, not the internal variable.
+    _normalise_bool ASSUME_YES LZC_FIX_DNF_LOCK_YES
+    _normalise_bool DO_CHECK LZC_FIX_DNF_LOCK_CHECK
+    _normalise_bool DRY_RUN LZC_FIX_DNF_LOCK_DRY_RUN
+
+    # GNU timeout treats a duration of 0 as "no timeout at all". Accepting 0 for
+    # a timeout would silently remove the guard instead of tightening it, and a
+    # hung 'fuser' on a stale NFS mount or a wedged 'dnf check' would then block
+    # forever. WAIT_SECONDS is the exception: 0 there legitimately means
+    # "do not wait".
+    _normalise_int CHECK_TIMEOUT 1 '--timeout / LZC_FIX_DNF_LOCK_CHECK_TIMEOUT'
+    _normalise_int PROBE_TIMEOUT 1 LZC_FIX_DNF_LOCK_PROBE_TIMEOUT
+    _normalise_int POLL_SECONDS 1 LZC_FIX_DNF_LOCK_POLL
+    _normalise_int CMDLINE_MAX 1 LZC_FIX_DNF_LOCK_CMDLINE_MAX
+    _normalise_int WAIT_SECONDS 0 '--wait / LZC_FIX_DNF_LOCK_WAIT'
+    return 0
+}
+
+# Accepts the spellings people actually write in cron files and unit files.
+# Without this, LZC_FIX_DNF_LOCK_YES=true reaches (( )) as a bare word and the
+# script dies with "true: unbound variable" before doing anything.
+_normalise_bool() {
+    local name=$1 label=$2 value
+    case ${!name,,} in
+        1 | true | yes | on) value=1 ;;
+        0 | false | no | off | '') value=0 ;;
+        *) die "$EX_USAGE" "$label must be one of 1/true/yes/on or 0/false/no/off, got '${!name}'" ;;
+    esac
+    printf -v "$name" '%s' "$value"
+}
+
+_normalise_int() {
+    local name=$1 min=$2 label=$3 value
+    [[ ${!name} =~ ^[0-9]+$ ]] ||
+        die "$EX_USAGE" "$label must be a whole number, got '${!name}'"
+    # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
+    # an invalid octal literal and aborts the arithmetic.
+    value=$((10#${!name}))
+    ((value >= min)) ||
+        die "$EX_USAGE" "$label must be at least $min, got '${!name}'"
+    printf -v "$name" '%s' "$value"
+}
+
+# --- Preflight ---------------------------------------------------------------
+
+# Expands one path spec entry. A glob contributes only the files it actually
+# matches; a plain path is kept even when missing, so the report can say
+# "absent" rather than staying silent about a file the operator asked about.
+expand_token() {
+    local token=$1 match found=0
+    case $token in
+        *[*?[]*)
+            for match in $token; do
+                [[ -e $match ]] || continue
+                printf '%s\n' "$match"
+                found=1
+            done
+            ((found)) || return 0
+            ;;
+        *) printf '%s\n' "$token" ;;
+    esac
+    return 0
+}
+
+# Resolves the configured lock paths, dropping duplicates. /var/run is a symlink
+# to /run on any current system, so the same file can easily be named twice.
+#
+# Only the DIRECTORY is canonicalised. Resolving the final component too (plain
+# `readlink -f` on the whole path) would silently follow a symlinked lock file
+# to wherever it points and aim the later `rm` at the target instead -- and it
+# would defeat the symlink check in scan_path, because by then the path would no
+# longer look like a symlink.
+resolve_paths() {
+    local raw token expanded dir base canonical seen=''
+    # Deliberate word splitting: the spec is a whitespace-separated path list.
+    # shellcheck disable=SC2206 # splitting on whitespace is the documented format
+    raw=($LOCK_PATHS_SPEC)
+    for token in ${raw[@]+"${raw[@]}"}; do
+        [[ -n $token ]] || continue
+        [[ $token == /* ]] || die "$EX_USAGE" "Lock paths must be absolute: '$token'"
+        while IFS= read -r expanded; do
+            [[ -n $expanded ]] || continue
+            dir=$(dirname -- "$expanded")
+            base=$(basename -- "$expanded")
+            canonical=$(readlink -f -- "$dir" 2>/dev/null) || canonical=$dir
+            [[ -n $canonical ]] || canonical=$dir
+            canonical="${canonical%/}/$base"
+            case $seen in
+                *"|$canonical|"*) continue ;;
+            esac
+            seen="$seen|$canonical|"
+            PATHS+=("$canonical")
+        done < <(expand_token "$token")
+    done
+    ((${#PATHS[@]})) || die "$EX_USAGE" "No lock paths to inspect"
+    return 0
+}
+
+preflight() {
+    [[ $EUID -eq 0 ]] || die "$EX_NOROOT" "This script must be run as root (try: sudo $0)"
+    [[ -r $PROC_LOCKS ]] ||
+        die "$EX_PREREQ" "Cannot read $PROC_LOCKS. This script needs Linux procfs to tell a held lock from a stale one; it will not guess."
+    command -v rpm >/dev/null 2>&1 ||
+        die "$EX_PREREQ" "rpm not found. This script is for RHEL/Fedora/Rocky/Alma systems."
+    command -v timeout >/dev/null 2>&1 || die "$EX_PREREQ" "timeout (coreutils) not found."
+    command -v stat >/dev/null 2>&1 || die "$EX_PREREQ" "stat (coreutils) not found."
+    command -v awk >/dev/null 2>&1 || die "$EX_PREREQ" "awk not found."
+    # Required, not optional: without it two copies of this script can race each
+    # other towards the same `rm`, and there is no safe way to continue without
+    # the guard. flock ships in util-linux, which is essential on every system
+    # this script supports.
+    command -v flock >/dev/null 2>&1 || die "$EX_PREREQ" "flock (util-linux) not found."
+    return 0
+}
+
+# Guards against two copies of this script racing each other towards the same
+# `rm`. The lock file is never deleted: the kernel releases it when the fd
+# closes, and unlinking it would let a second run lock a different inode.
+acquire_self_lock() {
+    mkdir -p -- "$(dirname -- "$SELF_LOCK")" 2>/dev/null || true
+    exec {LOCK_FD}>"$SELF_LOCK" || die "$EX_LOCKED" "Cannot open lock file $SELF_LOCK"
+    flock -n "$LOCK_FD" ||
+        die "$EX_LOCKED" "Another $SCRIPT_NAME run holds $SELF_LOCK. Refusing to run concurrently."
+    return 0
+}
+
+release_self_lock() {
+    ((LOCK_FD >= 0)) || return 0
+    exec {LOCK_FD}>&- || true
+    LOCK_FD=-1
+    return 0
+}
+
+# --- Holder detection --------------------------------------------------------
+
+# Trims leading and trailing whitespace. `read` does this in one step via IFS;
+# `${var## }` strips exactly one space, which is not enough for the run of
+# padding that `ps -o etime=` emits or the trailing separator left behind when
+# a NUL-separated /proc/<pid>/cmdline is flattened.
+_trim() {
+    local trimmed
+    read -r trimmed <<<"$1" || trimmed=''
+    printf '%s' "$trimmed"
+}
+
+# Describes a PID from procfs. Returns 1 if the process has already gone.
+describe_pid() {
+    local pid=$1 comm='' cmdline='' etime=''
+    [[ $pid =~ ^[0-9]+$ ]] || {
+        printf 'unidentified owner (open file description lock)'
+        return 0
+    }
+    [[ -d /proc/$pid ]] || return 1
+    if [[ -r /proc/$pid/comm ]]; then
+        read -r comm </proc/"$pid"/comm || comm=''
+    fi
+    if [[ -r /proc/$pid/cmdline ]]; then
+        # A command line is NUL-separated and may legitimately contain newlines
+        # and tabs (an rpm scriptlet invoked with an embedded here-doc, for one).
+        # Flatten every one of them: this string goes into an indented report,
+        # and a stray newline there would misalign the whole table and could be
+        # used to fake a second entry.
+        cmdline=$(tr '\0\n\r\t' '    ' </proc/"$pid"/cmdline) || cmdline=''
+    fi
+    if command -v ps >/dev/null 2>&1; then
+        etime=$(ps -o etime= -p "$pid" 2>/dev/null) || etime=''
+    fi
+    # Trim the surrounding whitespace ps and cmdline leave behind.
+    etime=$(_trim "$etime")
+    cmdline=$(_trim "$cmdline")
+    if ((${#cmdline} > CMDLINE_MAX)); then
+        cmdline="${cmdline:0:CMDLINE_MAX}..."
+    fi
+
+    printf 'pid %s' "$pid"
+    [[ -n $comm ]] && printf ' (%s)' "$comm"
+    [[ -n $etime ]] && printf ' running %s' "$etime"
+    [[ -n $cmdline ]] && printf ' -- %s' "$cmdline"
+    return 0
+}
+
+# PIDs with a lock record over the given inode, one "pid holding|waiting" per
+# line.
+#
+# /proc/locks lines look like:
+#   1: POSIX  ADVISORY  WRITE 3376 08:02:1442316 0 EOF
+#   1: -> POSIX  ADVISORY  WRITE 3402 08:02:1442316 0 EOF   (a blocked waiter)
+#
+# The kernel prints the device as %02x:%02x and the inode in decimal. The inode
+# is matched on its own because the st_dev -> major:minor mapping is not
+# reversible for every filesystem: btrfs, ZFS and overlayfs use anonymous
+# devices whose minor number can exceed 255, where the encoding stops being a
+# plain major*256+minor. Matching the inode alone can only ever over-report, and
+# over-reporting refuses a removal -- the safe direction. Under-reporting would
+# permit one, which is the direction that corrupts a package database.
+#
+# Exits non-zero if the lock table could not be read. The caller MUST treat that
+# as "state unknown" rather than "no records found": returning 0 unconditionally
+# here would turn a failed check into a clean bill of health and let the removal
+# proceed, which is the one direction this script must never fail in.
+locks_for_inode() {
+    local inode=$1
+    awk -v want="$inode" '
+        {
+            if ($2 == "->") { pid = $6; dev = $7; kind = "waiting" }
+            else            { pid = $5; dev = $6; kind = "holding" }
+            n = split(dev, part, ":")
+            if (n >= 3 && part[n] == want) printf "%s %s\n", pid, kind
+        }
+    ' "$PROC_LOCKS" 2>/dev/null
+    # awk's own "cannot open file" goes to /dev/null on purpose: the non-zero
+    # status is what matters, and scan_path turns it into a clearer message that
+    # names the file and says the lock state is unknown. Two errors for one
+    # fault would only invite someone to treat the noisier one as the real one.
+}
+
+# fuser and lsof report processes with the file OPEN, which is a superset of the
+# processes that have it LOCKED -- /proc/locks remains the authority on locks.
+# What these add is the process that holds the file open without a lock, which
+# /proc/locks cannot see.
+#
+# The caller must distinguish three outcomes, so they are returned separately:
+#   0  the probe ran; stdout is the (possibly empty) list of PIDs
+#   1  the tool is not installed, so no opinion was formed at all
+#   2  the probe ran but timed out, so the answer is genuinely UNKNOWN
+#
+# Collapsing 2 into 1 is what makes a wedged mount look like a clean bill of
+# health, so scan_path treats them differently.
+#
+# `--` is deliberately not passed: resolve_paths already guarantees every path is
+# absolute, so an end-of-options marker buys nothing here and dropping it avoids
+# depending on how each tool's own option parser treats one.
+openers_via_fuser() {
+    local path=$1 out rc=0
+    command -v fuser >/dev/null 2>&1 || return 1
+    out=$(timeout "$PROBE_TIMEOUT" fuser "$path" 2>/dev/null) || rc=$?
+    # fuser exits 1 when nothing has the file open -- that is an answer, not a
+    # failure. 124 is the timeout firing; 125-127 mean timeout could not run it.
+    ((rc >= 124)) && return 2
+    printf '%s\n' "$out"
+    return 0
+}
+
+openers_via_lsof() {
+    local path=$1 out rc=0
+    command -v lsof >/dev/null 2>&1 || return 1
+    out=$(timeout "$PROBE_TIMEOUT" lsof -t "$path" 2>/dev/null) || rc=$?
+    ((rc >= 124)) && return 2
+    printf '%s\n' "$out"
+    return 0
+}
+
+# Reads the PID a dnf/yum lock file advertises. These are pid files as well as
+# lock targets, so the recorded PID is a useful cross-check: if it names a live
+# process the lock is real even when the lock record is ambiguous.
+#
+# This mirrors what dnf itself does. dnf/lock.py's ProcessLock._try_lock reads
+# the recorded PID and, when /proc/<pid>/stat does not exist, truncates the file
+# and takes the lock over -- so a dead PID is not a condition dnf needs help
+# with, and this script is no more conservative than dnf is.
+#
+# Returning 1 for content that is not a plain integer is deliberate, not an
+# oversight: that is dnf's "Malformed lock file found" case, the one state dnf
+# cannot recover from on its own and whose documented remedy is removing the
+# file. Reporting no recorded PID lets such a file fall through to the normal
+# lock checks and be cleared if genuinely unheld.
+recorded_pid() {
+    local path=$1 content=''
+    [[ -s $path ]] || return 1
+    # `read` returns 1 at EOF without a delimiter, and that is precisely what a
+    # dnf lock file is: dnf/lock.py writes `os.write(fd, str(pid).encode())`
+    # with NO trailing newline. Gating on read's status therefore rejected every
+    # real dnf lock file and silently skipped this whole cross-check. Judge the
+    # content instead -- an unreadable file leaves `content` empty and is caught
+    # by the emptiness test below.
+    read -r content <"$path" 2>/dev/null || true
+    [[ -n $content ]] || return 1
+    [[ $content =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$content"
+    return 0
+}
+
+# Inspects one lock file and records its state in STATE[]/DETAIL[].
+#
+# States: absent | free | locked | unsafe | unknown
+# Everything except "absent" and "free" blocks removal.
+scan_path() {
+    local path=$1
+    local inode='' dev='' line pid kind desc records='' found=0
+    local -a notes=()
+
+    # -L is tested before -e on purpose: -e follows the link, so a lock path that
+    # is a symlink to something that does not exist would otherwise be reported
+    # as "absent" while the symlink itself is sitting there blocking dnf.
+    if [[ -L $path ]]; then
+        STATE["$path"]=unsafe
+        DETAIL["$path"]='a symlink, not a lock file -- refusing to touch it'
+        return 0
+    fi
+
+    if [[ ! -e $path ]]; then
+        STATE["$path"]=absent
+        DETAIL["$path"]=''
+        return 0
+    fi
+
+    if [[ ! -f $path ]]; then
+        STATE["$path"]=unsafe
+        DETAIL["$path"]='not a regular file (directory, device or socket) -- refusing to touch it'
+        return 0
+    fi
+
+    inode=$(stat -c '%i' -- "$path" 2>/dev/null) || inode=''
+    dev=$(stat -c '%D' -- "$path" 2>/dev/null) || dev=''
+    if [[ -z $inode ]]; then
+        STATE["$path"]=unknown
+        DETAIL["$path"]='cannot stat the file, so its lock state is unknown'
+        return 0
+    fi
+
+    # Read the lock table through a variable rather than a process substitution:
+    # a process substitution discards the producer's exit status, so a failed
+    # read would be indistinguishable from "this file has no lock records".
+    if ! records=$(locks_for_inode "$inode"); then
+        STATE["$path"]=unknown
+        DETAIL["$path"]="could not read lock records from $PROC_LOCKS, so the lock state is unknown"
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        pid=${line%% *}
+        kind=${line##* }
+        if desc=$(describe_pid "$pid"); then
+            notes+=("$kind: $desc")
+        else
+            notes+=("$kind: pid $pid (process has since exited)")
+        fi
+        found=1
+    done <<<"$records"
+
+    local opener out prc probes_ran=0 probes_failed=0
+    for opener in openers_via_fuser openers_via_lsof; do
+        prc=0
+        # The capture and the status read must stay one statement: a bare
+        # assignment followed by a separate `$?` read would abort under errexit.
+        out=$("$opener" "$path") || prc=$?
+        case $prc in
+            0)
+                probes_ran=1
+                for pid in $out; do
+                    [[ $pid =~ ^[0-9]+$ ]] || continue
+                    if desc=$(describe_pid "$pid"); then
+                        notes+=("has it open: $desc")
+                        found=1
+                    fi
+                done
+                ;;
+            2)
+                probes_failed=1
+                notes+=("${opener#openers_via_} probe timed out after ${PROBE_TIMEOUT}s")
+                ;;
+        esac
+    done
+
+    if pid=$(recorded_pid "$path"); then
+        if desc=$(describe_pid "$pid"); then
+            notes+=("names a live process: $desc")
+            found=1
+        else
+            notes+=("names pid $pid, which no longer exists -- dnf reclaims such a lock by itself")
+        fi
+    fi
+
+    # A probe that timed out is not the same as a probe that is not installed.
+    # The first means this file's state is genuinely unknown -- a wedged NFS or
+    # FUSE mount is the usual cause -- and must fail closed. The second is a
+    # known-absent capability, and /proc/locks is still authoritative for locks,
+    # so the verdict stands; the report just has to say the corroboration never
+    # happened rather than implying it passed.
+    if ((probes_failed)); then
+        STATE["$path"]=unknown
+        DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
+        return 0
+    fi
+    ((probes_ran)) ||
+        notes+=('open-file corroboration not performed: neither fuser (psmisc) nor lsof is installed')
+
+    if ((found)); then
+        STATE["$path"]=locked
+    else
+        STATE["$path"]=free
+        notes=("no lock record in $PROC_LOCKS (device $dev, inode $inode)"
+            ${notes[@]+"${notes[@]}"})
+    fi
+    DETAIL["$path"]=$(printf '%s\n' "${notes[@]}")
+    return 0
+}
+
+# Package-manager processes anywhere on the system, whether or not they are
+# currently holding one of the files above. An rpm transaction releases and
+# re-takes locks between stages, so "no lock right now" is not the same as "no
+# transaction in flight". comm is truncated to 15 characters by the kernel,
+# hence the abbreviated patterns.
+package_manager_processes() {
+    local dir pid comm
+    for dir in /proc/[0-9]*; do
+        [[ -d $dir ]] || continue
+        pid=${dir#/proc/}
+        [[ $pid == "$$" ]] && continue
+        [[ -r $dir/comm ]] || continue
+        read -r comm <"$dir/comm" || continue
+        case $comm in
+            dnf | dnf-3 | dnf5 | dnf-automatic | yum | microdnf | tdnf | rpm | rpmdb | \
+                packagekitd | PackageKit | dnf_automatic)
+                printf '%s %s\n' "$pid" "$comm"
+                ;;
+        esac
+    done
+    return 0
+}
+
+# Advisory only: these units are the usual reason a lock is held on a machine
+# nobody is logged into.
+active_dnf_units() {
+    local unit
+    command -v systemctl >/dev/null 2>&1 || return 0
+    for unit in dnf-automatic.service dnf-automatic-install.service \
+        dnf-automatic-download.service dnf-automatic-notifyonly.service \
+        dnf-makecache.service packagekit.service; do
+        if timeout "$PROBE_TIMEOUT" systemctl is-active --quiet "$unit" 2>/dev/null; then
+            printf '%s\n' "$unit"
+        fi
+    done
+    return 0
+}
+
+# --- Assessment --------------------------------------------------------------
+
+# Fills STATE/DETAIL for every path and BUSY_REASONS for the system as a whole.
+assess() {
+    local path line
+    BUSY_REASONS=()
+    STALE=()
+
+    for path in "${PATHS[@]}"; do
+        scan_path "$path"
+    done
+
+    for path in "${PATHS[@]}"; do
+        case ${STATE["$path"]} in
+            free) STALE+=("$path") ;;
+            absent) ;;
+            *) BUSY_REASONS+=("${STATE["$path"]} lock: $path") ;;
+        esac
+    done
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        BUSY_REASONS+=("package manager running: $line")
+    done < <(package_manager_processes)
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        BUSY_REASONS+=("systemd unit active: $line")
+    done < <(active_dnf_units)
+    return 0
+}
+
+report() {
+    local path state detail line
+
+    printf 'Lock state:\n'
+    for path in "${PATHS[@]}"; do
+        state=${STATE["$path"]}
+        detail=${DETAIL["$path"]}
+        printf '  %-38s %s\n' "$path" "$state"
+        if [[ -n $detail ]]; then
+            # Fixed indent rather than a second padded column: lock paths are
+            # long enough to overflow the column and misalign every detail line.
+            while IFS= read -r line; do
+                [[ -n $line ]] || continue
+                printf '      %s\n' "$line"
+            done <<<"$detail"
+        fi
+    done
+    printf '\n'
+    return 0
+}
+
+# Waits for every busy lock to be released. Returns 0 when the system went
+# quiet, 1 when the deadline passed.
+wait_for_release() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    log INFO "Waiting up to ${WAIT_SECONDS}s for the package manager to finish"
+    while ((SECONDS < deadline)); do
+        sleep "$POLL_SECONDS"
+        assess
+        if ((${#BUSY_REASONS[@]} == 0)); then
+            log SUCCESS "Locks released after ${SECONDS}s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- Actions -----------------------------------------------------------------
+
+confirm() {
+    local prompt=$1 reply src
+    ((ASSUME_YES)) && return 0
+
+    src=''
+    if [[ -t 0 ]]; then
+        src=/dev/stdin
+    elif [[ -t 1 && -e /dev/tty ]]; then
+        # Piped in from the network: stdin is the script text, so a prompt has
+        # to come from the terminal directly or it would eat the script.
+        src=/dev/tty
+    fi
+    if [[ -z $src ]]; then
+        log ERROR "No terminal available and --yes was not given. Nothing was changed."
+        return 1
+    fi
+
+    read -r -p "$prompt [y/N] " reply <"$src" || return 1
+    [[ ${reply,,} == y* ]]
+}
+
+# The last gate before an unlink. Re-runs detection on this one path so the
+# window between the report and the removal is as small as it can be made from
+# a shell, and refuses outright for anything that is not shaped like a lock or
+# that sits on the never-remove list.
+safe_to_remove() {
+    local path=$1 protected prefix pattern base allowed=0
+
+    base=${path##*/}
+    for pattern in "${REMOVABLE_BASENAMES[@]}"; do
+        # shellcheck disable=SC2053 # the right-hand side is a glob on purpose
+        if [[ $base == $pattern ]]; then
+            allowed=1
+            break
+        fi
+    done
+    if ((!allowed)); then
+        log ERROR "Refusing to remove $path: '$base' is not the name of a dnf, yum or rpm lock file."
+        return 1
+    fi
+
+    for protected in "${NEVER_REMOVE[@]}"; do
+        if [[ $path == "$protected" ]]; then
+            log ERROR "Refusing to remove $path: that is the RPM database, not a lock."
+            return 1
+        fi
+    done
+    for prefix in "${NEVER_REMOVE_PREFIX[@]}"; do
+        if [[ $path == "$prefix"* ]]; then
+            log ERROR "Refusing to remove $path: '$prefix'* is package-manager state, not a lock."
+            return 1
+        fi
+    done
+
+    scan_path "$path"
+    if [[ ${STATE["$path"]} != free ]]; then
+        log ERROR "$path changed state to '${STATE["$path"]}' while this script was running. Nothing removed."
+        return 1
+    fi
+    return 0
+}
+
+remove_stale_locks() {
+    local path rc=0
+    # Guard the expansion below: on bash < 4.4, "${STALE[@]}" on an empty array
+    # is an unbound-variable error under `set -u`.
+    ((${#STALE[@]})) || return 0
+    for path in "${STALE[@]}"; do
+        # The safety gate runs in BOTH modes deliberately. --dry-run is the mode
+        # this script tells an operator to run first, so it has to print the plan
+        # the real run would actually follow. Announcing "would remove" for a path
+        # that safe_to_remove goes on to refuse -- reachable whenever --path or
+        # LZC_FIX_DNF_LOCK_PATHS names something that is not shaped like a lock
+        # file -- makes the rehearsal claim a destruction that cannot happen, and
+        # exits 0 where the real run exits 1. scan_path is read-only, so running
+        # the gate early costs nothing but the probes.
+        if ! safe_to_remove "$path"; then
+            rc=1
+            continue
+        fi
+        if ((DRY_RUN)); then
+            log INFO "[dry-run] Would remove stale lock $path"
+            continue
+        fi
+        if rm -f -- "$path"; then
+            log SUCCESS "Removed stale lock $path"
+            CHANGED=1
+        else
+            log ERROR "Could not remove $path"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# There is no dnf equivalent of `dpkg --configure -a`: RPM has no "half
+# configured" state to replay, and `rpm --rebuilddb` is a human-run recovery
+# step that this script deliberately does not automate. `dnf check` is read-only
+# and doubles as proof that the package manager can take its locks again.
+package_manager_cmd() {
+    local candidate
+    for candidate in dnf dnf5 yum; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_check() {
+    local tool rc=0
+
+    if ! tool=$(package_manager_cmd); then
+        log WARN "Neither dnf nor yum is installed; skipping the post-clean check"
+        return 0
+    fi
+
+    if ((DRY_RUN)); then
+        log INFO "[dry-run] Would run: $tool check"
+        return 0
+    fi
+
+    log INFO "Running: $tool check"
+    timeout --foreground "$CHECK_TIMEOUT" "$tool" check || rc=$?
+
+    case $rc in
+        0)
+            log SUCCESS "$tool check passed; the package manager can take its locks again"
+            ;;
+        124)
+            log WARN "$tool check timed out after ${CHECK_TIMEOUT}s. The lock may still be contended."
+            ;;
+        *)
+            # A non-zero `dnf check` reports pre-existing RPM database problems.
+            # It still proves the lock is usable, which is what this script set
+            # out to fix, so it is a warning rather than a failure.
+            log WARN "$tool check exited $rc. It ran, so the locks are usable, but it reports package problems that predate this script. Review them with '$tool check' before your next transaction."
+            ;;
+    esac
+    return 0
+}
+
+# --- Lifecycle ---------------------------------------------------------------
+
+on_exit() {
+    local rc=$?
+    trap - EXIT INT TERM
+    release_self_lock
+    exit "$rc"
+}
+
+on_signal() {
+    log WARN "Interrupted -- nothing further will be changed"
+    exit "$EX_INTERRUPT"
+}
+
+on_err() {
+    log ERROR "Unexpected failure at line $1: '$2' (status $3)"
+    return 0
+}
+
+# --- Main --------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+    setup_color
+    preflight
+    resolve_paths
+    acquire_self_lock
+
+    trap on_exit EXIT
+    trap on_signal INT TERM
+    trap 'on_err "$LINENO" "$BASH_COMMAND" "$?"' ERR
+
+    assess
+    report
+
+    if ((${#BUSY_REASONS[@]})); then
+        local reason
+        log WARN "A package manager is active. Removing a lock now would let a second one start alongside it, which is what corrupts the RPM database."
+        for reason in "${BUSY_REASONS[@]}"; do
+            printf '  %s\n' "$reason" >&2
+        done
+
+        if ((WAIT_SECONDS > 0)) && wait_for_release; then
+            report
+        else
+            printf '\n' >&2
+            log ERROR "Nothing was changed. Wait for the run above to finish."
+            log INFO "dnf already waits for a lock; raise the ceiling with:  dnf --setopt=lock_timeout=600 upgrade"
+            log INFO "If the holder is a dead session rather than live work, end it deliberately: 'fuser -k -TERM /var/lib/rpm/.rpm.lock', then re-run this script. Never SIGKILL a running rpm transaction."
+            return "$EX_LOCKED"
+        fi
+    fi
+
+    if ((${#STALE[@]} == 0)); then
+        log SUCCESS "No lock is held and there is nothing to clean up."
+        ((DO_CHECK)) && run_check
+        return "$EX_OK"
+    fi
+
+    log INFO "Plan: remove ${#STALE[@]} stale lock file(s)"
+    if ((DRY_RUN)); then
+        log INFO "Dry run: nothing will be changed."
+    else
+        if ! confirm "Proceed?"; then
+            log INFO "Declined. Nothing was changed."
+            return "$EX_NOCONFIRM"
+        fi
+        # The prompt above can sit unanswered for minutes, and the per-file
+        # re-check in safe_to_remove only looks at that file's lock records. An
+        # rpm transaction releases and re-takes its locks between stages, so a
+        # package manager that started while the operator was deciding can hold
+        # no lock at this instant and would otherwise slip straight through to
+        # the unlink. Re-run the whole assessment, process check included.
+        assess
+        if ((${#BUSY_REASONS[@]})); then
+            local late
+            log ERROR "A package manager started while this script was waiting. Nothing was changed."
+            for late in "${BUSY_REASONS[@]}"; do
+                printf '  %s\n' "$late" >&2
+            done
+            return "$EX_LOCKED"
+        fi
+        ((${#STALE[@]})) || {
+            log SUCCESS "The locks were released while this script was waiting; nothing left to clear."
+            ((DO_CHECK)) && run_check
+            return "$EX_OK"
+        }
+    fi
+
+    local rc="$EX_OK"
+    remove_stale_locks || rc="$EX_FAIL"
+    ((DO_CHECK)) && run_check
+
+    if ((DRY_RUN)); then
+        log INFO "Dry run finished; nothing was changed."
+    elif ((CHANGED)); then
+        log SUCCESS "Done."
+    fi
+    return "$rc"
+}
+
+main "$@"

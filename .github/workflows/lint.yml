@@ -1,0 +1,109 @@
+# Lint gate for every script in the repo.
+#
+# The whole repo currently reports ZERO findings from both linters. This
+# workflow exists so that stays true: any new finding fails the build.
+#
+# Linter versions are pinned deliberately. An unpinned linter that ships a new
+# check would fail a commit nobody wrote, which is exactly the silent
+# regression this gate is supposed to prevent. Bump these two values
+# intentionally, and fix whatever the new version finds in the same change.
+#
+# Actions are pinned by commit SHA for the same reason this repo tells you to
+# fetch update-lxcs.sh by SHA rather than by branch: a tag is a movable
+# pointer, a commit is content-addressed. The trailing comment records which
+# release the SHA belongs to; keep the two in step when bumping.
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Matches the version the scripts were developed and verified against.
+  SHELLCHECK_VERSION: "0.10.0"
+  PSSCRIPTANALYZER_VERSION: "1.25.0"
+
+jobs:
+  shellcheck:
+    name: shellcheck (.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The runner image ships its own shellcheck at an unpinned version, so
+      # install the pinned release rather than using whatever is preinstalled.
+      - name: Install shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --proto '=https' --tlsv1.2 "$url" -o /tmp/shellcheck.tar.xz
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # `bash -n` first: a syntax error makes the shellcheck output much harder
+      # to read, and these scripts are fetched over curl and piped into bash,
+      # where a parse error is a production failure rather than a lint nit.
+      - name: bash -n (syntax)
+        run: |
+          set -euo pipefail
+          find . -name '*.sh' -not -path './.git/*' -print0 |
+            xargs -0 -r -n1 -t bash -n
+
+      # No `|| true`, no `--severity` relaxation, no `-e` exclusions: shellcheck
+      # exits non-zero on any finding and that fails the job. Genuine false
+      # positives belong in the source as a targeted `# shellcheck disable=SCxxxx`
+      # with a comment explaining why -- never as a flag here.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          find . -name '*.sh' -not -path './.git/*' -print0 |
+            xargs -0 -r shellcheck -s bash
+
+  psscriptanalyzer:
+    name: PSScriptAnalyzer (.ps1)
+    runs-on: windows-latest
+    # Windows PowerShell 5.1, which is what the .ps1 scripts target and what
+    # they were verified against. `pwsh` (7.x) parses some constructs
+    # differently, so analysing under the target host keeps CI and local
+    # verification in agreement.
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install PSScriptAnalyzer ${{ env.PSSCRIPTANALYZER_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-Module PSScriptAnalyzer `
+            -RequiredVersion $env:PSSCRIPTANALYZER_VERSION `
+            -Scope CurrentUser -Force -SkipPublisherCheck
+          (Get-Module -ListAvailable PSScriptAnalyzer).Version
+
+      # Default rule set at Error, Warning and Information -- the same severity
+      # set the scripts were verified against. Findings are printed in full and
+      # then fail the job.
+      - name: PSScriptAnalyzer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION
+          $files = Get-ChildItem -Path . -Recurse -Filter *.ps1 -File |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' }
+          if (-not $files) { Write-Host 'No .ps1 files found.'; exit 0 }
+          $findings = @()
+          foreach ($f in $files) {
+            $findings += Invoke-ScriptAnalyzer -Path $f.FullName `
+              -Severity Error, Warning, Information
+          }
+          if ($findings.Count -gt 0) {
+            $findings | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message |
+              Out-String -Width 4096 | Write-Host
+            Write-Host "PSScriptAnalyzer: $($findings.Count) finding(s)."
+            exit 1
+          }
+          Write-Host "PSScriptAnalyzer: 0 findings across $($files.Count) file(s)."

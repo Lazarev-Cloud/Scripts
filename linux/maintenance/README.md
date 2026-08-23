@@ -1,373 +1,352 @@
-# Comprehensive Debian/Ubuntu Maintenance Script
+# Linux Maintenance Runner
 
-## Overview
+`maintenance.sh` runs named housekeeping tasks on Debian/Ubuntu and RHEL-family
+hosts: a health report, package updates, cache/log/tmp cleanup, and repair of an
+interrupted package operation.
 
-The **Comprehensive Debian/Ubuntu Maintenance Script** is a powerful, all-in-one tool designed to automate and simplify a wide range of system administration tasks on Debian and Ubuntu systems. Whether you're a seasoned system administrator or a casual user looking to maintain your system's health, this script offers a robust set of features to ensure your system remains secure, efficient, and up-to-date.
-
-## Features
-
-### **1. Log Management**
-- **Clean Old Logs**: Remove or truncate outdated log files to free up disk space.
-- **Configure Log Rotation**: Set up custom log rotation policies.
-- **Trigger Log Rotation**: Manually initiate log rotation.
-
-### **2. Package Management**
-- **Fix Broken APT Packages**: Resolve broken package dependencies.
-- **Clean Disk Space**: Remove unused packages and temporary files.
-- **System Update & Upgrade**: Update package lists and upgrade installed packages.
-- **Unattended Upgrades**: Enable and configure automatic security updates.
-
-### **3. APT Lock Management**
-- **Resolve APT Lock Issues**: Remove stale APT lock files and reconfigure packages.
-
-### **4. Backup and Restore**
-- **Create Backups**: Backup specified directories.
-- **Restore Backups**: Restore from existing backups.
-- **Verify Backup Integrity**: Ensure backups are valid and not corrupted.
-- **List Available Backups**: View all backups stored in `/var/backups/`.
-
-### **5. System Information and Resource Usage**
-- **Display System Information**: View detailed system specs.
-- **Show Resource Usage**: Monitor CPU, memory, disk usage, and disk I/O.
-
-### **6. Firewall Configuration**
-- **Configure UFW Firewall**: Enable and set up UFW with default rules.
-
-### **7. Security Scans**
-- **Run Security Scans**: Perform security audits using `rkhunter` and Lynis.
-
-### **8. User and Group Management**
-- **Add/Remove Users and Groups**: Manage system users and groups efficiently.
-
-### **9. Service Management**
-- **Manage System Services**: Start, stop, restart, enable, or disable services.
-
-### **10. Scheduling Tasks**
-- **Schedule Maintenance Tasks**: Use `cron` to automate routine tasks.
-- **List Scheduled Tasks**: View all scheduled maintenance tasks.
-
-### **11. Reboot System**
-- **Reboot Options**: Reboot immediately or after a specified delay.
-
-### **12. Kernel Management**
-- **List Installed Kernels**: View all installed kernel versions.
-- **Remove Old Kernels**: Clean up outdated kernels.
-- **Install Latest Kernel**: Upgrade to the latest available kernel.
-- **Set Default Kernel**: Configure GRUB to boot a specific kernel by default.
-
-### **13. Snap and Flatpak Package Management**
-- **Manage Snap Packages**: List, install, refresh, and remove Snap packages.
-- **Manage Flatpak Packages**: Install Flatpak, add repositories, and manage packages.
-
-### **14. Swap Space Management**
-- **Check Swap Usage**: Monitor current swap usage.
-- **Create/Remove Swap Files**: Manage swap space as needed.
-
-### **15. Time Synchronization Management**
-- **Check Time Sync Status**: Verify NTP synchronization.
-- **Enable/Disable NTP**: Control NTP settings.
-- **Set Timezone**: Configure system timezone.
-
-### **16. APT Repository Management**
-- **Add/Remove APT Repositories**: Manage additional package sources.
-- **List APT Repositories**: View all configured APT sources.
-
-### **17. System Health Monitoring**
-- **Check Uptime and Load**: Monitor system uptime and load averages.
-- **Check Disk Inode Usage**: Ensure sufficient inodes are available.
-- **Monitor Services**: Check the status of specific services.
-
-### **18. Filesystem Integrity Check**
-- **Run Filesystem Checks**: Schedule `fsck` operations.
-- **Schedule Regular Checks**: Automate filesystem integrity checks via cron.
-
-### **19. Docker Management**
-- **Install Docker**: Set up Docker on your system.
-- **Manage Docker Service**: Start, stop, enable, or disable Docker.
-- **List/Remove Docker Containers**: View and manage Docker containers.
-
-### **20. AppArmor Management**
-- **Check AppArmor Status**: Verify AppArmor security module status.
-- **Enable/Disable AppArmor**: Control AppArmor services.
-- **Reload AppArmor Profiles**: Update security profiles.
-- **Set AppArmor Profile Modes**: Switch profiles between enforce and complain modes.
-
-### **21. Localization and Timezone Settings**
-- **Set System Locale**: Configure system language settings.
-- **Generate Locales**: Create missing locale configurations.
-
-### **22. Essential Package Checks**
-- **Ensure Essential Packages**: Verify and install essential system packages.
-- **List Missing Packages**: Identify any missing critical packages.
-
-### **23. System Log Analysis**
-- **Search Logs**: Find specific keywords in system logs.
-- **Display Recent Logs**: View the latest log entries.
-
-### **24. Advanced Log Management**
-- **Compress Old Logs**: Reduce log file sizes by compressing them.
-- **Archive Logs**: Move logs to external storage destinations.
-- **Delete Archived Logs**: Remove old archived logs based on retention policies.
-
-### **25. Network Configuration Backup**
-- **Backup Network Settings**: Save current network configurations.
-- **Restore Network Settings**: Revert to previous network configurations from backups.
-
-### **26. Custom Script Execution**
-- **Execute Custom Scripts/Commands**: Run user-defined scripts or commands for additional customization.
-
-### **27. Container-Specific Update Function (ProxmoxVE)**
-- **Update ProxmoxVE Containers**: Modify `/usr/bin/update` scripts within ProxmoxVE containers.
-
-## Prerequisites
-
-- **Operating System**: Debian or Ubuntu-based distributions.
-- **Root Privileges**: The script must be run as root to perform system-level operations.
-- **Utilities**: Ensure the following utilities are installed:
-  - `mail` (for email notifications)
-  - `deborphan` (for package management)
-  - `iostat` (part of `sysstat` for disk I/O monitoring)
+Nothing happens unless you name a task. With no task it prints a read-only
+report. Every task that changes the system can be previewed with `--dry-run`,
+prints its blast radius before acting, and refuses to run unattended without
+`--yes`.
 
 ```bash
-sudo apt update
-sudo apt install -y mailutils deborphan sysstat
+./maintenance.sh                              # health report, changes nothing
+./maintenance.sh --dry-run clean-logs         # exactly which files would go
+sudo ./maintenance.sh --yes routine           # unattended nightly run
 ```
 
-- **Internet Connectivity**: Required for package installations and updates.
+## Requirements
 
-## Installation
+Runs as root for anything except `report`. Needs `bash` 4.4 or newer, plus
+`find` and `df` from coreutils/findutils. An older `bash` exits `3`.
 
-1. **Clone the Repository**
+`flock` (util-linux) is required for any run that changes the system: without
+it there is no concurrency protection, and running a package transaction
+alongside another one is the collision this script exists to avoid, so it exits
+`3` rather than proceeding unlocked. `report` and `--dry-run` never take the
+lock and run fine without it.
 
-   ```bash
-   git clone https://github.com/yourusername/maintenance-script.git
-   ```
+`timeout` (coreutils) is strongly recommended — without it the script warns and
+runs commands unbounded. `apt-get`, `dnf`/`yum`, `journalctl`,
+`systemd-tmpfiles`, `fuser`/`lsof` are used when present and skipped when not.
 
-2. **Navigate to the Script Directory**
+## Tasks
 
-   ```bash
-   cd maintenance-script
-   ```
+| Task | Changes the system | What it does | Blast radius |
+| --- | --- | --- | --- |
+| `report` | no | Health summary (see below). | None. The only task that runs without root. |
+| `update` | yes | Refreshes the index, then upgrades. | Installs new package versions; packaging scripts may restart services. |
+| `autoremove` | yes | Removes packages nothing needs any more. | **Purges packages and their config**, old kernels included. |
+| `clean-cache` | yes | Deletes downloaded package archives. | Cache only; all of it is re-downloadable. |
+| `clean-logs` | yes | Vacuums the journal, deletes aged rotated logs. | **Deletes log history permanently.** |
+| `clean-tmp` | yes | Cleans temporary files. | **Deletes files.** In `age` mode, in `--tmp-dirs`. In `tmpfiles` mode — the default under systemd — everywhere the distribution's `tmpfiles.d` policy covers, which is wider. |
+| `fix-packages` | yes | `dpkg --configure -a`, then `apt-get -f install`. | Completes half-finished package operations. Debian/Ubuntu only. |
+| `fix-locks` | no* | Diagnoses package-manager locks. | Read-only on Debian/Ubuntu. On RHEL it may delete a dnf pid file whose process is provably gone, and asks first. |
+| `routine` | yes | Group: `update`, `autoremove`, `clean-cache`, `report`. | The union of its members. |
 
-3. **Make the Script Executable**
+\* `fix-locks` still requires root: an unprivileged `fuser` cannot see file
+handles held by other users, so it would report "nothing holds the lock" while
+root's `dpkg` holds it. Rather than guess, it refuses.
 
-   ```bash
-   chmod +x maintenance.sh
-   ```
+Tasks run in the order given and each name runs once, so `routine report` runs
+the report a single time, at the end.
 
-4. **Ensure Necessary Directories and Permissions**
+### `report`
 
-   - **Backup Directory**
+Read-only. Covers the host and OS, uptime and load, memory and swap,
+filesystems and inodes at or above the warning thresholds, `/boot` usage,
+installed kernel packages versus the running one, pending updates and held
+packages, whether a reboot is pending, failed systemd units, config files the
+packaging left behind (`.dpkg-dist`, `.dpkg-new`, `.ucf-dist`, `.rpmnew`,
+`.rpmsave`), journal size, and whether any package-manager lock is held.
 
-     ```bash
-     sudo mkdir -p /var/backups/
-     sudo chmod 700 /var/backups/
-     ```
+A pending reboot is reported in the `Reboot` section and repeated as a warning
+in the run summary. It is not an exit code: the repo-wide table reserves every
+code it defines, and a reboot is not one of those situations. A monitoring
+wrapper should read `/run/reboot-required` or the report output.
 
-   - **Log File Permissions**
+Under `--quiet` the report body goes to the log file instead of stdout — this is
+what keeps `--yes --quiet routine` silent in cron even though `routine` ends
+with a report. The report is still generated, so a pending reboot is still
+recorded where an unattended run can be audited afterwards. If the log file is
+not writable there is nowhere to put it and `--quiet report` produces nothing.
 
-     ```bash
-     sudo touch /var/log/maintenance_script.log
-     sudo chmod 600 /var/log/maintenance_script.log
-     ```
+### `clean-logs`
 
-5. **Configure Log Rotation (Optional but Recommended)**
+Two independent steps:
 
-   ```bash
-   sudo nano /etc/logrotate.d/maintenance_script
-   ```
+- `journalctl --vacuum-size` and `--vacuum-time`, when journald is present.
+- Deleting already-rotated files under `--log-dir` older than `--log-age` days:
+  `*.gz`, `*.xz`, `*.bz2`, `*.zst`, `*.old`, and one- or two-digit numeric
+  suffixes such as `syslog.1`.
 
-   Paste the following configuration:
+Live `*.log` files are never touched. Truncating a file a daemon holds open is
+how "free some space" becomes "the service stopped logging". Names matching
+`--log-exclude` (default `audit wtmp btmp lastlog`) are skipped, so the audit
+trail and the login records survive; on a host with a compliance obligation,
+deleting those is an incident, not housekeeping.
 
-   ```plaintext
-   /var/log/maintenance_script.log {
-       weekly
-       rotate 4
-       compress
-       missingok
-       notifempty
-       create 600 root root
-   }
-   ```
+`logrotate`'s own `rotate` and `maxage` settings are the better place to express
+retention. This task is for a filesystem that is already full.
 
-   Save and exit (`Ctrl + O`, `Enter`, then `Ctrl + X`).
+### `clean-tmp`
 
-## Usage
+Two modes, and **they do not have the same blast radius.** `auto` picks
+`tmpfiles` wherever systemd is running and `age` otherwise. Which one applies is
+resolved before the plan is printed, so the plan line you confirm names the
+behaviour you are actually getting. Force either with `--tmp-mode tmpfiles` or
+`--tmp-mode age`.
 
-### **1. Interactive Mode**
+**`tmpfiles` mode** defers to `systemd-tmpfiles --clean`, which follows the
+distribution's own `tmpfiles.d` policy — that policy already encodes which paths
+are safe to remove, after how long, and which sockets must survive. The cost of
+delegating is that the policy is **wider than `--tmp-dirs`**: it can clean paths
+you did not name, and neither `--tmp-dirs` nor `--tmp-age` applies. List the
+rules that will be used with `systemd-tmpfiles --cat-config`.
 
-Simply run the script without any arguments to access the interactive menu:
+`--dry-run` in this mode runs `systemd-tmpfiles --clean --dry-run` and shows you
+the real file list. That option arrived in systemd 249, so support is probed
+rather than assumed; on an older systemd (Debian 11 ships 247) the dry run says
+it cannot preview and changes nothing, rather than guessing. Use `--tmp-mode age`
+there if you need a previewable sweep.
+
+A preview is a query, not work: if `systemd-tmpfiles --clean --dry-run` exits
+non-zero — which an unprivileged preview will, since it cannot stat everything
+the policy covers — the status is reported as a warning and the task still
+counts as succeeded. Every task's `--dry-run` returns `0`.
+
+**`age` mode** deletes regular files under `--tmp-dirs` whose **atime and mtime
+are both** older than `--tmp-age` days, then removes directories left empty.
+Directories are never deleted for being old, only for being empty, so an old
+directory holding fresh files survives. Sockets and symlinks are left alone, as
+are names matching `--tmp-exclude`.
+
+### `fix-locks`
+
+Reports which process holds each package-manager lock, and never kills it.
+
+It does not delete `/var/lib/dpkg/lock`, `lock-frontend`, or the apt locks.
+Those are `flock(2)` targets: the kernel releases the lock when the holding
+process exits, including on `kill -9`, so they cannot go stale. A leftover
+zero-byte file blocks nothing. Deleting one while a holder is alive is what lets
+a second `dpkg` run concurrently against the same database — that is the actual
+cause of the corruption people are usually trying to fix.
+
+If the holder cannot be determined — no `fuser`, no `lsof`, or not root — it
+refuses rather than assuming the lock is free.
+
+The genuine fix for a busy lock is to wait, which `--pkg-lock-wait` does for you
+on every apt transaction this script runs.
+
+## Options
+
+Every option has an environment variable, which is easier when piping the script
+in from the network. Every variable is named `LZC_MAINTENANCE_*`, matching the
+repo-wide namespace, so `env | grep LZC_` shows everything that is configurable.
+
+| Flag | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `-n, --dry-run` | `LZC_MAINTENANCE_DRY_RUN` | off | Print what would happen; change nothing. |
+| `-y, --yes` | `LZC_MAINTENANCE_YES` | off | Skip the confirmation. Required by cron. |
+| `-q, --quiet` | `LZC_MAINTENANCE_QUIET` | off | Silent on success; output only on failure. |
+| `--list-tasks` | — | — | Print task names and exit. |
+| `--upgrade-mode MODE` | `LZC_MAINTENANCE_UPGRADE_MODE` | `upgrade` | `upgrade` or `dist-upgrade`. |
+| `--timeout SECONDS` | `LZC_MAINTENANCE_TIMEOUT` | `3600` | Bounds **each system-changing command** individually: one apt/dnf transaction, one journal vacuum, one `systemd-tmpfiles` run. Not a budget for the whole run. Minimum `1`. |
+| `--probe-timeout SEC` | `LZC_MAINTENANCE_PROBE_TIMEOUT` | `30` | Bounds **each read-only probe** individually: `df`, `dpkg-query`, `rpm`, `systemctl`, `journalctl --disk-usage`, `fuser`/`lsof`, and the simulated upgrade the report counts. Minimum `1`. |
+| `--pkg-lock-wait SEC` | `LZC_MAINTENANCE_PKG_LOCK_WAIT` | `600` | How long apt waits for the dpkg lock to be released before giving up (`DPkg::Lock::Timeout`). Not a `timeout(1)` bound; `0` means do not wait. |
+| `--disk-warn PCT` | `LZC_MAINTENANCE_DISK_WARN` | `85` | Filesystem usage worth reporting (0–100). |
+| `--inode-warn PCT` | `LZC_MAINTENANCE_INODE_WARN` | `85` | Inode usage worth reporting (0–100). |
+| `--log-dir PATH` | `LZC_MAINTENANCE_LOG_DIR` | `/var/log` | Directory `clean-logs` sweeps. |
+| `--log-age DAYS` | `LZC_MAINTENANCE_LOG_AGE_DAYS` | `30` | Age of rotated logs to delete. |
+| `--log-exclude LIST` | `LZC_MAINTENANCE_LOG_EXCLUDE` | `audit wtmp btmp lastlog` | Names `clean-logs` must not touch. |
+| `--journal-size SIZE` | `LZC_MAINTENANCE_JOURNAL_SIZE` | `500M` | `journalctl --vacuum-size`. |
+| `--journal-age TIME` | `LZC_MAINTENANCE_JOURNAL_AGE` | `30d` | `journalctl --vacuum-time`. |
+| `--tmp-dirs LIST` | `LZC_MAINTENANCE_TMP_DIRS` | `/tmp /var/tmp` | Directories `clean-tmp` cleans. |
+| `--tmp-age DAYS` | `LZC_MAINTENANCE_TMP_AGE_DAYS` | `10` | Age threshold, `age` mode only. |
+| `--tmp-mode MODE` | `LZC_MAINTENANCE_TMP_MODE` | `auto` | `auto`, `tmpfiles`, or `age`. |
+| `--tmp-exclude LIST` | `LZC_MAINTENANCE_TMP_EXCLUDE` | X11/ICE sockets, `systemd-private*` | Names `clean-tmp` must not touch. |
+| `--needrestart-mode M` | `LZC_MAINTENANCE_NEEDRESTART_MODE` | `l` | After an update, what to do about services still running old libraries: `l` lists them, `a` **restarts** them, `i` asks. |
+| `--log-file PATH` | `LZC_MAINTENANCE_LOG` | `/var/log/maintenance.log` | This script's own log. |
+| `--lock-file PATH` | `LZC_MAINTENANCE_LOCK` | `/run/lock/lzc-maintenance.lock` | Concurrency lock. |
+| `--color WHEN` | `LZC_MAINTENANCE_COLOR` | `auto` | `auto`, `always`, `never`. |
+| `-V, --version` | — | — | Print version and exit. |
+| `-h, --help` | — | — | Print help and exit. |
+
+Environment-only settings:
+`LZC_MAINTENANCE_FS_EXCLUDE` (default `tmpfs devtmpfs squashfs overlay efivarfs`),
+`LZC_MAINTENANCE_ETC_DIR` (default `/etc`), `LZC_MAINTENANCE_LOG_MAX_BYTES`
+(default `5242880`), `LZC_MAINTENANCE_PATH`
+(default `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`).
+
+### Values
+
+The three boolean variables — `LZC_MAINTENANCE_DRY_RUN`, `LZC_MAINTENANCE_YES`,
+`LZC_MAINTENANCE_QUIET` — accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
+in any case. Anything else is a usage error (exit `2`) with a message naming the
+setting, rather than a silently wrong default.
+
+Numeric values are validated and read as decimal, so a zero-padded `08` means
+eight, not an invalid octal literal. `--timeout` and `--probe-timeout` have a
+minimum of `1`: `timeout 0` means *no* limit, so accepting `0` would silently
+remove the protection the option exists to provide.
+
+`--log-dir` and every entry in `--tmp-dirs` is a **sweep root**: files beneath it
+are deleted, as root. A typo there is not recoverable, so each is required to be
+an absolute path, with no `.` or `..` component, that is not `/` and not a
+top-level system directory such as `/usr` or `/var`. `/tmp` is allowed — it is
+the one top-level directory whose contents are disposable by definition, and it
+is a default. Anything rejected exits `2` naming the value; name the directory
+inside it that you meant.
+
+### Colour
+
+`NO_COLOR` is honoured per [no-color.org](https://no-color.org): any non-empty
+value disables colour. An explicit `--color always` still wins, because a flag
+is a deliberate answer to the question the variable answers by default.
+Otherwise colour is emitted only when stdout is a terminal.
+
+Normal output goes to stdout and diagnostics to stderr, so
+`maintenance.sh report > report.txt` still shows you the warnings.
+
+## Exit status
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. Every task that applied to this host succeeded. |
+| 1 | The work ran but something in it failed. |
+| 2 | Usage error: unknown flag, unknown task, missing or invalid argument value. |
+| 3 | Unsupported platform or a missing prerequisite tool: `bash` older than 4.4, no `flock` for a run that changes the system, or an unusable lock file. |
+| 4 | Must be run as root. |
+| 5 | Refused: confirmation needed, but no TTY and `--yes` was not given. |
+| 75 | Temporary failure: another instance holds the lock (`EX_TEMPFAIL`, so cron and systemd treat it as "retry later" rather than a real fault). |
+| 130 | Interrupted (`SIGINT`/`SIGTERM`). |
+
+A failing task never stops the ones after it — the run finishes, then reports.
+
+A pending reboot is a warning in the summary, not an exit code. A task that does
+not apply to this host (`fix-packages` on RHEL, any package task with no package
+manager present) is reported as skipped and does not fail the run.
+
+Code 75 is not a fault as far as a scheduler is concerned. Say so, or you will
+train people to ignore the mail.
+
+## Scheduling
+
+### systemd timer
+
+```ini
+# /etc/systemd/system/maintenance.service
+[Unit]
+Description=Nightly system maintenance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/maintenance.sh --yes --quiet routine
+TimeoutStartSec=2h
+SuccessExitStatus=0 75
+Nice=10
+IOSchedulingClass=idle
+```
+
+```ini
+# /etc/systemd/system/maintenance.timer
+[Unit]
+Description=Nightly system maintenance
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+```
+
+`Persistent=true` catches up a run missed while the machine was off.
+`RandomizedDelaySec=` stops a fleet hitting the mirror in lockstep.
+
+`SuccessExitStatus=` lists `75` and nothing else. `75` means another instance
+already holds the lock, which is genuinely not a fault. Do **not** add `3` to
+that list: `3` means a prerequisite is missing — no `flock`, for instance — and a
+host in that state runs no maintenance at all while its unit stays green.
+
+### cron
+
+```
+# /etc/cron.d/maintenance — 03:20 daily
+20 3 * * * root /usr/local/sbin/maintenance.sh --yes --quiet routine
+```
+
+`--quiet` is what makes this cron-friendly: output only appears when something
+failed, so mail means something. The script sets its own `PATH` and never
+prompts, so it needs nothing from the crontab environment.
+
+Concurrent runs are refused via `flock` on `/run/lock/lzc-maintenance.lock`
+(exit 75). The lock is only taken when a task will actually change something, so
+a `report` is never blocked by an update already in progress. The script's own
+log rotates once past `LZC_MAINTENANCE_LOG_MAX_BYTES`.
+
+## Running from the network
+
+Fetch, verify, then run. Pin to a **commit SHA** and check the hash before
+executing.
 
 ```bash
-sudo ./maintenance.sh
+REV=<40-char-commit-sha>
+SUM=<sha256-of-that-file>
+URL=https://raw.githubusercontent.com/Lazarev-Cloud/Scripts/$REV/linux/maintenance/maintenance.sh
+
+curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/maintenance.sh "$URL" \
+  && echo "$SUM  /tmp/maintenance.sh" | sha256sum -c - \
+  && sudo bash /tmp/maintenance.sh --yes routine
 ```
 
-Navigate through the menu by entering the corresponding number for each task.
+Produce the two values from a checkout with `git rev-parse HEAD` and
+`sha256sum linux/maintenance/maintenance.sh`.
 
-### **2. Command-Line Options**
+A branch name is not a pin — it means "whatever was pushed most recently",
+executed as root. A tag is not a pin either, because a tag can be moved. A
+commit SHA is content-addressed.
 
-Execute specific tasks directly via command-line arguments. This is useful for scripting or performing multiple tasks at once.
-
-**General Syntax:**
+`main "$@"` is the last line of the script and everything above it is a
+definition, so a truncated download fails to parse and runs nothing rather than
+executing half a cleanup. Environment variables are the easier way to pass
+settings through a pipe, since `bash -c "$script" arg` assigns the first
+argument to `$0`:
 
 ```bash
-sudo ./maintenance.sh [options]
+LZC_MAINTENANCE_YES=1 LZC_MAINTENANCE_QUIET=1 bash -c "$s" -- routine
 ```
 
-**Examples:**
+## Notes and limits
 
-- **Clean Logs and Fix APT Packages**
-
-  ```bash
-  sudo ./maintenance.sh --clean-logs --fix-apt-packages
-  ```
-
-- **Create a Backup and Send Notification**
-
-  ```bash
-  sudo ./maintenance.sh --backup /home/user/data --send-notification admin@example.com
-  ```
-
-- **Manage a Specific Service**
-
-  ```bash
-  sudo ./maintenance.sh --manage-service restart apache2
-  ```
-
-### **3. Help Menu**
-
-Display all available options and their descriptions:
-
-```bash
-sudo ./maintenance.sh --help
-```
-
-## Configuration
-
-### **Email Notifications**
-
-To enable email notifications after completing tasks:
-
-1. **Install Mail Utilities**
-
-   ```bash
-   sudo apt install -y mailutils
-   ```
-
-2. **Configure SMTP Settings**
-
-   Ensure that your system's mail transfer agent (MTA) is configured correctly to send emails.
-
-3. **Use the `--send-notification` Option**
-
-   Specify the email address where notifications should be sent:
-
-   ```bash
-   sudo ./maintenance.sh --send-notification admin@example.com
-   ```
-
-### **Log Rotation**
-
-The script automatically configures log rotation for its own log file. Ensure that log rotation is set up correctly to prevent log files from growing indefinitely.
-
-### **Scheduling Tasks**
-
-Use the interactive menu or `--schedule-task` option to automate routine maintenance tasks via `cron`.
-
-**Example: Schedule Daily Log Cleaning at 2 AM**
-
-```bash
-sudo ./maintenance.sh --schedule-task "--clean-logs" "0 2 * * *"
-```
-
-## Security and Best Practices
-
-- **Run as Root**: Ensure you run the script with root privileges to execute system-level tasks.
-
-- **Backup Before Major Changes**: Always create backups before performing significant system modifications.
-
-- **Secure the Script**: Limit execution permissions to authorized users to prevent unauthorized system changes.
-
-- **Test in Controlled Environments**: Before deploying on production systems, test the script in virtual machines or staging environments.
-
-- **Regular Updates**: Keep the script updated to incorporate new features and security patches.
-
-- **Input Validation**: The script includes basic input validation. For enhanced security, consider adding more robust validation mechanisms.
-
-## Extensibility and Customization
-
-The script is designed to be modular and extensible. You can easily add new features or modify existing ones by editing the script or adding new modules.
-
-**Example: Adding a New Feature**
-
-1. **Define the Function**
-
-   ```bash
-   new_feature() {
-       # Your code here
-   }
-   ```
-
-2. **Add to Interactive Menu**
-
-   ```bash
-   interactive_menu() {
-       # ... existing options ...
-       echo "84) New Feature Description"
-       # ... existing options ...
-   }
-   
-   # Add the case for the new option
-   case "$option" in
-       # ... existing cases ...
-       84) new_feature ;;
-       # ... existing cases ...
-   esac
-   ```
-
-3. **Add to Command-Line Parsing**
-
-   ```bash
-   case "$1" in
-       # ... existing options ...
-       --new-feature)
-           new_feature
-           shift
-           ;;
-       # ... existing options ...
-   esac
-   ```
-
-## Contribution
-
-Contributions are welcome! Feel free to submit issues or pull requests to enhance the script's functionality.
-
-1. **Fork the Repository**
-
-2. **Create a New Branch**
-
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-3. **Commit Your Changes**
-
-   ```bash
-   git commit -m "Add your feature description"
-   ```
-
-4. **Push to the Branch**
-
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-5. **Submit a Pull Request**
-
-## License
-
-This project is licensed under the [MIT License](https://github.com/yourusername/maintenance-script/raw/main/LICENSE).
-
----
-
-**Disclaimer**: Use this script at your own risk. Always ensure you have proper backups before performing system-level operations.
+- Package transactions are given a generous timeout rather than a short one,
+  because killing `dpkg` mid-transaction is itself a way to break a system. If
+  the timeout does fire, run `fix-packages` to replay the dpkg journal. The bound
+  cannot be switched off — `--timeout 0` is rejected, because `timeout 0` means
+  *no* limit and accepting it would silently remove the protection. Raise it
+  instead (`--timeout 86400`).
+- `update` defaults to `upgrade`, which never removes a package. `dist-upgrade`
+  can remove packages to satisfy dependencies; ask for it deliberately.
+- Service restarts are listed, not performed. Pass `--needrestart-mode a` (or
+  `LZC_MAINTENANCE_NEEDRESTART_MODE=a`) if a maintenance window means restarting
+  services still running old libraries is fine.
+- Config changes shipped by packages are not applied: apt runs with
+  `--force-confdef --force-confold`, so your edited files stay. `report` lists
+  the `.dpkg-dist`/`.rpmnew` files this leaves behind — reconcile them yourself.
+- Old kernels are removed by `autoremove`, which is the packaging system's own
+  mechanism for it. There is no bespoke kernel purge here: getting it wrong
+  makes a host unbootable, and on Proxmox `/boot` is additionally governed by
+  `proxmox-boot-tool`. On RHEL, kernel retention is `installonly_limit` in
+  `/etc/dnf/dnf.conf`.
+- SIGHUP is ignored, so losing an SSH connection mid-run does not kill `dpkg`.
+  For a long run, prefer `systemd-run --unit=maint --collect
+  /usr/local/sbin/maintenance.sh --yes routine` and follow it with `journalctl`.
+- This is a maintenance tool. It does not create users, install Docker, add
+  repositories, configure firewalls, set locales, create swap, take backups, or
+  execute arbitrary commands. Those are provisioning decisions and belong to
+  configuration management.
+- If two patching mechanisms run unmanaged on the same host they will fight over
+  the lock. Pick one: this script, or `unattended-upgrades`/`dnf-automatic`.

@@ -1,0 +1,30 @@
+# Python dependencies for prometheus_unified_metrics.py.
+#
+# Install into a virtualenv, never into the system interpreter: Debian 13 /
+# Proxmox VE 9 ship PEP 668's EXTERNALLY-MANAGED marker, and
+# --break-system-packages can leave apt unable to reconcile python3-* packages
+# on the hypervisor itself.
+#
+#   python3 -m venv /opt/prometheus-unified-exporter/venv
+#   /opt/prometheus-unified-exporter/venv/bin/pip install --no-cache-dir \
+#       -r requirements.txt
+#
+# Distro packages are an equally valid alternative when you would rather have
+# unattended-upgrades patch them:
+#   apt-get install python3-prometheus-client python3-psutil
+
+# Required. Without it the exporter refuses to start (exit 3).
+prometheus-client==0.26.0
+
+# Optional. Without it the `host` and `sensors` collectors report
+# hostwatch_collector_up 0 and the rest of the exporter still works.
+psutil==7.2.2
+
+# Optional, and only useful on a host with an NVIDIA GPU. Without it the `gpu`
+# collector falls back to parsing `nvidia-smi`, and without that too it reports
+# hostwatch_collector_up 0. Uncomment to use the in-process NVML path, and pick
+# the release matching your installed driver branch (13.610.43 was the latest
+# when this was written). Prefer this over the older `pynvml` distribution,
+# which is deprecated in favour of nvidia-ml-py; both provide the same
+# importable `pynvml` module, which is what the exporter looks for.
+# nvidia-ml-py==13.610.43

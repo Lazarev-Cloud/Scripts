@@ -1,551 +1,1120 @@
 #!/usr/bin/env bash
-
-# Enhanced Proxmox VE LXC Container Updater
-# Author: Enhanced version based on tteck's original script
+#
+# Proxmox VE LXC container updater.
+#
+# Updates every LXC container on this node one at a time, records per-container
+# failures, and reports a summary. Runs interactively or fully unattended.
+#
 # License: MIT
-# Version: 2.0
+# Origin:  https://github.com/Lazarev-Cloud/Scripts
+#
+# Error model: this script deliberately does NOT use `set -e`. Its whole job is
+# to keep going when an individual container fails, so every fallible operation
+# is checked explicitly and routed into FAILED[]. Do not add `set -e` and do not
+# call this script as `update-lxcs.sh || true` -- both make the error handling
+# non-local and reintroduce the bugs this rewrite removed.
+set -uo pipefail
 
-# Exit on any error, undefined variables, or pipe failures
-set -eEuo pipefail
+readonly SCRIPT_NAME='Proxmox VE LXC Updater'
+readonly SCRIPT_VERSION='3.0'
 
-# Configuration
-readonly SCRIPT_NAME="Proxmox VE LXC Updater"
-readonly SCRIPT_VERSION="2.0"
-readonly LOG_FILE="/var/log/lxc-updater.log"
-readonly MAX_CONTAINER_WAIT=30
-readonly SHUTDOWN_WAIT=10
+# Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
+# sysexits.h, which cron and systemd read as "retry later" rather than a fault.
+readonly EX_FAIL=1 EX_USAGE=2 EX_PREREQ=3 EX_NOROOT=4
+readonly EX_NOCONFIRM=5 EX_LOCKED=75 EX_INTERRUPT=130
 
-# Color codes
-readonly YW='\033[33m'    # Yellow
-readonly BL='\033[36m'    # Blue
-readonly RD='\033[01;31m' # Red
-readonly GN='\033[1;92m'  # Green
-readonly CL='\033[m'      # Clear
+# --- Tunables (env overridable, then flag overridable) -----------------------
+LOG_FILE="${LZC_UPDATE_LXCS_LOG:-/var/log/lxc-updater.log}"
+LOG_MAX_BYTES="${LZC_UPDATE_LXCS_LOG_MAX_BYTES:-5242880}"
+LOCK_FILE="${LZC_UPDATE_LXCS_LOCK:-/run/lock/lxc-updater.lock}"
+START_TIMEOUT="${LZC_UPDATE_LXCS_START_TIMEOUT:-60}"
+READY_PROBE_TIMEOUT="${LZC_UPDATE_LXCS_READY_PROBE_TIMEOUT:-5}"
+READY_POLL_INTERVAL="${LZC_UPDATE_LXCS_READY_POLL_INTERVAL:-2}"
+SHUTDOWN_TIMEOUT="${LZC_UPDATE_LXCS_SHUTDOWN_TIMEOUT:-60}"
+UPDATE_TIMEOUT="${LZC_UPDATE_LXCS_UPDATE_TIMEOUT:-1800}"
+PROBE_TIMEOUT="${LZC_UPDATE_LXCS_PROBE_TIMEOUT:-20}"
+RETRIES="${LZC_UPDATE_LXCS_RETRIES:-2}"
+RETRY_DELAY="${LZC_UPDATE_LXCS_RETRY_DELAY:-10}"
+EXCLUDE_SPEC="${LZC_UPDATE_LXCS_EXCLUDE:-}"
+INCLUDE_SPEC="${LZC_UPDATE_LXCS_INCLUDE:-}"
+ASSUME_YES="${LZC_UPDATE_LXCS_YES:-0}"
+SKIP_STOPPED="${LZC_UPDATE_LXCS_SKIP_STOPPED:-0}"
+CLUSTER_MODE="${LZC_UPDATE_LXCS_CLUSTER:-0}"
+NODES_SPEC="${LZC_UPDATE_LXCS_NODES:-}"
+SSH_USER="${LZC_UPDATE_LXCS_SSH_USER:-root}"
+SSH_TIMEOUT="${LZC_UPDATE_LXCS_SSH_TIMEOUT:-15}"
+SSH_EXTRA_OPTS="${LZC_UPDATE_LXCS_SSH_OPTS:-}"
+DRY_RUN=0
+USE_COLOR=auto
 
-# Global arrays
-declare -a EXCLUDED_CONTAINERS=()
-declare -a CONTAINERS_NEEDING_REBOOT=()
-declare -a FAILED_UPDATES=()
+# Consumed by lib/lzc-obs.sh when it is available. Declared here so --logs-url
+# and --metrics-url have something to assign to even when the library is not.
+LZC_LOGS_URL="${LZC_LOGS_URL:-}"
+LZC_METRICS_URL="${LZC_METRICS_URL:-}"
 
-# Logging function
+# --- Runtime state -----------------------------------------------------------
+declare -a EXCLUDED=()
+declare -a INCLUDED=()
+declare -a STARTED_BY_US=()
+declare -a FAILED=()
+declare -a NEEDS_REBOOT=()
+declare -a NODES_OK=()
+declare -a NODES_FAILED=()
+SELF_PATH=''
+OBS_LIB_PATH=''
+COUNT_TOTAL=0
+COUNT_UPDATED=0
+COUNT_TEMPLATE=0
+COUNT_EXCLUDED=0
+LOG_READY=0
+LOG_SINK=/dev/null
+LOCK_HELD=0
+YW='' BL='' RD='' GN='' CL=''
+
+# --- Observability -----------------------------------------------------------
+#
+# Remote log and metric shipping lives in lib/lzc-obs.sh and is entirely
+# optional. These no-op stubs are what runs when that library is not present, so
+# every obs_* call below is safe unconditionally. _load_obs replaces them with
+# the real implementations when it finds the library.
+
+# Guarded: a cluster run prepends the real library to the payload it sends to
+# each node, and these definitions come later in that stream. Without the guard
+# they would silently replace the real implementations on every remote node.
+if [[ -z ${_LZC_OBS_LOADED:-} ]]; then
+    obs_init() { :; }
+    obs_log() { :; }
+    obs_metric() { :; }
+    obs_finish() { :; }
+    obs_cleanup() { :; }
+    obs_enabled() { return 1; }
+fi
+
+_load_obs() {
+    # Already present when a cluster run shipped the functions over SSH.
+    if [[ -z ${_LZC_OBS_LOADED:-} ]]; then
+        local candidate lib=''
+        local -a search=()
+
+        [[ -n ${LZC_LIB:-} ]] && search+=("$LZC_LIB")
+        if [[ -n $SELF_PATH ]]; then
+            local self_dir
+            self_dir=$(dirname "$SELF_PATH")
+            # A checkout, then an install of any prefix: installed as
+            # <prefix>/sbin/<name>, the library sits at <prefix>/lib/lzc/.
+            search+=("$self_dir/../../../lib/lzc-obs.sh"
+                "$self_dir/../lib/lzc/lzc-obs.sh")
+        fi
+        search+=(/usr/local/lib/lzc/lzc-obs.sh /usr/lib/lzc/lzc-obs.sh)
+
+        for candidate in "${search[@]}"; do
+            if [[ -r $candidate ]]; then
+                lib=$candidate
+                break
+            fi
+        done
+
+        if [[ -n $lib ]]; then
+            # shellcheck source=/dev/null
+            . "$lib" || return 0
+            OBS_LIB_PATH=$lib
+        fi
+    fi
+
+    # A no-op when nothing was loaded, so this is safe unconditionally.
+    obs_init "$(basename "${SELF_PATH:-update-lxcs}" .sh)"
+}
+
+# --- Output ------------------------------------------------------------------
+
+setup_color() {
+    # NO_COLOR is honoured per no-color.org: any non-empty value disables colour.
+    if [[ $USE_COLOR == never ]] ||
+        { [[ $USE_COLOR == auto ]] && { [[ -n ${NO_COLOR:-} ]] || [[ ! -t 1 ]]; }; }; then
+        return
+    fi
+    YW=$'\033[33m' BL=$'\033[36m' RD=$'\033[01;31m' GN=$'\033[1;92m' CL=$'\033[m'
+}
+
 log() {
-    local level="$1"
+    local level=$1
     shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
-    
-    case "$level" in
-        "ERROR") echo -e "${RD}[Error]${CL} $message" ;;
-        "WARN")  echo -e "${YW}[Warning]${CL} $message" ;;
-        "INFO")  echo -e "${BL}[Info]${CL} $message" ;;
-        "SUCCESS") echo -e "${GN}[Success]${CL} $message" ;;
-        *) echo "$message" ;;
+    local msg=$*
+
+    if ((LOG_READY)); then
+        printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg" >>"$LOG_FILE"
+    fi
+
+    case $level in
+        ERROR) printf '%s[Error]%s %s\n' "$RD" "$CL" "$msg" >&2 ;;
+        WARN) printf '%s[Warning]%s %s\n' "$YW" "$CL" "$msg" >&2 ;;
+        INFO) printf '%s[Info]%s %s\n' "$BL" "$CL" "$msg" ;;
+        SUCCESS) printf '%s[OK]%s %s\n' "$GN" "$CL" "$msg" ;;
+        *) printf '%s\n' "$msg" ;;
     esac
+
+    obs_log "$level" "$msg"
 }
 
-# Display header
-header_info() {
-    clear
-    cat << 'EOF'
-   __  __          __      __          __   _  ________
-  / / / /___  ____/ /___ _/ /____     / /  | |/ / ____/
- / / / / __ \/ __  / __ `/ __/ _ \   / /   |   / /
-/ /_/ / /_/ / /_/ / /_/ / /_/  __/  / /___/   / /___
-\____/ .___/\__,_/\__,_/\__/\___/  /_____/_/|_\____/
-    /_/
+die() {
+    local code=$1
+    shift
+    log ERROR "$*"
+    exit "$code"
+}
 
+banner() {
+    [[ -t 1 ]] || return 0
+    printf '%s%s v%s%s\n\n' "$GN" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$CL"
+}
+
+usage() {
+    cat <<EOF
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Updates the packages of every LXC container on this Proxmox VE node.
+
+Usage:
+  update-lxcs.sh [options]
+
+Options:
+  -y, --yes                 Run unattended; skip all prompts (required for cron).
+  -n, --dry-run             Report what would be done; change nothing.
+  -e, --exclude IDS         Comma-separated CT IDs to skip. Repeatable.
+  -i, --include IDS         Comma-separated CT IDs to update exclusively. Repeatable.
+      --skip-stopped        Leave stopped containers alone (default: start,
+                            update, then return them to stopped).
+      --timeout SECONDS     Per-container update timeout (default: $UPDATE_TIMEOUT).
+      --retries N           Update attempts per container (default: $RETRIES).
+      --log-file PATH       Log file (default: $LOG_FILE).
+      --color WHEN          auto | always | never (default: auto).
+  -V, --version             Print version and exit.
+  -h, --help                Print this help and exit.
+
+Cluster options:
+  -c, --cluster             Update containers on every node in the cluster, not
+                            just this one. Implies --yes.
+      --nodes LIST          Comma-separated node names instead of autodiscovery.
+      --local-only          Force single-node operation (overrides --cluster).
+      --ssh-user USER       SSH user for remote nodes (default: $SSH_USER).
+
+Cluster mode runs this same script on each remote node over SSH, which relies on
+the passwordless root SSH trust that \`pvecm\` establishes between cluster
+members. VMIDs are cluster-unique, so --exclude / --include work cluster-wide.
+Each node keeps its own log and its own lock, so nodes are updated in sequence
+and a node that is already running the updater is reported, not disturbed.
+
+Most options also have an environment variable, which is the easier route when
+piping this script in from the network. --dry-run, --color and --local-only are
+flag-only. Boolean variables accept 1/true/yes/on and 0/false/no/off:
+  LZC_UPDATE_LXCS_YES=1  LZC_UPDATE_LXCS_EXCLUDE=100,101  LZC_UPDATE_LXCS_INCLUDE=
+  LZC_UPDATE_LXCS_SKIP_STOPPED=1  LZC_UPDATE_LXCS_UPDATE_TIMEOUT=1800
+  LZC_UPDATE_LXCS_RETRIES=2  LZC_UPDATE_LXCS_LOG=/var/log/lxc-updater.log
+  LZC_UPDATE_LXCS_CLUSTER=1  LZC_UPDATE_LXCS_NODES=pve1,pve2  LZC_UPDATE_LXCS_SSH_USER=root
+
+Exit status:
+  0    every selected container updated, or was skipped by choice
+  1    a container failed, or a cluster node could not be reached
+  2    usage error
+  3    not a Proxmox VE node, or a required tool is missing
+  4    not running as root
+  5    confirmation needed but there is no terminal and --yes was not given
+  75   another instance holds the lock; try again later
+  130  interrupted
+
+Remote invocation: because \`bash -c "\$(curl ...)"\` consumes \$0, flags must be
+passed after a literal \`--\`. See the README for the pinned, checksum-verified
+form -- fetching an unpinned branch and running it as root is not recommended.
 EOF
-    echo -e "${GN}Enhanced Proxmox VE LXC Container Updater v${SCRIPT_VERSION}${CL}\n"
 }
 
-# Validate prerequisites
-check_prerequisites() {
-    log "INFO" "Checking prerequisites..."
-    
-    # Check if running on Proxmox
-    if ! command -v pct >/dev/null 2>&1; then
-        log "ERROR" "pct command not found. This script must run on Proxmox VE."
-        exit 1
-    fi
-    
-    # Check if running as root
-    if [[ $EUID -ne 0 ]]; then
-        log "ERROR" "This script must be run as root."
-        exit 1
-    fi
-    
-    # Check if whiptail is available
-    if ! command -v whiptail >/dev/null 2>&1; then
-        log "ERROR" "whiptail not found. Please install: apt-get install whiptail"
-        exit 1
-    fi
-    
-    # Create log file if it doesn't exist
-    touch "$LOG_FILE" || {
-        log "ERROR" "Cannot create log file: $LOG_FILE"
-        exit 1
-    }
-    
-    log "SUCCESS" "Prerequisites check passed"
+# --- Argument parsing --------------------------------------------------------
+
+append_spec() {
+    local -n target=$1
+    target="${target:+$target,}$2"
 }
 
-# Sanitize container ID input
-sanitize_container_id() {
-    local container_id="$1"
-    # Only allow digits
-    if [[ "$container_id" =~ ^[0-9]+$ ]]; then
-        echo "$container_id"
-    else
-        log "WARN" "Invalid container ID format: $container_id"
-        return 1
-    fi
-}
-
-# Validate container exists
-validate_container() {
-    local container="$1"
-    
-    # Sanitize input
-    container=$(sanitize_container_id "$container") || return 1
-    
-    if ! pct config "$container" >/dev/null 2>&1; then
-        log "ERROR" "Container $container does not exist or is not accessible"
-        return 1
-    fi
-    
-    return 0
-}
-
-# Get container information
-get_container_info() {
-    local container="$1"
-    local info_type="$2"
-    
-    case "$info_type" in
-        "hostname")
-            pct exec "$container" -- hostname 2>/dev/null || echo "unknown"
-            ;;
-        "ostype")
-            pct config "$container" 2>/dev/null | awk '/^ostype:/ {print $2}' || echo "unknown"
-            ;;
-        "status")
-            pct status "$container" 2>/dev/null || echo "status: unknown"
-            ;;
-        "template")
-            if pct config "$container" 2>/dev/null | grep -q "template: 1"; then
-                echo "true"
-            else
-                echo "false"
-            fi
-            ;;
-    esac
-}
-
-# Get disk usage information
-get_disk_info() {
-    local container="$1"
-    local os="$2"
-    
-    if [[ "$os" == "ubuntu" || "$os" == "debian" || "$os" == "fedora" ]]; then
-        local disk_info
-        if disk_info=$(pct exec "$container" -- df /boot 2>/dev/null | awk 'NR==2{gsub("%","",$5); printf "%s %.1fG %.1fG %.1fG", $5, $3/1024/1024, $2/1024/1024, $4/1024/1024}'); then
-            echo "$disk_info"
-        else
-            echo "N/A N/A N/A N/A"
-        fi
-    else
-        echo "N/A N/A N/A N/A"
-    fi
-}
-
-# Wait for container to be ready
-wait_for_container() {
-    local container="$1"
-    local max_wait="$2"
-    local count=0
-    
-    while [[ $count -lt $max_wait ]]; do
-        if pct exec "$container" -- true 2>/dev/null; then
-            log "INFO" "Container $container is ready"
-            return 0
-        fi
-        sleep 1
-        ((count++))
-    done
-    
-    log "ERROR" "Container $container not ready after ${max_wait}s"
-    return 1
-}
-
-# Check if container needs reboot
-needs_reboot() {
-    local container="$1"
-    local os="$2"
-    
-    # Check for reboot-required flag (Ubuntu/Debian)
-    if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
-        if pct exec "$container" -- test -f /var/run/reboot-required 2>/dev/null; then
-            return 0
-        fi
-    fi
-    
-    # Check for other OS-specific reboot indicators
-    case "$os" in
-        "fedora"|"centos"|"rocky"|"alma")
-            # Check if kernel was updated
-            if pct exec "$container" -- needs-restarting -r 2>/dev/null; then
-                return 1
-            else
-                return 0
-            fi
-            ;;
-        "archlinux")
-            # Check for .pacnew files or kernel updates
-            if pct exec "$container" -- find /boot -name "*.pacnew" 2>/dev/null | grep -q .; then
-                return 0
-            fi
-            ;;
-    esac
-    
-    return 1
-}
-
-# Update container based on OS type
-update_container() {
-    local container="$1"
-    local retries=3
-    local retry_count=0
-    
-    # Validate container
-    if ! validate_container "$container"; then
-        FAILED_UPDATES+=("$container: Invalid container")
-        return 1
-    fi
-    
-    # Get container information
-    local name hostname os status template
-    hostname=$(get_container_info "$container" "hostname")
-    os=$(get_container_info "$container" "ostype")
-    status=$(get_container_info "$container" "status")
-    template=$(get_container_info "$container" "template")
-    
-    log "INFO" "Processing container $container ($hostname) - OS: $os, Status: $status"
-    
-    # Skip templates
-    if [[ "$template" == "true" ]]; then
-        log "INFO" "Skipping template container $container"
-        return 0
-    fi
-    
-    # Get disk information
-    local disk_info_array
-    read -ra disk_info_array <<< "$(get_disk_info "$container" "$os")"
-    
-    # Display container info
-    header_info
-    if [[ "${disk_info_array[0]}" != "N/A" ]]; then
-        log "INFO" "Updating $container : $hostname - Boot Disk: ${disk_info_array[0]}% full [${disk_info_array[1]}/${disk_info_array[2]} used, ${disk_info_array[3]} free]"
-    else
-        log "INFO" "Updating $container : $hostname - [No disk info available for $os]"
-    fi
-    
-    # Start container if stopped
-    local was_stopped=false
-    if [[ "$status" == "status: stopped" ]]; then
-        log "INFO" "Starting container $container"
-        if ! pct start "$container"; then
-            log "ERROR" "Failed to start container $container"
-            FAILED_UPDATES+=("$container: Failed to start")
-            return 1
-        fi
-        
-        if ! wait_for_container "$container" "$MAX_CONTAINER_WAIT"; then
-            log "ERROR" "Container $container failed to become ready"
-            FAILED_UPDATES+=("$container: Not ready after start")
-            return 1
-        fi
-        was_stopped=true
-    elif [[ "$status" != "status: running" ]]; then
-        log "WARN" "Container $container is in unexpected state: $status"
-        FAILED_UPDATES+=("$container: Unexpected state - $status")
-        return 1
-    fi
-    
-    # Perform update with retries
-    local update_success=false
-    while [[ $retry_count -lt $retries && "$update_success" == false ]]; do
-        ((retry_count++))
-        log "INFO" "Update attempt $retry_count for container $container"
-        
-        case "$os" in
-            "alpine")
-                if pct exec "$container" -- ash -c "apk update && apk upgrade" 2>/dev/null; then
-                    update_success=true
-                fi
+parse_args() {
+    while (($#)); do
+        case $1 in
+            -y | --yes) ASSUME_YES=1 ;;
+            -n | --dry-run) DRY_RUN=1 ;;
+            -e | --exclude)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--exclude requires a comma-separated list of CT IDs"
+                append_spec EXCLUDE_SPEC "$2"
+                shift
                 ;;
-            "archlinux")
-                if pct exec "$container" -- bash -c "pacman -Syyu --noconfirm" 2>/dev/null; then
-                    update_success=true
-                fi
+            -i | --include)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--include requires a comma-separated list of CT IDs"
+                append_spec INCLUDE_SPEC "$2"
+                shift
                 ;;
-            "fedora"|"rocky"|"centos"|"alma")
-                if pct exec "$container" -- bash -c "dnf -y update" 2>/dev/null; then
-                    update_success=true
-                fi
+            --skip-stopped) SKIP_STOPPED=1 ;;
+            -c | --cluster)
+                CLUSTER_MODE=1
+                ASSUME_YES=1
                 ;;
-            "ubuntu"|"debian"|"devuan")
-                # Safer update command without removing EXTERNALLY-MANAGED
-                if pct exec "$container" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade -qq" 2>/dev/null; then
-                    update_success=true
-                fi
+            --local-only) CLUSTER_MODE=0 ;;
+            --nodes)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--nodes requires a comma-separated list of node names"
+                NODES_SPEC=$2
+                CLUSTER_MODE=1
+                ASSUME_YES=1
+                shift
                 ;;
-            "opensuse")
-                if pct exec "$container" -- bash -c "zypper ref && zypper --non-interactive dup" 2>/dev/null; then
-                    update_success=true
-                fi
+            --ssh-user)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--ssh-user requires a user name"
+                SSH_USER=$2
+                shift
                 ;;
-            *)
-                log "WARN" "Unsupported OS type: $os for container $container"
-                FAILED_UPDATES+=("$container: Unsupported OS - $os")
-                return 1
+            --logs-url)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--logs-url requires an ingestion URL"
+                LZC_LOGS_URL=$2
+                shift
                 ;;
+            --metrics-url)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--metrics-url requires an ingestion URL"
+                LZC_METRICS_URL=$2
+                shift
+                ;;
+            --timeout)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--timeout requires a value in seconds"
+                UPDATE_TIMEOUT=$2
+                shift
+                ;;
+            --retries)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--retries requires a value"
+                RETRIES=$2
+                shift
+                ;;
+            --log-file)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--log-file requires a path"
+                LOG_FILE=$2
+                shift
+                ;;
+            --color)
+                [[ $# -ge 2 ]] || die "$EX_USAGE" "--color requires auto, always or never"
+                USE_COLOR=$2
+                shift
+                ;;
+            -V | --version)
+                printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+                exit 0
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                continue
+                ;;
+            *) die "$EX_USAGE" "Unknown option: $1 (try --help)" ;;
         esac
-        
-        if [[ "$update_success" == false ]]; then
-            log "WARN" "Update attempt $retry_count failed for container $container"
-            if [[ $retry_count -lt $retries ]]; then
-                sleep 5
-            fi
-        fi
+        shift
     done
-    
-    if [[ "$update_success" == false ]]; then
-        log "ERROR" "All update attempts failed for container $container"
-        FAILED_UPDATES+=("$container: All update attempts failed")
-        
-        # Don't shutdown if update failed and container was originally stopped
-        if [[ "$was_stopped" == true ]]; then
-            log "INFO" "Stopping container $container due to failed update"
-            pct stop "$container" 2>/dev/null || true
-        fi
-        return 1
-    fi
-    
-    log "SUCCESS" "Successfully updated container $container"
-    
-    # Check if reboot is needed
-    if needs_reboot "$container" "$os"; then
-        CONTAINERS_NEEDING_REBOOT+=("$container ($hostname)")
-        log "INFO" "Container $container requires a reboot"
-    fi
-    
-    # Shutdown if it was originally stopped
-    if [[ "$was_stopped" == true ]]; then
-        log "INFO" "Shutting down container $container"
-        if pct shutdown "$container"; then
-            # Wait for graceful shutdown
-            local shutdown_count=0
-            while [[ $shutdown_count -lt $SHUTDOWN_WAIT ]]; do
-                if [[ "$(get_container_info "$container" "status")" == "status: stopped" ]]; then
-                    break
-                fi
-                sleep 1
-                ((shutdown_count++))
-            done
-            
-            if [[ $shutdown_count -ge $SHUTDOWN_WAIT ]]; then
-                log "WARN" "Graceful shutdown timeout for container $container, forcing stop"
-                pct stop "$container" 2>/dev/null || true
-            fi
-        else
-            log "WARN" "Failed to shutdown container $container gracefully, forcing stop"
-            pct stop "$container" 2>/dev/null || true
-        fi
-    fi
-    
-    return 0
+
+    [[ $USE_COLOR =~ ^(auto|always|never)$ ]] || die "$EX_USAGE" "--color must be auto, always or never"
+
+    local name
+    for name in ASSUME_YES SKIP_STOPPED CLUSTER_MODE; do
+        _normalise_bool "$name"
+    done
+
+    # Minimum 1, not 0: `timeout 0` means "no limit", so accepting 0 here would
+    # silently remove the very protection the option exists to provide.
+    for name in UPDATE_TIMEOUT START_TIMEOUT SHUTDOWN_TIMEOUT PROBE_TIMEOUT \
+        SSH_TIMEOUT READY_PROBE_TIMEOUT READY_POLL_INTERVAL LOG_MAX_BYTES RETRIES; do
+        _normalise_int "$name" 1
+    done
+    _normalise_int RETRY_DELAY 0
 }
 
-# Get list of containers to exclude
-get_excluded_containers() {
-    local node
-    node=$(hostname)
-    
-    # Build menu array safely
-    local exclude_menu=()
-    local msg_max_length=0
-    
-    while IFS= read -r line; do
-        # Skip header line and parse container info
-        if [[ "$line" =~ ^[0-9] ]]; then
-            local container_id container_name
-            container_id=$(echo "$line" | awk '{print $1}')
-            container_name=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/[[:space:]]*$//')
-            
-            # Sanitize inputs
-            if container_id=$(sanitize_container_id "$container_id") 2>/dev/null; then
-                local offset=2
-                local item_length=$((${#container_name} + offset))
-                [[ $item_length -gt $msg_max_length ]] && msg_max_length=$item_length
-                
-                exclude_menu+=("$container_id" "$container_name " "OFF")
-            fi
+# Accepts the spellings people actually write in cron files and unit files.
+# Without this, LZC_UPDATE_LXCS_YES=true reaches (( )) as a bare word and the script
+# dies with "true: unbound variable" before doing anything.
+_normalise_bool() {
+    local name=$1 value
+    case ${!name,,} in
+        1 | true | yes | on) value=1 ;;
+        0 | false | no | off | '') value=0 ;;
+        *) die "$EX_USAGE" "$name must be true or false, got '${!name}'" ;;
+    esac
+    printf -v "$name" '%s' "$value"
+}
+
+_normalise_int() {
+    local name=$1 min=$2 value
+    [[ ${!name} =~ ^[0-9]+$ ]] || die "$EX_USAGE" "$name must be a whole number, got '${!name}'"
+    # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
+    # an invalid octal literal and aborts the arithmetic.
+    value=$((10#${!name}))
+    ((value >= min)) || die "$EX_USAGE" "$name must be at least $min, got '${!name}'"
+    printf -v "$name" '%s' "$value"
+}
+
+# Expands a comma/space separated ID list into the named array, rejecting
+# anything that is not a plain integer.
+parse_id_spec() {
+    local -n out=$1
+    local spec=$2 label=$3 token
+    [[ -n $spec ]] || return 0
+    local raw
+    IFS=', ' read -r -a raw <<<"$spec"
+    for token in "${raw[@]}"; do
+        [[ -n $token ]] || continue
+        [[ $token =~ ^[0-9]+$ ]] || die "$EX_USAGE" "Invalid container ID in $label list: '$token'"
+        out+=("$token")
+    done
+}
+
+in_list() {
+    local needle=$1 name=$2
+    local -n haystack=$name
+    ((${#haystack[@]})) || return 1
+    local item
+    for item in "${haystack[@]}"; do
+        [[ $item == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# --- Preflight ---------------------------------------------------------------
+
+preflight() {
+    [[ $EUID -eq 0 ]] || die "$EX_NOROOT" "This script must be run as root."
+    command -v pct >/dev/null 2>&1 || die "$EX_PREREQ" "pct not found. This script must run on a Proxmox VE node."
+    command -v timeout >/dev/null 2>&1 || die "$EX_PREREQ" "timeout (coreutils) not found."
+    command -v flock >/dev/null 2>&1 || die "$EX_PREREQ" "flock (util-linux) not found."
+
+    # Rotate before opening so a long-lived node does not grow an unbounded log.
+    local size
+    if [[ -f $LOG_FILE ]]; then
+        size=$(wc -c <"$LOG_FILE" 2>/dev/null) || size=0
+        if ((size > LOG_MAX_BYTES)); then
+            mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
         fi
-    done < <(pct list 2>/dev/null)
-    
-    if [[ ${#exclude_menu[@]} -eq 0 ]]; then
-        log "WARN" "No containers found"
+    fi
+
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    if : >>"$LOG_FILE" 2>/dev/null; then
+        LOG_READY=1
+        LOG_SINK=$LOG_FILE
+    else
+        printf '%s[Warning]%s Cannot write %s; continuing without a log file.\n' \
+            "$YW" "$CL" "$LOG_FILE" >&2
+    fi
+}
+
+acquire_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+    exec 9>"$LOCK_FILE" || die "$EX_LOCKED" "Cannot open lock file $LOCK_FILE"
+    flock -n 9 || die "$EX_LOCKED" "Another $SCRIPT_NAME run holds $LOCK_FILE. Refusing to run concurrently."
+    LOCK_HELD=1
+}
+
+# --- Container inspection ----------------------------------------------------
+
+# IDs only. Names and everything else come from `pct config`, whose key: value
+# format is stable, rather than from the positional columns of `pct list`.
+list_container_ids() {
+    pct list 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }'
+}
+
+config_value() {
+    local id=$1 key=$2
+    pct config "$id" 2>/dev/null | sed -n "s/^${key}: //p" | head -n1
+}
+
+container_status() {
+    pct status "$1" 2>/dev/null | awk '{ print $2 }'
+}
+
+is_template() {
+    [[ $(config_value "$1" template) == 1 ]]
+}
+
+is_locked() {
+    [[ -n $(config_value "$1" lock) ]]
+}
+
+# Runs a command inside the container under a hard timeout, so one wedged
+# package manager cannot stall the entire node's update run.
+ct_exec() {
+    local id=$1 secs=$2
+    shift 2
+    timeout --foreground "$secs" pct exec "$id" -- "$@"
+}
+
+# Resolves the package-manager family. `pct config` ostype is authoritative when
+# set, but containers created outside PVE tooling report `unmanaged`, so fall
+# back to reading /etc/os-release from inside the running guest.
+detect_family() {
+    local id=$1 ostype family
+    ostype=$(config_value "$id" ostype)
+
+    family=$(family_from_id "$ostype")
+    if [[ -n $family ]]; then
+        printf '%s' "$family"
         return 0
     fi
-    
-    # Show selection dialog
-    local excluded_raw
-    if excluded_raw=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
-                               --title "Containers on $node" \
-                               --checklist "\nSelect containers to skip from updates:\n" \
-                               16 $((msg_max_length + 23)) 6 \
-                               "${exclude_menu[@]}" \
-                               3>&1 1>&2 2>&3 2>/dev/null); then
-        
-        # Parse selected containers safely
-        while IFS= read -r container_id; do
-            # Remove quotes and validate
-            container_id=$(echo "$container_id" | tr -d '"')
-            if container_id=$(sanitize_container_id "$container_id") 2>/dev/null; then
-                EXCLUDED_CONTAINERS+=("$container_id")
-            fi
-        done <<< "$excluded_raw"
-        
-        if [[ ${#EXCLUDED_CONTAINERS[@]} -gt 0 ]]; then
-            log "INFO" "Excluding containers: ${EXCLUDED_CONTAINERS[*]}"
-        fi
-    else
-        log "INFO" "No containers excluded"
-    fi
-}
 
-# Check if container should be excluded
-is_excluded() {
-    local container="$1"
-    local excluded_container
-    
-    for excluded_container in "${EXCLUDED_CONTAINERS[@]}"; do
-        if [[ "$excluded_container" == "$container" ]]; then
+    local os_release
+    # Single quotes are deliberate: ID and ID_LIKE must expand in the guest's
+    # shell, not this one.
+    # shellcheck disable=SC2016
+    os_release=$(ct_exec "$id" "$PROBE_TIMEOUT" sh -c \
+        '. /etc/os-release 2>/dev/null && printf "%s %s" "${ID:-}" "${ID_LIKE:-}"' 2>/dev/null) || return 1
+
+    local token
+    for token in $os_release; do
+        family=$(family_from_id "$token")
+        if [[ -n $family ]]; then
+            printf '%s' "$family"
             return 0
         fi
     done
     return 1
 }
 
-# Generate summary report
-generate_summary() {
-    header_info
-    
-    local total_containers=0
-    local updated_containers=0
-    local excluded_count=${#EXCLUDED_CONTAINERS[@]}
-    local failed_count=${#FAILED_UPDATES[@]}
-    local reboot_count=${#CONTAINERS_NEEDING_REBOOT[@]}
-    
-    # Count total containers
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[0-9] ]]; then
-            ((total_containers++))
-        fi
-    done < <(pct list 2>/dev/null)
-    
-    updated_containers=$((total_containers - excluded_count - failed_count))
-    
-    log "SUCCESS" "Update process completed!"
-    echo ""
-    log "INFO" "Summary:"
-    echo "  Total containers: $total_containers"
-    echo "  Successfully updated: $updated_containers"
-    echo "  Excluded: $excluded_count"
-    echo "  Failed updates: $failed_count"
-    echo "  Requiring reboot: $reboot_count"
-    echo ""
-    
-    if [[ $failed_count -gt 0 ]]; then
-        log "ERROR" "Failed updates:"
-        local failed_update
-        for failed_update in "${FAILED_UPDATES[@]}"; do
-            echo "  $failed_update"
-        done
-        echo ""
-    fi
-    
-    if [[ $reboot_count -gt 0 ]]; then
-        log "WARN" "Containers requiring reboot:"
-        local container_name
-        for container_name in "${CONTAINERS_NEEDING_REBOOT[@]}"; do
-            echo "  $container_name"
-        done
-        echo ""
-    fi
-    
-    log "INFO" "Detailed logs available at: $LOG_FILE"
+family_from_id() {
+    case ${1,,} in
+        debian | devuan | ubuntu | raspbian | linuxmint | pop) printf 'debian' ;;
+        centos | fedora | rocky | almalinux | alma | rhel | ol | oracle | amzn) printf 'rhel' ;;
+        alpine) printf 'alpine' ;;
+        archlinux | arch | manjaro) printf 'arch' ;;
+        opensuse | opensuse-leap | opensuse-tumbleweed | sles | suse) printf 'suse' ;;
+        *) return 1 ;;
+    esac
 }
 
-# Main execution function
+update_command_for() {
+    case $1 in
+        debian)
+            printf '%s' 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade && apt-get -y --purge autoremove && apt-get clean'
+            ;;
+        rhel)
+            printf '%s' 'if command -v dnf >/dev/null 2>&1; then dnf -y upgrade && dnf -y clean packages; else yum -y update && yum -y clean packages; fi'
+            ;;
+        alpine) printf '%s' 'apk update && apk upgrade' ;;
+        arch) printf '%s' 'pacman -Syu --noconfirm' ;;
+        suse) printf '%s' 'zypper --non-interactive refresh && zypper --non-interactive dup' ;;
+        *) return 1 ;;
+    esac
+}
+
+# The container's root filesystem, not /boot -- an LXC guest shares the host
+# kernel and its /boot is normally empty.
+disk_summary() {
+    local id=$1 out
+    out=$(ct_exec "$id" "$PROBE_TIMEOUT" df -P / 2>/dev/null |
+        awk 'NR == 2 { printf "%s used of %.1fG (%.1fG free)", $5, $2 / 1048576, $4 / 1048576 }') || return 1
+    [[ -n $out ]] || return 1
+    printf '%s' "$out"
+}
+
+# An LXC guest shares the host kernel, so "needs reboot" here means "restart the
+# container to pick up replaced libraries and services", not a kernel upgrade.
+needs_reboot() {
+    local id=$1 family=$2
+    case $family in
+        debian)
+            ct_exec "$id" "$PROBE_TIMEOUT" sh -c \
+                'test -f /run/reboot-required || test -f /var/run/reboot-required' >/dev/null 2>&1 && return 0
+            ;;
+        rhel)
+            # needs-restarting ships in dnf-utils/yum-utils and is absent from
+            # minimal images. Absent means unknown, not "reboot needed".
+            if ct_exec "$id" "$PROBE_TIMEOUT" sh -c 'command -v needs-restarting >/dev/null 2>&1' >/dev/null 2>&1; then
+                ct_exec "$id" "$PROBE_TIMEOUT" needs-restarting -r >/dev/null 2>&1 || return 0
+            fi
+            ;;
+        arch | alpine | suse)
+            # No dependable in-guest indicator; checkrestart/needrestart are not
+            # installed by default. Reported as unknown rather than guessed.
+            :
+            ;;
+    esac
+    return 1
+}
+
+# --- Container lifecycle -----------------------------------------------------
+
+wait_until_ready() {
+    local id=$1 deadline=$((SECONDS + START_TIMEOUT))
+    while ((SECONDS < deadline)); do
+        if ct_exec "$id" "$READY_PROBE_TIMEOUT" true >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$READY_POLL_INTERVAL"
+    done
+    return 1
+}
+
+start_container() {
+    local id=$1
+    log INFO "Starting container $id"
+    if ! pct start "$id" >>"$LOG_SINK" 2>&1; then
+        return 1
+    fi
+    STARTED_BY_US+=("$id")
+    wait_until_ready "$id"
+}
+
+stop_container() {
+    local id=$1
+    log INFO "Returning container $id to stopped"
+    if pct shutdown "$id" --timeout "$SHUTDOWN_TIMEOUT" >>"$LOG_SINK" 2>&1; then
+        return 0
+    fi
+    log WARN "Graceful shutdown of container $id failed; forcing stop"
+    pct stop "$id" >>"$LOG_SINK" 2>&1
+}
+
+# Called from the EXIT trap so an interrupted run does not leave containers
+# running that were stopped before the script touched them.
+restore_started_containers() {
+    ((${#STARTED_BY_US[@]})) || return 0
+    ((SKIP_STOPPED)) && return 0
+    local id
+    for id in "${STARTED_BY_US[@]}"; do
+        if [[ $(container_status "$id") == running ]]; then
+            stop_container "$id" || log WARN "Could not stop container $id during cleanup"
+        fi
+    done
+    STARTED_BY_US=()
+}
+
+forget_started() {
+    local id=$1 keep=() item
+    for item in "${STARTED_BY_US[@]}"; do
+        [[ $item == "$id" ]] || keep+=("$item")
+    done
+    STARTED_BY_US=(${keep[@]+"${keep[@]}"})
+}
+
+# --- The per-container workflow ----------------------------------------------
+
+update_one() {
+    local id=$1
+    local name status family cmd disk attempt rc
+    local started=0
+
+    name=$(config_value "$id" hostname)
+    [[ -n $name ]] || name="ct$id"
+
+    if is_template "$id"; then
+        log INFO "Skipping template $id ($name)"
+        COUNT_TEMPLATE=$((COUNT_TEMPLATE + 1))
+        return 0
+    fi
+
+    # Counted as a failure, not a skip: the container was scheduled for patching
+    # and did not get patched. Saying "skipped" here while the summary counts it
+    # under Failed is how an unpatched container goes unnoticed.
+    if is_locked "$id"; then
+        log WARN "Container $id ($name) not updated: locked by another PVE task (backup, snapshot or migration in progress)"
+        FAILED+=("$id ($name): locked by another PVE task")
+        return 1
+    fi
+
+    status=$(container_status "$id")
+    case $status in
+        running) ;;
+        stopped)
+            if ((SKIP_STOPPED)); then
+                log INFO "Skipping stopped container $id ($name) (--skip-stopped)"
+                return 0
+            fi
+            if ((DRY_RUN)); then
+                log INFO "[dry-run] Would start, update and re-stop container $id ($name)"
+                return 0
+            fi
+            if ! start_container "$id"; then
+                log ERROR "Container $id ($name) did not become ready within ${START_TIMEOUT}s"
+                FAILED+=("$id ($name): failed to start")
+                return 1
+            fi
+            started=1
+            ;;
+        '')
+            log ERROR "Container $id: cannot read status"
+            FAILED+=("$id ($name): unreadable status")
+            return 1
+            ;;
+        *)
+            log WARN "Skipping container $id ($name): unexpected state '$status'"
+            FAILED+=("$id ($name): unexpected state '$status'")
+            return 1
+            ;;
+    esac
+
+    if ! family=$(detect_family "$id"); then
+        log ERROR "Container $id ($name): unsupported or undetectable distribution"
+        FAILED+=("$id ($name): unsupported distribution")
+        ((started)) && stop_container "$id" && forget_started "$id"
+        return 1
+    fi
+
+    if disk=$(disk_summary "$id"); then
+        log INFO "Updating $id ($name) -- $family, rootfs $disk"
+    else
+        log INFO "Updating $id ($name) -- $family"
+    fi
+
+    if ((DRY_RUN)); then
+        log INFO "[dry-run] Would run the $family update for container $id ($name)"
+        return 0
+    fi
+
+    cmd=$(update_command_for "$family") || {
+        FAILED+=("$id ($name): no update command for $family")
+        return 1
+    }
+
+    rc=1
+    for ((attempt = 1; attempt <= RETRIES; attempt++)); do
+        # Guest output is streamed and logged: a failing update has to be
+        # diagnosable, which is why stderr is never discarded here.
+        ct_exec "$id" "$UPDATE_TIMEOUT" sh -c "$cmd" 2>&1 | tee -a "$LOG_SINK"
+        rc=${PIPESTATUS[0]}
+        ((rc == 0)) && break
+
+        if ((rc == 124)); then
+            log WARN "Container $id ($name): update timed out after ${UPDATE_TIMEOUT}s (attempt $attempt/$RETRIES)"
+        else
+            log WARN "Container $id ($name): update failed with status $rc (attempt $attempt/$RETRIES)"
+        fi
+        ((attempt < RETRIES)) && sleep "$RETRY_DELAY"
+    done
+
+    if ((rc != 0)); then
+        log ERROR "Container $id ($name): giving up after $RETRIES attempt(s)"
+        FAILED+=("$id ($name): update failed (status $rc)")
+    else
+        log SUCCESS "Container $id ($name) updated"
+        COUNT_UPDATED=$((COUNT_UPDATED + 1))
+        if needs_reboot "$id" "$family"; then
+            NEEDS_REBOOT+=("$id ($name)")
+        fi
+    fi
+
+    if ((started)); then
+        stop_container "$id" || log WARN "Could not return container $id to stopped"
+        forget_started "$id"
+    fi
+
+    return "$((rc == 0 ? 0 : 1))"
+}
+
+# --- Interactive selection ---------------------------------------------------
+
+select_exclusions() {
+    command -v whiptail >/dev/null 2>&1 || {
+        log WARN "whiptail not installed; skipping the exclusion picker"
+        return 0
+    }
+
+    local menu=() id name width=30
+    while read -r id; do
+        name=$(config_value "$id" hostname)
+        [[ -n $name ]] || name="ct$id"
+        ((${#name} + 12 > width)) && width=$((${#name} + 12))
+        menu+=("$id" "$name" OFF)
+    done < <(list_container_ids)
+
+    ((${#menu[@]})) || return 0
+
+    local raw
+    raw=$(whiptail --backtitle "$SCRIPT_NAME" \
+        --title "Containers on $(hostname)" \
+        --checklist "\nSelect containers to skip:\n" \
+        20 "$width" 10 \
+        "${menu[@]}" 3>&1 1>&2 2>&3) || return 0
+
+    local token
+    for token in $raw; do
+        token=${token//\"/}
+        [[ $token =~ ^[0-9]+$ ]] && EXCLUDED+=("$token")
+    done
+}
+
+confirm() {
+    if command -v whiptail >/dev/null 2>&1; then
+        whiptail --backtitle "$SCRIPT_NAME" --title "$SCRIPT_NAME" \
+            --yesno "Update the LXC containers on $(hostname)?" 10 60
+        return
+    fi
+    local reply
+    read -r -p "Update the LXC containers on $(hostname)? [y/N] " reply
+    [[ ${reply,,} == y* ]]
+}
+
+# --- Reporting ---------------------------------------------------------------
+
+summary() {
+    local failed=${#FAILED[@]} reboot=${#NEEDS_REBOOT[@]} item
+
+    printf '\n'
+    log INFO "Summary for $(hostname):"
+    printf '  Containers on node : %d\n' "$COUNT_TOTAL"
+    printf '  Updated            : %d\n' "$COUNT_UPDATED"
+    printf '  Skipped (excluded) : %d\n' "$COUNT_EXCLUDED"
+    printf '  Skipped (template) : %d\n' "$COUNT_TEMPLATE"
+    printf '  Failed             : %d\n' "$failed"
+    printf '  Restart advised    : %d\n' "$reboot"
+    printf '\n'
+
+    if ((failed)); then
+        log ERROR "Failures:"
+        for item in "${FAILED[@]}"; do printf '  %s\n' "$item" >&2; done
+        printf '\n'
+    fi
+
+    if ((reboot)); then
+        log WARN "Restart advised (replaced libraries or services):"
+        for item in "${NEEDS_REBOOT[@]}"; do printf '  %s\n' "$item" >&2; done
+        printf '\n'
+    fi
+
+    ((LOG_READY)) && log INFO "Full log: $LOG_FILE"
+
+    # Gauges, so "state" is a label rather than six separate metric names.
+    obs_metric lzc_lxc_containers "$COUNT_TOTAL" state=total
+    obs_metric lzc_lxc_containers "$COUNT_UPDATED" state=updated
+    obs_metric lzc_lxc_containers "$COUNT_EXCLUDED" state=excluded
+    obs_metric lzc_lxc_containers "$COUNT_TEMPLATE" state=template
+    obs_metric lzc_lxc_containers "$failed" state=failed
+    obs_metric lzc_lxc_containers "$reboot" state=restart_advised
+
+    return 0
+}
+
+on_exit() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    restore_started_containers
+    # Ships whatever was buffered, including on the interrupted path -- a run
+    # that died half way is exactly the one worth seeing in the log store.
+    obs_finish "$rc"
+    ((LOCK_HELD)) && exec 9>&-
+    exit "$rc"
+}
+
+on_signal() {
+    log WARN "Interrupted -- restoring container states before exit"
+    exit "$EX_INTERRUPT"
+}
+
+# --- Cluster -----------------------------------------------------------------
+
+# Node names, one per line. `pvecm nodes` is the authoritative view of live
+# membership; /etc/pve/nodes is the fallback, but it also retains directories for
+# removed nodes, so the discovered list is always logged for the operator to see.
+cluster_nodes() {
+    local found=''
+
+    if command -v pvecm >/dev/null 2>&1; then
+        found=$(pvecm nodes 2>/dev/null | awk '$1 ~ /^[0-9]+$/ { print $3 }' | sed 's/(local)//')
+    fi
+
+    if [[ -z $found && -d /etc/pve/nodes ]]; then
+        found=$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
+        [[ -n $found ]] && log WARN "pvecm gave no members; falling back to /etc/pve/nodes (may list removed nodes)"
+    fi
+
+    [[ -n $found ]] || return 1
+    printf '%s\n' "$found" | awk 'NF'
+}
+
+# This node's name as the *cluster* knows it. `pvecm nodes` marks the local
+# member, which is authoritative; `hostname` may return an FQDN and drift from
+# the membership list. If they drift, run_cluster would fail to recognise itself
+# and SSH to localhost, colliding with the lock it already holds.
+local_node_name() {
+    local name=''
+    if command -v pvecm >/dev/null 2>&1; then
+        name=$(pvecm nodes 2>/dev/null |
+            awk '/\(local\)/ && $1 ~ /^[0-9]+$/ { print $3 }')
+    fi
+    [[ -n $name ]] || name=$(hostname -s 2>/dev/null)
+    [[ -n $name ]] || name=$(hostname)
+    printf '%s' "$name"
+}
+
+# The script text to run on a remote node. Normally the file itself; when this
+# script was piped in from the network there is no file, so an equivalent one is
+# reconstructed from the live function and variable definitions. Either way the
+# remote node runs exactly the code this node is running -- it never re-fetches.
+
+# Telemetry settings for the remote node, emitted ahead of the script body in
+# both transport modes. Every consumer reads these as "${VAR:-}", so assigning
+# them first is enough for the values to survive into the remote run.
+_obs_remote_env() {
+    local v
+    for v in LZC_LOGS_URL LZC_LOGS_FORMAT LZC_METRICS_URL LZC_METRICS_FORMAT \
+        LZC_OBS_JOB LZC_OBS_LABELS LZC_OBS_TIMEOUT LZC_OBS_TENANT \
+        LZC_OBS_TOKEN_ENV LZC_OBS_USER LZC_OBS_PASSWORD_ENV LZC_OBS_BUFFER \
+        LZC_OBS_DEBUG LZC_OBS_INSECURE LZC_OBS_RETRIES LZC_OBS_CONNECT_TIMEOUT; do
+        [[ -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
+    done
+
+    # The credential itself, under the name the configuration points at. It
+    # travels inside the encrypted SSH stream and never reaches a command line,
+    # a process list, or a file on either node.
+    #
+    # The name is checked against the identifier grammar first. Unlike the loop
+    # above, which walks a literal list, these two come from user configuration,
+    # and `${!v}` is not a plain lookup: bash parses the value as a variable
+    # reference, so a non-identifier is a fatal expansion error that kills this
+    # script mid-fleet-update, and an array subscript inside it is *evaluated*
+    # -- `LZC_OBS_TOKEN_ENV='x[$(...)]'` would run the substitution as root.
+    for v in "${LZC_OBS_TOKEN_ENV:-}" "${LZC_OBS_PASSWORD_ENV:-}"; do
+        [[ -n $v ]] || continue
+        if [[ ! $v =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            log WARN "Ignoring '$v': expected the NAME of an environment variable, not a value."
+            continue
+        fi
+        [[ -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
+    done
+
+    # Cleared so each node reports under its own instance label.
+    printf 'LZC_OBS_INSTANCE=\n'
+}
+
+remote_payload() {
+    _obs_remote_env
+
+    # Inlining the library means the remote node ships telemetry even when it
+    # has no copy of it installed.
+    [[ -n $OBS_LIB_PATH && -r $OBS_LIB_PATH ]] && cat "$OBS_LIB_PATH"
+
+    if [[ -n $SELF_PATH ]]; then
+        cat "$SELF_PATH"
+        return
+    fi
+
+    printf 'set -uo pipefail\n'
+    declare -p SCRIPT_NAME SCRIPT_VERSION LOG_FILE LOG_MAX_BYTES LOCK_FILE \
+        START_TIMEOUT SHUTDOWN_TIMEOUT UPDATE_TIMEOUT PROBE_TIMEOUT \
+        RETRIES RETRY_DELAY SSH_USER SSH_TIMEOUT SSH_EXTRA_OPTS 2>/dev/null
+
+    printf '%s\n' \
+        'EXCLUDE_SPEC= INCLUDE_SPEC= NODES_SPEC= ASSUME_YES=1' \
+        'SKIP_STOPPED=0 CLUSTER_MODE=0 DRY_RUN=0 USE_COLOR=never SELF_PATH=' \
+        'declare -a EXCLUDED=() INCLUDED=() STARTED_BY_US=() FAILED=() NEEDS_REBOOT=()' \
+        'declare -a NODES_OK=() NODES_FAILED=()' \
+        'COUNT_TOTAL=0 COUNT_UPDATED=0 COUNT_TEMPLATE=0 COUNT_EXCLUDED=0' \
+        'LOG_READY=0 LOG_SINK=/dev/null LOCK_HELD=0' \
+        "YW='' BL='' RD='' GN='' CL=''"
+    declare -f
+    printf 'main "$@"\n'
+}
+
+run_remote_node() {
+    local node=$1 rc
+    local -a args=(--local-only --yes --color never
+        --timeout "$UPDATE_TIMEOUT" --retries "$RETRIES")
+    ((DRY_RUN)) && args+=(--dry-run)
+    ((SKIP_STOPPED)) && args+=(--skip-stopped)
+    [[ -n $EXCLUDE_SPEC ]] && args+=(--exclude "$EXCLUDE_SPEC")
+    [[ -n $INCLUDE_SPEC ]] && args+=(--include "$INCLUDE_SPEC")
+
+    local -a ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT")
+    if [[ -n $SSH_EXTRA_OPTS ]]; then
+        local -a extra
+        read -r -a extra <<<"$SSH_EXTRA_OPTS"
+        ssh_cmd+=("${extra[@]}")
+    fi
+    ssh_cmd+=("${SSH_USER}@${node}" "bash -s -- $(printf '%q ' "${args[@]}")")
+
+    log INFO "--- node $node (remote) ---"
+    remote_payload | "${ssh_cmd[@]}" 2>&1 | sed "s/^/[$node] /"
+    rc=${PIPESTATUS[1]}
+
+    case $rc in
+        0)
+            NODES_OK+=("$node")
+            log SUCCESS "Node $node completed"
+            ;;
+        255)
+            NODES_FAILED+=("$node: unreachable over SSH")
+            log ERROR "Node $node: SSH connection failed"
+            ;;
+        *)
+            NODES_FAILED+=("$node: updater exited $rc")
+            log ERROR "Node $node: updater exited $rc"
+            ;;
+    esac
+}
+
+run_cluster() {
+    local -a nodes=()
+    local listing rc
+    if [[ -n $NODES_SPEC ]]; then
+        IFS=', ' read -r -a nodes <<<"$NODES_SPEC"
+    else
+        # Same process-substitution trap as run_local_node: cluster_nodes
+        # signals "membership could not be read" with a non-zero status, and
+        # `mapfile < <(...)` would drop it.
+        listing=$(cluster_nodes)
+        rc=$?
+
+        # On a working node /etc/pve/nodes always contains at least this host,
+        # so reaching here means /etc/pve is not mounted -- a cluster whose
+        # members cannot be read, not a standalone host. Degrading to "just do
+        # the local node" would silently patch one node and report success for
+        # a run the operator asked to cover the whole cluster.
+        if ((rc != 0)); then
+            log ERROR "Cannot determine cluster membership: pvecm reported no members and /etc/pve/nodes could not be read"
+            log ERROR "Pass --nodes to name them explicitly, or --local-only for a deliberate single-node run"
+            NODES_FAILED+=("$(hostname): cluster membership unreadable")
+            return "$EX_FAIL"
+        fi
+
+        [[ -n $listing ]] && mapfile -t nodes <<<"$listing"
+    fi
+
+    if ((${#nodes[@]} == 0)); then
+        log WARN "No cluster membership found; treating this as a standalone node"
+        run_local_node
+        return
+    fi
+
+    log INFO "Cluster nodes: ${nodes[*]}"
+
+    local node local_node
+    local_node=$(local_node_name)
+    for node in "${nodes[@]}"; do
+        # Compared on the short name: one side may carry a domain suffix.
+        if [[ ${node%%.*} == "${local_node%%.*}" ]]; then
+            log INFO "--- node $node (local) ---"
+            run_local_node
+            if ((${#FAILED[@]})); then
+                NODES_FAILED+=("$node: ${#FAILED[@]} container(s) failed")
+            else
+                NODES_OK+=("$node")
+            fi
+        else
+            run_remote_node "$node"
+        fi
+    done
+
+    cluster_summary
+}
+
+cluster_summary() {
+    local item
+    printf '\n'
+    log INFO "Cluster summary: ${#NODES_OK[@]} node(s) OK, ${#NODES_FAILED[@]} with problems"
+    obs_metric lzc_lxc_nodes "${#NODES_OK[@]}" state=ok
+    obs_metric lzc_lxc_nodes "${#NODES_FAILED[@]}" state=failed
+    if ((${#NODES_FAILED[@]})); then
+        for item in "${NODES_FAILED[@]}"; do printf '  %s\n' "$item" >&2; done
+        printf '\n'
+    fi
+    return 0
+}
+
+# --- Main --------------------------------------------------------------------
+
+run_local_node() {
+    local ids=() id listing rc
+
+    # Capture the status before the array. `pipefail` already gives
+    # list_container_ids a non-zero status when `pct list` fails, but
+    # `mapfile < <(...)` discards the status of a process substitution, so
+    # reading it straight into the array throws that away.
+    listing=$(list_container_ids)
+    rc=$?
+
+    # "Could not enumerate" is not "there is nothing here". `pct` still exists
+    # when pvedaemon or pve-cluster is down, so preflight passes and this is the
+    # first thing that notices. Reporting success would mean a node whose
+    # containers were never even listed looks patched.
+    if ((rc != 0)); then
+        log ERROR "Cannot list containers on $(hostname): pct list failed (status $rc)"
+        FAILED+=("$(hostname): pct list failed (status $rc); no container was inspected")
+        return "$EX_FAIL"
+    fi
+
+    [[ -n $listing ]] && mapfile -t ids <<<"$listing"
+    COUNT_TOTAL=${#ids[@]}
+
+    if ((COUNT_TOTAL == 0)); then
+        log WARN "No LXC containers found on this node"
+        return 0
+    fi
+
+    for id in "${ids[@]}"; do
+        if ((${#INCLUDED[@]})) && ! in_list "$id" INCLUDED; then
+            continue
+        fi
+        if in_list "$id" EXCLUDED; then
+            log INFO "Skipping excluded container $id"
+            COUNT_EXCLUDED=$((COUNT_EXCLUDED + 1))
+            continue
+        fi
+        update_one "$id"
+    done
+
+    summary
+}
+
 main() {
-    # Initialize
-    header_info
-    log "INFO" "Starting $SCRIPT_NAME v$SCRIPT_VERSION"
-    
-    # Check prerequisites
-    check_prerequisites
-    
-    # Confirm execution
-    if ! whiptail --backtitle "Proxmox VE Helper Scripts" \
-                  --title "$SCRIPT_NAME" \
-                  --yesno "This will update LXC containers. Proceed?" \
-                  10 58; then
-        log "INFO" "Update cancelled by user"
-        exit 0
-    fi
-    
-    # Get containers to exclude
-    get_excluded_containers
-    
-    # Process all containers
-    log "INFO" "Starting container updates..."
-    
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[0-9] ]]; then
-            local container_id
-            container_id=$(echo "$line" | awk '{print $1}')
-            
-            # Sanitize and validate
-            if ! container_id=$(sanitize_container_id "$container_id") 2>/dev/null; then
-                continue
-            fi
-            
-            if is_excluded "$container_id"; then
-                log "INFO" "Skipping excluded container $container_id"
-                continue
-            fi
-            
-            # Update container
-            update_container "$container_id" || true
+    parse_args "$@"
+    setup_color
+    banner
+
+    local src=${BASH_SOURCE[0]:-}
+    [[ -n $src && -r $src ]] && SELF_PATH=$src
+
+    preflight
+    acquire_lock
+    _load_obs
+
+    trap on_exit EXIT
+    # HUP matters because cluster mode runs this over SSH: a dropped connection
+    # sends the remote shell HUP, not TERM, and without it the cleanup that
+    # returns containers to stopped would never run on that node.
+    trap on_signal INT TERM HUP
+
+    log INFO "Starting $SCRIPT_NAME v$SCRIPT_VERSION on $(hostname)"
+    ((DRY_RUN)) && log INFO "Dry run: no container will be started, updated or stopped"
+
+    parse_id_spec EXCLUDED "$EXCLUDE_SPEC" exclude
+    parse_id_spec INCLUDED "$INCLUDE_SPEC" include
+
+    if ((!ASSUME_YES)); then
+        # Refuse rather than assume consent: an unattended run that nobody asked
+        # for is exactly how a maintenance script surprises someone.
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            die "$EX_NOCONFIRM" \
+                "Refusing to run unattended without confirmation. Pass --yes (or set LZC_UPDATE_LXCS_YES=1)."
         fi
-    done < <(pct list 2>/dev/null)
-    
-    # Generate summary
-    generate_summary
-    
-    log "INFO" "$SCRIPT_NAME completed"
+        confirm || {
+            log INFO "Cancelled by user"
+            return 0
+        }
+        ((${#INCLUDED[@]})) || select_exclusions
+    fi
+
+    ((${#EXCLUDED[@]})) && log INFO "Excluding: ${EXCLUDED[*]}"
+    ((${#INCLUDED[@]})) && log INFO "Limiting to: ${INCLUDED[*]}"
+
+    if ((CLUSTER_MODE)); then
+        command -v ssh >/dev/null 2>&1 || die "$EX_PREREQ" "ssh not found; cluster mode needs it to reach other nodes."
+        run_cluster
+        ((${#NODES_FAILED[@]} == 0)) && return 0
+        # Unreachable nodes and failed containers share exit 1, matching the
+        # repo-wide table. The two are told apart by the lzc_lxc_nodes metric
+        # and by the summary, not by overloading the exit status.
+        return "$EX_FAIL"
+    fi
+
+    run_local_node
+    ((${#FAILED[@]} == 0))
 }
 
-# Trap for cleanup
-cleanup() {
-    log "INFO" "Script interrupted, cleaning up..."
-    exit 130
-}
-
-# Set up signal handling
-trap cleanup INT TERM
-
-# Execute main function
 main "$@"

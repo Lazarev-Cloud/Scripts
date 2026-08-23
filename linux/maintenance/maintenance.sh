@@ -1,2205 +1,1849 @@
 #!/usr/bin/env bash
-
-# Comprehensive Maintenance Script for Debian/Ubuntu
-# Author: YourName
+#
+# Linux system maintenance runner.
+#
+# Runs named maintenance tasks -- health reporting, package updates, cache/log/
+# tmp cleanup and package-state repair -- on Debian/Ubuntu and RHEL-family
+# hosts. Nothing runs unless you name it, every task that changes the system is
+# previewable with --dry-run, and unattended runs need --yes.
+#
 # License: MIT
-# Repository: https://github.com/yourusername/maintenance-script
+# Origin:  https://github.com/Lazarev-Cloud/Scripts
+#
+# Error model: this script deliberately does NOT use `set -e`. It is a batch
+# runner -- when one task fails the remaining tasks must still run and the
+# failure must be reported at the end. Every fallible command is therefore
+# checked explicitly and routed into FAILED_TASKS[]. Do not add `set -e`, and do
+# not invoke this script as `maintenance.sh || true`: both make the error
+# handling non-local and hide exactly the failures this script exists to report.
+set -uo pipefail
 
-function header_info {
-  clear
-  cat <<"EOF"
-   __  __          __      __          ____                 
-  / / / /___  ____/ /___ _/ /____     / __ \___  ____  ____ 
- / / / / __ \/ __  / __ `/ __/ _ \   / /_/ / _ \/ __ \/ __ \
-/ /_/ / /_/ / /_/ / /_/ / /_/  __/  / _, _/  __/ /_/ / /_/ /
-\____/ .___/\__,_/\__,_/\__/\___/  /_/ |_|\___/ .___/\____/ 
-    /_/                                      /_/            
-EOF
-}
+readonly SCRIPT_NAME='Linux Maintenance Runner'
+readonly SCRIPT_VERSION='2.1'
+readonly PROG='maintenance.sh'
 
-set -eEuo pipefail
-BL=$(echo "\033[36m")  # Blue
-RD=$(echo "\033[01;31m") # Red
-GN=$(echo "\033[1;92m")  # Green
-CL=$(echo "\033[m")      # Clear
+# Exit codes, shared by every script in this repository. 75 is EX_TEMPFAIL from
+# sysexits.h, which cron and systemd read as "retry later" rather than a fault.
+readonly EX_FAIL=1 EX_USAGE=2 EX_PREREQ=3 EX_NOROOT=4
+readonly EX_NOCONFIRM=5 EX_LOCKED=75 EX_INTERRUPT=130
 
-header_info
-echo "Loading..."
-LOG_FILE="/var/log/maintenance_script.log"
-NODE=$(hostname)
+# cron gives a script an almost empty environment and sources no profile, so the
+# search path is set here rather than in the crontab -- the script stays
+# self-contained and a missing PATH cannot turn into exit 127 halfway through.
+PATH="${LZC_MAINTENANCE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export PATH
 
-# Ensure the script is run as root.
-if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root. Please use sudo."
-   exit 1
-fi
+# --- Tunables (env overridable, then flag overridable) -----------------------
+LOG_FILE="${LZC_MAINTENANCE_LOG:-/var/log/maintenance.log}"
+LOG_MAX_BYTES="${LZC_MAINTENANCE_LOG_MAX_BYTES:-5242880}"
+LOCK_FILE="${LZC_MAINTENANCE_LOCK:-/run/lock/lzc-maintenance.lock}"
+TASK_TIMEOUT="${LZC_MAINTENANCE_TIMEOUT:-3600}"
+PROBE_TIMEOUT="${LZC_MAINTENANCE_PROBE_TIMEOUT:-30}"
+PKG_LOCK_WAIT="${LZC_MAINTENANCE_PKG_LOCK_WAIT:-600}"
+UPGRADE_MODE="${LZC_MAINTENANCE_UPGRADE_MODE:-upgrade}"
+NEEDRESTART_CHOICE="${LZC_MAINTENANCE_NEEDRESTART_MODE:-l}"
+DISK_WARN="${LZC_MAINTENANCE_DISK_WARN:-85}"
+INODE_WARN="${LZC_MAINTENANCE_INODE_WARN:-85}"
+FS_EXCLUDE="${LZC_MAINTENANCE_FS_EXCLUDE:-tmpfs devtmpfs squashfs overlay efivarfs}"
+ETC_DIR="${LZC_MAINTENANCE_ETC_DIR:-/etc}"
+LOG_DIR="${LZC_MAINTENANCE_LOG_DIR:-/var/log}"
+LOG_AGE_DAYS="${LZC_MAINTENANCE_LOG_AGE_DAYS:-30}"
+LOG_EXCLUDE="${LZC_MAINTENANCE_LOG_EXCLUDE:-audit wtmp btmp lastlog}"
+JOURNAL_SIZE="${LZC_MAINTENANCE_JOURNAL_SIZE:-500M}"
+JOURNAL_AGE="${LZC_MAINTENANCE_JOURNAL_AGE:-30d}"
+TMP_DIRS="${LZC_MAINTENANCE_TMP_DIRS:-/tmp /var/tmp}"
+TMP_AGE_DAYS="${LZC_MAINTENANCE_TMP_AGE_DAYS:-10}"
+TMP_MODE="${LZC_MAINTENANCE_TMP_MODE:-auto}"
+TMP_EXCLUDE="${LZC_MAINTENANCE_TMP_EXCLUDE:-.X11-unix .XIM-unix .ICE-unix .font-unix .Test-unix systemd-private snap-private-tmp}"
+ASSUME_YES="${LZC_MAINTENANCE_YES:-0}"
+DRY_RUN="${LZC_MAINTENANCE_DRY_RUN:-0}"
+QUIET="${LZC_MAINTENANCE_QUIET:-0}"
+USE_COLOR="${LZC_MAINTENANCE_COLOR:-auto}"
 
-# Initialize log file
-touch "$LOG_FILE"
-chmod 600 "$LOG_FILE"
+# --- Runtime state -----------------------------------------------------------
+declare -a TASKS=()
+declare -a FAILED_TASKS=()
+declare -a OK_TASKS=()
+declare -a SKIPPED_TASKS=()
+FAMILY=''
+PKG_TOOL=''
+REBOOT_REQUIRED=0
+HAVE_TIMEOUT=0
+LOG_READY=0
+LOG_SINK=/dev/null
+LOCK_HELD=0
+SUMMARY_DONE=0
+TASK_SKIPPED=0
+YW='' BL='' RD='' GN='' CL=''
 
-# Variables
-NOTIFY_EMAIL=""
+# --- Output ------------------------------------------------------------------
 
-# Function to display the help message.
-show_help() {
-    cat << EOF
-Usage: sudo $0 [options]
-
-Options:
-  --clean-logs                       Clean old log files.
-  --fix-apt-packages                 Fix broken APT packages and update system.
-  --fix-apt-lock                     Resolve APT lock issues.
-  --clean-disk                       Perform disk cleanup and remove unused packages.
-  --update-system                    Update and upgrade the entire system.
-  --backup [directory]               Create a backup of the specified directory.
-  --restore [backup_file] [restore_directory]  Restore from a backup.
-  --system-info                      Display system information.
-  --resource-usage                   Show CPU, memory, and disk usage.
-  --configure-firewall               Enable and configure the UFW firewall.
-  --security-scan                    Perform a security scan for rootkits and malware.
-  --add-user [username]              Add a new user.
-  --remove-user [username]           Remove an existing user.
-  --add-group [groupname]            Add a new group.
-  --remove-group [groupname]         Remove an existing group.
-  --manage-service [action] [service_name] Manage a specified service.
-  --schedule-task [task] [schedule]  Schedule a maintenance task with cron.
-  --list-scheduled-tasks             List all scheduled maintenance tasks.
-  --reboot [delay]                   Reboot the system immediately or after a specified delay in minutes.
-  --logrotate-configure              Set up custom log rotation.
-  --logrotate-trigger                Manually trigger log rotation.
-  --send-notification [email]        Send a notification after tasks.
-  --list-kernels                     List all installed kernels.
-  --remove-old-kernels               Remove old kernels, keeping the current and one previous.
-  --install-latest-kernel            Install the latest available kernel.
-  --set-default-kernel               Update GRUB with the current kernel as default.
-  --enable-unattended-upgrades       Enable automatic unattended upgrades.
-  --configure-auto-updates           Configure automatic update intervals.
-  --check-unattended-status          Check status of unattended upgrades.
-  --list-snap-packages               List all installed snap packages.
-  --remove-snap-package [pkg]        Remove a specified snap package.
-  --refresh-snap-packages            Refresh (update) all snap packages.
-  --install-snap-package [pkg]       Install a specified snap package.
-  --install-flatpak                   Install Flatpak.
-  --add-flatpak-repo [URL]            Add a Flatpak repository.
-  --list-flatpak-packages             List all installed Flatpak packages.
-  --remove-flatpak-package [pkg]       Remove a specified Flatpak package.
-  --refresh-flatpak-packages          Refresh (update) all Flatpak packages.
-  --check-swap                        Check current swap usage.
-  --create-swap [size]                Create a swap file of specified size (e.g., 2G, 512M).
-  --remove-swap                       Disable and remove the swap file.
-  --check-time-sync                   Check time synchronization status.
-  --enable-ntp                        Enable NTP time synchronization.
-  --disable-ntp                       Disable NTP time synchronization.
-  --set-timezone [timezone]           Set system timezone (e.g., 'Europe/London').
-  --add-apt-repo [repo] [key_url]     Add an APT repository with optional GPG key URL.
-  --remove-apt-repo [repo]            Remove a specified APT repository.
-  --list-apt-repos                    List all APT repositories.
-  --check-uptime                      Check system uptime.
-  --check-load                        Check system load averages.
-  --check-inodes                      Check disk inode usage.
-  --monitor-service [service]         Monitor the status of a specific service.
-  --run-fsck                          Schedule a filesystem check on next reboot.
-  --schedule-fsck                     Schedule regular filesystem checks weekly.
-  --install-docker                    Install Docker.
-  --start-docker                      Start and enable Docker service.
-  --stop-docker                       Stop and disable Docker service.
-  --list-docker-containers            List all running Docker containers.
-  --remove-docker-container [id]       Remove a specified Docker container.
-  --check-apparmor-status             Check AppArmor status.
-  --enable-apparmor                   Enable and start AppArmor.
-  --disable-apparmor                  Disable and stop AppArmor.
-  --reload-apparmor-profiles          Reload all AppArmor profiles.
-  --set-apparmor-mode [profile] [mode] Set AppArmor profile to 'enforce' or 'complain'.
-  --set-locale [locale]                Set system locale (e.g., 'en_US.UTF-8').
-  --generate-locales                   Generate missing locales.
-  --verify-backup [backup_file]        Verify the integrity of a specified backup file.
-  --list-backups                       List all available backups in /var/backups/.
-  --ensure-essential-packages          Check and install missing essential packages.
-  --list-missing-packages              List missing essential packages.
-  --search-logs [keyword]              Search system logs for a specific keyword.
-  --recent-logs [number]               Display the last [number] lines of /var/log/syslog (default: 100).
-  --compress-logs                      Compress old log files older than 7 days.
-  --archive-logs [destination]         Archive compressed logs to a specified destination.
-  --delete-archived-logs [dir] [days]  Delete archived logs older than specified days.
-  --install-lynis                      Install Lynis for system auditing.
-  --run-lynis-audit                    Run Lynis security audit.
-  --backup-network-config              Backup network configuration files.
-  --restore-network-config [file]       Restore network configuration from a backup file.
-  --exec-script [script_path]           Execute a custom script.
-  --exec-command [command]              Execute a custom command.
-  -h, --help                           Display this help message.
-
-Examples:
-  sudo $0 --clean-logs --fix-apt-packages
-  sudo $0 --backup /home/user/data --send-notification admin@example.com
-  sudo $0 --manage-service restart apache2
-EOF
-}
-
-# Function to log messages
-log_message() {
-    local message="$1"
-    echo "$(date +"%Y-%m-%d %H:%M:%S") : $message" | tee -a "$LOG_FILE"
-}
-
-# Function to send email notifications
-send_notification() {
-    local subject="$1"
-    local body="$2"
-    local email="$3"
-
-    if [[ -z "$email" ]]; then
-        echo "No notification email provided."
+setup_color() {
+    # NO_COLOR is honoured per no-color.org: any non-empty value disables colour.
+    # --color always still wins, because an explicit flag is a deliberate answer
+    # to the question the environment variable answers by default.
+    if [[ $USE_COLOR == never ]] ||
+        { [[ $USE_COLOR == auto ]] && { [[ -n ${NO_COLOR:-} ]] || [[ ! -t 1 ]]; }; }; then
         return
     fi
-
-    if command -v mail >/dev/null 2>&1; then
-        echo "$body" | mail -s "$subject" "$email"
-    else
-        echo "Mail utility not found. Cannot send notification."
-    fi
-}
-
-# ====== Maintenance Functions ======
-
-# 1. Log Management
-clean_logs() {
-    log_message "Cleaning old logs started."
-    echo "Cleaning old logs..."
-    find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
-    find /var/log -type f -name "*.gz" -exec rm -f {} \;
-    log_message "Old logs cleaned."
-    echo "Old logs cleaned."
-}
-
-# 2. Package Management
-fix_apt_packages() {
-    log_message "Fixing broken APT packages started."
-    echo "Fixing broken APT packages..."
-    apt --fix-broken install -y
-    dpkg --configure -a
-    apt update
-    apt upgrade -y
-    log_message "APT packages fixed and system updated."
-    echo "APT package issues fixed and system updated."
-}
-
-# 3. APT Lock Management
-fix_apt_lock() {
-    log_message "Fixing APT lock issues started."
-    echo "Fixing APT lock issues..."
-    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
-    dpkg --configure -a
-    apt update
-    log_message "APT lock issues resolved."
-    echo "APT lock issues resolved."
-}
-
-# 4. Disk Cleanup
-clean_disk() {
-    log_message "Disk cleanup started."
-    echo "Cleaning disk space..."
-
-    # Remove unused packages
-    apt autoremove -y
-    apt clean
-    apt autoclean
-
-    # Remove temporary files
-    rm -rf /tmp/*
-
-    log_message "Disk cleanup completed."
-    echo "Disk cleanup completed."
-}
-
-# 5. System Update
-update_system() {
-    log_message "System update and upgrade started."
-    echo "Updating and upgrading the system..."
-    apt update
-    apt upgrade -y
-    apt dist-upgrade -y
-    log_message "System update and upgrade completed."
-    echo "System update and upgrade completed."
-}
-
-# 6. Backup and Restore
-backup_system() {
-    local backup_dir="$1"
-    local timestamp
-    timestamp=$(date +"%Y%m%d_%H%M%S")
-    local backup_file="/var/backups/backup_${timestamp}.tar.gz"
-
-    if [[ -z "$backup_dir" ]]; then
-        echo "Please specify a directory to back up."
-        log_message "Backup failed: No directory specified."
-        return 1
-    fi
-
-    if [[ ! -d "$backup_dir" ]]; then
-        echo "Directory $backup_dir does not exist."
-        log_message "Backup failed: Directory $backup_dir does not exist."
-        return 1
-    fi
-
-    echo "Creating backup of $backup_dir..."
-    tar -czvf "$backup_file" "$backup_dir" &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Backup created: $backup_file"
-        echo "Backup created: $backup_file"
-    else
-        log_message "Backup failed for directory: $backup_dir"
-        echo "Backup failed."
-    fi
-}
-
-restore_backup() {
-    local backup_file="$1"
-    local restore_dir="$2"
-
-    if [[ -z "$backup_file" || -z "$restore_dir" ]]; then
-        echo "Please specify both backup file and restore directory."
-        log_message "Restore failed: Missing backup file or restore directory."
-        return 1
-    fi
-
-    if [[ ! -f "$backup_file" ]]; then
-        echo "Backup file $backup_file does not exist."
-        log_message "Restore failed: Backup file $backup_file does not exist."
-        return 1
-    fi
-
-    if [[ ! -d "$restore_dir" ]]; then
-        echo "Restore directory $restore_dir does not exist. Creating it."
-        mkdir -p "$restore_dir"
-    fi
-
-    echo "Restoring backup from $backup_file to $restore_dir..."
-    tar -xzvf "$backup_file" -C "$restore_dir" &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Backup restored from $backup_file to $restore_dir."
-        echo "Backup restored successfully."
-    else
-        log_message "Restore failed from $backup_file to $restore_dir."
-        echo "Restore failed."
-    fi
-}
-
-# 7. System Information
-system_info() {
-    echo "System Information:"
-    uname -a
-    lsb_release -a 2>/dev/null
-    echo ""
-    echo "CPU Information:"
-    lscpu
-    echo ""
-    echo "Memory Usage:"
-    free -h
-    echo ""
-    echo "Disk Usage:"
-    df -h
-    echo ""
-    echo "Network Interfaces:"
-    ip addr show
-    log_message "Displayed system information."
-}
-
-# 8. Resource Usage
-resource_usage() {
-    echo "CPU and Memory Usage:"
-    top -b -n1 | head -15
-    echo ""
-    echo "Disk I/O:"
-    iostat
-    log_message "Displayed resource usage."
-}
-
-# 9. Firewall Configuration
-configure_firewall() {
-    log_message "Configuring UFW firewall started."
-    echo "Configuring UFW firewall..."
-
-    if command -v ufw >/dev/null 2>&1; then
-        ufw enable
-        ufw allow ssh
-        ufw allow http
-        ufw allow https
-        ufw status verbose
-        log_message "UFW firewall configured."
-        echo "UFW firewall configured."
-    else
-        echo "UFW is not installed. Installing UFW..."
-        apt install ufw -y &>> "$LOG_FILE"
-        if [[ $? -eq 0 ]]; then
-            ufw enable
-            ufw allow ssh
-            ufw allow http
-            ufw allow https
-            ufw status verbose
-            log_message "UFW firewall installed and configured."
-            echo "UFW firewall installed and configured."
-        else
-            echo "Failed to install UFW."
-            log_message "Failed to install UFW."
-        fi
-    fi
-}
-
-# 10. Security Scan
-security_scan() {
-    log_message "Security scan started."
-    echo "Performing security scan..."
-
-    if command -v rkhunter >/dev/null 2>&1; then
-        rkhunter --update
-        rkhunter --check --sk
-    else
-        echo "rkhunter is not installed. Installing rkhunter..."
-        apt install rkhunter -y &>> "$LOG_FILE"
-        if [[ $? -eq 0 ]]; then
-            rkhunter --update
-            rkhunter --check --sk
-            log_message "rkhunter installed and security scan completed."
-            echo "rkhunter installed and security scan completed."
-        else
-            echo "Failed to install rkhunter."
-            log_message "Failed to install rkhunter."
-        fi
-    fi
-}
-
-# 11. User and Group Management
-add_user() {
-    local username="$1"
-
-    if [[ -z "$username" ]]; then
-        echo "Please provide a username to add."
-        log_message "Add user failed: No username provided."
-        return 1
-    fi
-
-    if id "$username" &>/dev/null; then
-        echo "User $username already exists."
-        log_message "Add user failed: User $username already exists."
-        return 1
-    fi
-
-    useradd -m "$username"
-    if [[ $? -eq 0 ]]; then
-        passwd "$username"
-        log_message "User $username added successfully."
-        echo "User $username added successfully."
-    else
-        log_message "Failed to add user $username."
-        echo "Failed to add user."
-    fi
-}
-
-remove_user() {
-    local username="$1"
-
-    if [[ -z "$username" ]]; then
-        echo "Please provide a username to remove."
-        log_message "Remove user failed: No username provided."
-        return 1
-    fi
-
-    if ! id "$username" &>/dev/null; then
-        echo "User $username does not exist."
-        log_message "Remove user failed: User $username does not exist."
-        return 1
-    fi
-
-    userdel -r "$username"
-    if [[ $? -eq 0 ]]; then
-        log_message "User $username removed successfully."
-        echo "User $username removed successfully."
-    else
-        log_message "Failed to remove user $username."
-        echo "Failed to remove user."
-    fi
-}
-
-add_group() {
-    local group="$1"
-
-    if [[ -z "$group" ]]; then
-        echo "Please provide a group name to add."
-        log_message "Add group failed: No group name provided."
-        return 1
-    fi
-
-    if getent group "$group" >/dev/null; then
-        echo "Group $group already exists."
-        log_message "Add group failed: Group $group already exists."
-        return 1
-    fi
-
-    groupadd "$group"
-    if [[ $? -eq 0 ]]; then
-        log_message "Group $group added successfully."
-        echo "Group $group added successfully."
-    else
-        log_message "Failed to add group $group."
-        echo "Failed to add group."
-    fi
-}
-
-remove_group() {
-    local group="$1"
-
-    if [[ -z "$group" ]]; then
-        echo "Please provide a group name to remove."
-        log_message "Remove group failed: No group name provided."
-        return 1
-    fi
-
-    if ! getent group "$group" >/dev/null; then
-        echo "Group $group does not exist."
-        log_message "Remove group failed: Group $group does not exist."
-        return 1
-    fi
-
-    groupdel "$group"
-    if [[ $? -eq 0 ]]; then
-        log_message "Group $group removed successfully."
-        echo "Group $group removed successfully."
-    else
-        log_message "Failed to remove group $group."
-        echo "Failed to remove group."
-    fi
-}
-
-# 12. Service Management
-manage_service() {
-    local action="$1"
-    local service="$2"
-
-    if [[ -z "$action" || -z "$service" ]]; then
-        echo "Please specify both action and service name."
-        log_message "Manage service failed: Missing action or service name."
-        return 1
-    fi
-
-    if ! systemctl list-unit-files | grep -qw "$service"; then
-        echo "Service $service does not exist."
-        log_message "Manage service failed: Service $service does not exist."
-        return 1
-    fi
-
-    systemctl "$action" "$service" &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Service $service $action successfully."
-        echo "Service $service $action successfully."
-    else
-        log_message "Failed to $action service $service."
-        echo "Failed to $action service."
-    fi
-}
-
-# 13. Scheduling Tasks
-schedule_task() {
-    local task="$1"
-    local schedule="$2"
-
-    if [[ -z "$task" || -z "$schedule" ]]; then
-        echo "Please provide both a task and a schedule."
-        echo "Example schedule: '0 2 * * *' for daily at 2 AM."
-        log_message "Schedule task failed: Missing task or schedule."
-        return 1
-    fi
-
-    # Basic cron schedule validation
-    if ! [[ "$schedule" =~ ^([0-5]?[0-9]|[0-5][0-9])\ ([0-9]|1[0-9]|2[0-3])\ ([1-9]|[12][0-9]|3[01])\ ([1-9]|1[0-2])\ ([0-6])$ ]]; then
-        echo "Invalid cron schedule format."
-        log_message "Schedule task failed: Invalid cron schedule format."
-        return 1
-    fi
-
-    (crontab -l 2>/dev/null; echo "$schedule $0 $task") | crontab -
-    if [[ $? -eq 0 ]]; then
-        log_message "Task '$task' scheduled with cron at '$schedule'."
-        echo "Task '$task' scheduled successfully."
-    else
-        log_message "Failed to schedule task '$task' with cron."
-        echo "Failed to schedule task."
-    fi
-}
-
-list_scheduled_tasks() {
-    echo "Scheduled Maintenance Tasks (crontab):"
-    crontab -l
-    log_message "Listed scheduled maintenance tasks."
-}
-
-# 14. Reboot System
-reboot_system() {
-    local delay="$1"
-    if [[ -n "$delay" ]]; then
-        echo "System will reboot in $delay minutes."
-        shutdown -r +"$delay" "Reboot initiated by maintenance script."
-        log_message "System scheduled to reboot in $delay minutes."
-    else
-        echo "Rebooting the system now..."
-        shutdown -r now "Reboot initiated by maintenance script."
-        log_message "System reboot initiated."
-    fi
-}
-
-# 15. Log Rotation
-configure_logrotate() {
-    log_message "Configuring log rotation started."
-    echo "Configuring log rotation..."
-
-    local logrotate_conf="/etc/logrotate.d/custom"
-
-    if [[ ! -f "$logrotate_conf" ]]; then
-        cat << EOF > "$logrotate_conf"
-/var/log/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 0640 root adm
-    sharedscripts
-    postrotate
-        systemctl reload rsyslog > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-        log_message "Custom logrotate configuration created at $logrotate_conf."
-        echo "Custom logrotate configuration created."
-    else
-        log_message "Custom logrotate configuration already exists at $logrotate_conf."
-        echo "Custom logrotate configuration already exists."
-    fi
-
-    log_message "Log rotation configured."
-}
-
-trigger_logrotate() {
-    log_message "Triggering log rotation."
-    echo "Triggering log rotation..."
-    logrotate -f /etc/logrotate.conf
-    if [[ $? -eq 0 ]]; then
-        log_message "Log rotation triggered successfully."
-        echo "Log rotation triggered successfully."
-    else
-        log_message "Log rotation failed."
-        echo "Log rotation failed."
-    fi
-}
-
-# 16. Notifications
-notify_after_task() {
-    if [[ -n "$NOTIFY_EMAIL" ]]; then
-        local subject="Maintenance Script Notification"
-        local body="The maintenance script has completed its tasks successfully."
-        send_notification "$subject" "$body" "$NOTIFY_EMAIL"
-    fi
-}
-
-# 17. Kernel Management
-list_kernels() {
-    echo "Installed Kernels:"
-    dpkg --list | grep linux-image | awk '{print $2}'
-    log_message "Listed installed kernels."
-}
-
-remove_old_kernels() {
-    echo "Removing old kernels..."
-    current_kernel=$(uname -r | sed 's/-generic//')
-    dpkg --list | grep linux-image | awk '{print $2}' | grep -v "$current_kernel" | grep -v "$(apt-cache showpkg linux-image-$(uname -r | awk -F'-' '{print $1"-"$2}'))" | xargs sudo apt-get -y purge
-    apt autoremove -y
-    log_message "Old kernels removed."
-    echo "Old kernels removed."
-}
-
-install_latest_kernel() {
-    echo "Installing the latest kernel..."
-    apt update
-    apt install -y linux-generic
-    log_message "Latest kernel installed."
-    echo "Latest kernel installed."
-}
-
-set_default_kernel() {
-    echo "Setting default kernel in GRUB..."
-    update-grub
-    log_message "GRUB updated with the default kernel."
-    echo "Default kernel set."
-}
-
-# 18. Unattended Upgrades
-enable_unattended_upgrades() {
-    echo "Enabling unattended upgrades..."
-    apt install -y unattended-upgrades
-    dpkg-reconfigure --priority=low unattended-upgrades
-    log_message "Unattended upgrades enabled."
-    echo "Unattended upgrades enabled."
-}
-
-configure_automatic_updates() {
-    echo "Configuring automatic updates..."
-    cat << EOF > /etc/apt/apt.conf.d/20auto-upgrades
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::AutocleanInterval "7";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-    log_message "Automatic updates configured."
-    echo "Automatic updates configured."
-}
-
-check_unattended_upgrades() {
-    systemctl status unattended-upgrades
-    log_message "Checked unattended upgrades status."
-}
-
-# 19. Snap Package Management
-list_snap_packages() {
-    echo "Installed Snap Packages:"
-    snap list
-    log_message "Listed installed snap packages."
-}
-
-remove_snap_package() {
-    local package="$1"
-    if [[ -z "$package" ]]; then
-        echo "Please provide a snap package name to remove."
-        log_message "Remove snap package failed: No package name provided."
-        return 1
-    fi
-    snap remove "$package"
-    if [[ $? -eq 0 ]]; then
-        log_message "Snap package $package removed successfully."
-        echo "Snap package $package removed successfully."
-    else
-        log_message "Failed to remove snap package $package."
-        echo "Failed to remove snap package."
-    fi
-}
-
-refresh_snap_packages() {
-    echo "Refreshing (updating) snap packages..."
-    snap refresh
-    log_message "Snap packages refreshed."
-    echo "Snap packages refreshed."
-}
-
-install_snap_package() {
-    local package="$1"
-    if [[ -z "$package" ]]; then
-        echo "Please provide a snap package name to install."
-        log_message "Install snap package failed: No package name provided."
-        return 1
-    fi
-    snap install "$package"
-    if [[ $? -eq 0 ]]; then
-        log_message "Snap package $package installed successfully."
-        echo "Snap package $package installed successfully."
-    else
-        log_message "Failed to install snap package $package."
-        echo "Failed to install snap package."
-    fi
-}
-
-# 20. Flatpak Package Management
-install_flatpak() {
-    echo "Installing Flatpak..."
-    apt update
-    apt install -y flatpak
-    if [[ $? -eq 0 ]]; then
-        log_message "Flatpak installed successfully."
-        echo "Flatpak installed successfully."
-    else
-        log_message "Failed to install Flatpak."
-        echo "Failed to install Flatpak."
-    fi
-}
-
-add_flatpak_repo() {
-    local repo_url="$1"
-    if [[ -z "$repo_url" ]]; then
-        echo "Please provide a Flatpak repository URL."
-        log_message "Add Flatpak repo failed: No repository URL provided."
-        return 1
-    fi
-    flatpak remote-add --if-not-exists flathub "$repo_url"
-    if [[ $? -eq 0 ]]; then
-        log_message "Flatpak repository $repo_url added successfully."
-        echo "Flatpak repository added successfully."
-    else
-        log_message "Failed to add Flatpak repository $repo_url."
-        echo "Failed to add Flatpak repository."
-    fi
-}
-
-list_flatpak_packages() {
-    echo "Installed Flatpak Packages:"
-    flatpak list
-    log_message "Listed installed Flatpak packages."
-}
-
-remove_flatpak_package() {
-    local package="$1"
-    if [[ -z "$package" ]]; then
-        echo "Please provide a Flatpak package name to remove."
-        log_message "Remove Flatpak package failed: No package name provided."
-        return 1
-    fi
-    flatpak uninstall -y "$package"
-    if [[ $? -eq 0 ]]; then
-        log_message "Flatpak package $package removed successfully."
-        echo "Flatpak package $package removed successfully."
-    else
-        log_message "Failed to remove Flatpak package $package."
-        echo "Failed to remove Flatpak package."
-    fi
-}
-
-refresh_flatpak_packages() {
-    echo "Refreshing (updating) Flatpak packages..."
-    flatpak update -y
-    if [[ $? -eq 0 ]]; then
-        log_message "Flatpak packages refreshed."
-        echo "Flatpak packages refreshed."
-    else
-        log_message "Failed to refresh Flatpak packages."
-        echo "Failed to refresh Flatpak packages."
-    fi
-}
-
-# 21. Swap Space Management
-check_swap() {
-    echo "Swap Usage:"
-    swapon --show
-    free -h
-    log_message "Checked swap usage."
-}
-
-create_swap() {
-    local swap_size="$1"
-    if [[ -z "$swap_size" ]]; then
-        echo "Please provide swap size (e.g., 2G, 512M)."
-        log_message "Create swap failed: No swap size provided."
-        return 1
-    fi
-    fallocate -l "$swap_size" /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
-    log_message "Swap file of size $swap_size created and enabled."
-    echo "Swap file created and enabled."
-}
-
-remove_swap() {
-    echo "Disabling and removing swap file..."
-    swapoff /swapfile
-    rm /swapfile
-    sed -i '/\/swapfile/d' /etc/fstab
-    log_message "Swap file disabled and removed."
-    echo "Swap file disabled and removed."
-}
-
-# 22. Time Synchronization Management
-check_time_sync() {
-    timedatectl status
-    log_message "Checked time synchronization status."
-}
-
-enable_ntp() {
-    echo "Enabling NTP time synchronization..."
-    timedatectl set-ntp true
-    log_message "NTP time synchronization enabled."
-    echo "NTP time synchronization enabled."
-}
-
-disable_ntp() {
-    echo "Disabling NTP time synchronization..."
-    timedatectl set-ntp false
-    log_message "NTP time synchronization disabled."
-    echo "NTP time synchronization disabled."
-}
-
-set_timezone() {
-    local timezone="$1"
-    if [[ -z "$timezone" ]]; then
-        echo "Please provide a timezone (e.g., 'Europe/London')."
-        log_message "Set timezone failed: No timezone provided."
-        return 1
-    fi
-    timedatectl set-timezone "$timezone"
-    if [[ $? -eq 0 ]]; then
-        log_message "Timezone set to $timezone."
-        echo "Timezone set to $timezone."
-    else
-        log_message "Failed to set timezone to $timezone."
-        echo "Failed to set timezone."
-    fi
-}
-
-# 23. APT Repository Management
-add_apt_repo() {
-    local repo="$1"
-    local key_url="$2"
-
-    if [[ -z "$repo" ]]; then
-        echo "Please provide an APT repository string."
-        log_message "Add APT repo failed: No repository string provided."
-        return 1
-    fi
-
-    echo "Adding APT repository: $repo"
-    add-apt-repository -y "$repo"
-    if [[ -n "$key_url" ]]; then
-        wget -qO - "$key_url" | apt-key add -
-        if [[ $? -eq 0 ]]; then
-            log_message "GPG key added from $key_url."
-            echo "GPG key added."
-        else
-            log_message "Failed to add GPG key from $key_url."
-            echo "Failed to add GPG key."
-        fi
-    fi
-    apt update
-    log_message "APT repository $repo added."
-    echo "APT repository added successfully."
-}
-
-remove_apt_repo() {
-    local repo="$1"
-
-    if [[ -z "$repo" ]]; then
-        echo "Please provide an APT repository string to remove."
-        log_message "Remove APT repo failed: No repository string provided."
-        return 1
-    fi
-
-    echo "Removing APT repository: $repo"
-    add-apt-repository --remove -y "$repo"
-    apt update
-    log_message "APT repository $repo removed."
-    echo "APT repository removed successfully."
-}
-
-list_apt_repos() {
-    echo "Current APT Repositories:"
-    grep -r ^deb /etc/apt/sources.list /etc/apt/sources.list.d/
-    log_message "Listed APT repositories."
-}
-
-# 24. System Health Monitoring
-check_uptime() {
-    echo "System Uptime:"
-    uptime
-    log_message "Checked system uptime."
-}
-
-check_load() {
-    echo "Load Averages:"
-    uptime | awk -F 'load average:' '{ print $2 }'
-    log_message "Checked load averages."
-}
-
-check_disk_inodes() {
-    echo "Disk Inode Usage:"
-    df -i
-    log_message "Checked disk inode usage."
-}
-
-monitor_service() {
-    local service="$1"
-    if [[ -z "$service" ]]; then
-        echo "Please provide a service name to monitor."
-        log_message "Monitor service failed: No service name provided."
-        return 1
-    fi
-
-    if systemctl is-active --quiet "$service"; then
-        echo "Service $service is running."
-    else
-        echo "Service $service is NOT running."
-    fi
-    log_message "Monitored service $service."
-}
-
-# 25. Filesystem Integrity Check
-run_fsck() {
-    echo "Running filesystem check..."
-    touch /forcefsck
-    log_message "Filesystem check scheduled on next reboot."
-    echo "Filesystem check scheduled on next reboot."
-}
-
-schedule_fsck() {
-    echo "Scheduling regular filesystem checks..."
-    echo "0 3 * * 1 root /sbin/fsck -Af -M" >> /etc/crontab
-    log_message "Regular filesystem checks scheduled."
-    echo "Regular filesystem checks scheduled."
-}
-
-# 26. Docker Management
-install_docker() {
-    echo "Installing Docker..."
-    apt update
-    apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
-      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt update
-    apt install -y docker-ce docker-ce-cli containerd.io
-    log_message "Docker installed successfully."
-    echo "Docker installed successfully."
-}
-
-start_docker() {
-    systemctl start docker
-    systemctl enable docker
-    log_message "Docker service started and enabled."
-    echo "Docker service started and enabled."
-}
-
-stop_docker() {
-    systemctl stop docker
-    systemctl disable docker
-    log_message "Docker service stopped and disabled."
-    echo "Docker service stopped and disabled."
-}
-
-list_docker_containers() {
-    echo "Running Docker Containers:"
-    docker ps
-    log_message "Listed Docker containers."
-}
-
-remove_docker_container() {
-    local container_id="$1"
-    if [[ -z "$container_id" ]]; then
-        echo "Please provide a Docker container ID to remove."
-        log_message "Remove Docker container failed: No container ID provided."
-        return 1
-    fi
-    docker rm -f "$container_id"
-    if [[ $? -eq 0 ]]; then
-        log_message "Docker container $container_id removed successfully."
-        echo "Docker container $container_id removed successfully."
-    else
-        log_message "Failed to remove Docker container $container_id."
-        echo "Failed to remove Docker container."
-    fi
-}
-
-# 27. AppArmor Management
-check_apparmor_status() {
-    apparmor_status
-    log_message "Checked AppArmor status."
-}
-
-enable_apparmor() {
-    echo "Enabling AppArmor..."
-    systemctl enable apparmor
-    systemctl start apparmor
-    log_message "AppArmor enabled."
-    echo "AppArmor enabled."
-}
-
-disable_apparmor() {
-    echo "Disabling AppArmor..."
-    systemctl stop apparmor
-    systemctl disable apparmor
-    log_message "AppArmor disabled."
-    echo "AppArmor disabled."
-}
-
-reload_apparmor_profiles() {
-    echo "Reloading AppArmor profiles..."
-    apparmor_parser -r /etc/apparmor.d/*
-    log_message "AppArmor profiles reloaded."
-    echo "AppArmor profiles reloaded."
-}
-
-set_apparmor_mode() {
-    local profile="$1"
-    local mode="$2"
-
-    if [[ -z "$profile" || -z "$mode" ]]; then
-        echo "Please provide both profile name and mode (enforce/complain)."
-        log_message "Set AppArmor mode failed: Missing profile name or mode."
-        return 1
-    fi
-
-    if [[ "$mode" == "enforce" ]]; then
-        aa-enforce "$profile"
-    elif [[ "$mode" == "complain" ]]; then
-        aa-complain "$profile"
-    else
-        echo "Invalid mode. Use 'enforce' or 'complain'."
-        log_message "Set AppArmor mode failed: Invalid mode."
-        return 1
-    fi
-
-    if [[ $? -eq 0 ]]; then
-        log_message "AppArmor profile $profile set to $mode mode."
-        echo "AppArmor profile $profile set to $mode mode."
-    else
-        log_message "Failed to set AppArmor profile $profile to $mode mode."
-        echo "Failed to set AppArmor profile."
-    fi
-}
-
-# 28. Localization and Timezone Settings
-set_system_locale() {
-    local locale="$1"
-    if [[ -z "$locale" ]]; then
-        echo "Please provide a locale (e.g., 'en_US.UTF-8')."
-        log_message "Set locale failed: No locale provided."
-        return 1
-    fi
-    echo "Setting system locale to $locale..."
-    locale-gen "$locale"
-    update-locale LANG="$locale"
-    log_message "System locale set to $locale."
-    echo "System locale set to $locale."
-}
-
-generate_locales() {
-    echo "Generating missing locales..."
-    dpkg-reconfigure locales
-    log_message "Locales generated."
-    echo "Locales generated."
-}
-
-# 29. Backup Verification
-verify_backup() {
-    local backup_file="$1"
-
-    if [[ -z "$backup_file" ]]; then
-        echo "Please provide a backup file to verify."
-        log_message "Verify backup failed: No backup file provided."
-        return 1
-    fi
-
-    if [[ ! -f "$backup_file" ]]; then
-        echo "Backup file $backup_file does not exist."
-        log_message "Verify backup failed: Backup file $backup_file does not exist."
-        return 1
-    fi
-
-    echo "Verifying backup integrity..."
-    tar -tzf "$backup_file" &>/dev/null
-    if [[ $? -eq 0 ]]; then
-        log_message "Backup $backup_file is valid."
-        echo "Backup $backup_file is valid."
-    else
-        log_message "Backup $backup_file is corrupted or invalid."
-        echo "Backup $backup_file is corrupted or invalid."
-    fi
-}
-
-list_backups() {
-    echo "Available Backups in /var/backups/:"
-    ls /var/backups/backup_*.tar.gz
-    log_message "Listed available backups."
-}
-
-# 30. Essential Package Checks
-ensure_essential_packages() {
-    local packages=("curl" "wget" "git" "vim" "htop" "tmux" "net-tools" "gnupg" "software-properties-common" "iostat")
-    local missing=()
-
-    for pkg in "${packages[@]}"; do
-        if ! dpkg -s "$pkg" &>/dev/null; then
-            missing+=("$pkg")
-        fi
-    done
-
-    if [[ ${#missing[@]} -eq 0 ]]; then
-        echo "All essential packages are installed."
-        log_message "All essential packages are installed."
-    else
-        echo "Installing missing essential packages: ${missing[*]}"
-        apt install -y "${missing[@]}"
-        if [[ $? -eq 0 ]]; then
-            log_message "Essential packages installed: ${missing[*]}"
-            echo "Essential packages installed successfully."
-        else
-            log_message "Failed to install essential packages: ${missing[*]}"
-            echo "Failed to install some essential packages."
-        fi
-    fi
-}
-
-list_missing_packages() {
-    local packages=("curl" "wget" "git" "vim" "htop" "tmux" "net-tools" "gnupg" "software-properties-common" "iostat")
-    local missing=()
-
-    for pkg in "${packages[@]}"; do
-        if ! dpkg -s "$pkg" &>/dev/null; then
-            missing+=("$pkg")
-        fi
-    done
-
-    if [[ ${#missing[@]} -eq 0 ]]; then
-        echo "All essential packages are installed."
-    else
-        echo "Missing essential packages: ${missing[*]}"
-    fi
-    log_message "Listed missing essential packages."
-}
-
-# 31. System Log Analysis
-search_logs() {
-    local keyword="$1"
-    if [[ -z "$keyword" ]]; then
-        echo "Please provide a keyword to search in logs."
-        log_message "Search logs failed: No keyword provided."
-        return 1
-    fi
-
-    echo "Searching /var/log for keyword: $keyword"
-    grep -i "$keyword" /var/log/*.log
-    log_message "Searched logs for keyword: $keyword."
-}
-
-recent_logs() {
-    local num="$1"
-    if [[ -z "$num" ]]; then
-        num=100
-    fi
-
-    echo "Displaying the last $num lines of /var/log/syslog:"
-    tail -n "$num" /var/log/syslog
-    log_message "Displayed the last $num lines of /var/log/syslog."
-}
-
-# 32. Advanced Log Management
-compress_old_logs() {
-    echo "Compressing old logs..."
-    find /var/log -type f -name "*.log" -mtime +7 -exec gzip {} \;
-    log_message "Old logs compressed."
-    echo "Old logs compressed."
-}
-
-archive_logs() {
-    local destination="$1"
-    if [[ -z "$destination" ]]; then
-        echo "Please provide a destination path for archiving logs."
-        log_message "Archive logs failed: No destination provided."
-        return 1
-    fi
-
-    echo "Archiving logs to $destination..."
-    tar -czvf "$destination/logs_archive_$(date +"%Y%m%d_%H%M%S").tar.gz" /var/log/*.gz /var/log/*.log.gz &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Logs archived to $destination."
-        echo "Logs archived successfully."
-    else
-        log_message "Failed to archive logs to $destination."
-        echo "Failed to archive logs."
-    fi
-}
-
-delete_archived_logs() {
-    local archive_dir="$1"
-    local retention_days="$2"
-
-    if [[ -z "$archive_dir" || -z "$retention_days" ]]; then
-        echo "Please provide both archive directory and retention days."
-        log_message "Delete archived logs failed: Missing archive directory or retention days."
-        return 1
-    fi
-
-    echo "Deleting archived logs older than $retention_days days from $archive_dir..."
-    find "$archive_dir" -type f -name "logs_archive_*.tar.gz" -mtime +"$retention_days" -exec rm -f {} \;
-    log_message "Archived logs older than $retention_days days deleted from $archive_dir."
-    echo "Archived logs deleted successfully."
-}
-
-# 33. Lynis Security Audit
-install_lynis() {
-    echo "Installing Lynis for system auditing..."
-    apt install -y lynis
-    if [[ $? -eq 0 ]]; then
-        log_message "Lynis installed successfully."
-        echo "Lynis installed successfully."
-    else
-        log_message "Failed to install Lynis."
-        echo "Failed to install Lynis."
-    fi
-}
-
-run_lynis_audit() {
-    if ! command -v lynis >/dev/null 2>&1; then
-        echo "Lynis is not installed. Installing now..."
-        install_lynis
-    fi
-
-    echo "Running Lynis security audit..."
-    lynis audit system
-    log_message "Lynis security audit completed."
-}
-
-# 34. Network Configuration Backup
-backup_network_config() {
-    local backup_file="/var/backups/network_config_backup_$(date +"%Y%m%d_%H%M%S").tar.gz"
-    echo "Backing up network configuration..."
-    tar -czvf "$backup_file" /etc/network /etc/netplan /etc/NetworkManager &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Network configuration backed up to $backup_file."
-        echo "Network configuration backed up to $backup_file."
-    else
-        log_message "Failed to backup network configuration."
-        echo "Failed to backup network configuration."
-    fi
-}
-
-restore_network_config() {
-    local backup_file="$1"
-
-    if [[ -z "$backup_file" ]]; then
-        echo "Please provide a backup file to restore."
-        log_message "Restore network config failed: No backup file provided."
-        return 1
-    fi
-
-    if [[ ! -f "$backup_file" ]]; then
-        echo "Backup file $backup_file does not exist."
-        log_message "Restore network config failed: Backup file $backup_file does not exist."
-        return 1
-    fi
-
-    echo "Restoring network configuration from $backup_file..."
-    tar -xzvf "$backup_file" -C / &>> "$LOG_FILE"
-    if [[ $? -eq 0 ]]; then
-        log_message "Network configuration restored from $backup_file."
-        echo "Network configuration restored successfully."
-    else
-        log_message "Failed to restore network configuration from $backup_file."
-        echo "Failed to restore network configuration."
-    fi
-}
-
-# 35. Custom Script Execution
-execute_custom_script() {
-    local script_path="$1"
-
-    if [[ -z "$script_path" ]]; then
-        echo "Please provide the path to the script to execute."
-        log_message "Execute custom script failed: No script path provided."
-        return 1
-    fi
-
-    if [[ ! -f "$script_path" ]]; then
-        echo "Script file $script_path does not exist."
-        log_message "Execute custom script failed: Script file $script_path does not exist."
-        return 1
-    fi
-
-    chmod +x "$script_path"
-    "$script_path"
-    if [[ $? -eq 0 ]]; then
-        log_message "Custom script $script_path executed successfully."
-        echo "Custom script executed successfully."
-    else
-        log_message "Failed to execute custom script $script_path."
-        echo "Failed to execute custom script."
-    fi
-}
-
-execute_custom_command() {
-    local command="$1"
-
-    if [[ -z "$command" ]]; then
-        echo "Please provide the command to execute."
-        log_message "Execute custom command failed: No command provided."
-        return 1
-    fi
-
-    echo "Executing custom command: $command"
-    eval "$command"
-    if [[ $? -eq 0 ]]; then
-        log_message "Custom command '$command' executed successfully."
-        echo "Custom command executed successfully."
-    else
-        log_message "Failed to execute custom command '$command'."
-        echo "Failed to execute custom command."
-    fi
-}
-
-# 36. Container-Specific Update Function (as per your example)
-update_container() {
-    container=$1
-    os=$(pct config "$container" | awk '/^ostype/ {print $2}')
-
-    if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
-        echo -e "${BL}[Info]${GN} Checking /usr/bin/update in ${BL}$container${CL} (OS: ${GN}$os${CL})"
-
-        if pct exec "$container" -- [ -e /usr/bin/update ]; then
-            if pct exec "$container" -- grep -q "community-scripts/ProxmoxVE" /usr/bin/update; then
-                echo -e "${RD}[No Change]${CL} /usr/bin/update is already up to date in ${BL}$container${CL}.\n"
-            elif pct exec "$container" -- grep -q -v "tteck" /usr/bin/update; then
-                echo -e "${RD}[Warning]${CL} /usr/bin/update in ${BL}$container${CL} contains a different entry (${RD}tteck${CL}). No changes made.\n"
-            else
-                pct exec "$container" -- bash -c "sed -i 's/tteck\\/Proxmox/community-scripts\\/ProxmoxVE/g' /usr/bin/update"
-
-                if pct exec "$container" -- grep -q "community-scripts/ProxmoxVE" /usr/bin/update; then
-                    echo -e "${GN}[Success]${CL} /usr/bin/update updated in ${BL}$container${CL}.\n"
-                else
-                    echo -e "${RD}[Error]${CL} /usr/bin/update in ${BL}$container${CL} could not be updated properly.\n"
-                fi
-            fi
-        else
-            echo -e "${RD}[Error]${CL} /usr/bin/update not found in container ${BL}$container${CL}.\n"
-        fi
-    else
-        echo -e "${BL}[Info]${GN} Skipping ${BL}$container${CL} (not Debian/Ubuntu)\n"
-    fi
-}
-
-# 37. Essential Package Installation in Containers (Optional)
-# Add here if needed.
-
-# ====== Interactive Menu Function ======
-
-interactive_menu() {
-    echo "===== Debian/Ubuntu Maintenance Menu ====="
-    echo "1) Clean Old Logs"
-    echo "2) Fix APT Packages"
-    echo "3) Fix APT Locks"
-    echo "4) Clean Disk"
-    echo "5) Update System"
-    echo "6) Backup System"
-    echo "7) Restore Backup"
-    echo "8) System Info"
-    echo "9) Resource Usage"
-    echo "10) Configure Firewall"
-    echo "11) Security Scan"
-    echo "12) Add User"
-    echo "13) Remove User"
-    echo "14) Add Group"
-    echo "15) Remove Group"
-    echo "16) Manage Service"
-    echo "17) Schedule Task"
-    echo "18) List Scheduled Tasks"
-    echo "19) Reboot System"
-    echo "20) Configure Log Rotation"
-    echo "21) Trigger Log Rotation"
-    echo "22) Send Notification"
-    echo "23) List Installed Kernels"
-    echo "24) Remove Old Kernels"
-    echo "25) Install Latest Kernel"
-    echo "26) Set Default Kernel"
-    echo "27) Enable Unattended Upgrades"
-    echo "28) Configure Automatic Updates"
-    echo "29) Check Unattended Upgrades Status"
-    echo "30) List Snap Packages"
-    echo "31) Remove Snap Package"
-    echo "32) Refresh Snap Packages"
-    echo "33) Install Snap Package"
-    echo "34) Install Flatpak"
-    echo "35) Add Flatpak Repository"
-    echo "36) List Flatpak Packages"
-    echo "37) Remove Flatpak Package"
-    echo "38) Refresh Flatpak Packages"
-    echo "39) Check Swap Usage"
-    echo "40) Create Swap File"
-    echo "41) Remove Swap File"
-    echo "42) Check Time Synchronization Status"
-    echo "43) Enable NTP"
-    echo "44) Disable NTP"
-    echo "45) Set Timezone"
-    echo "46) Add APT Repository"
-    echo "47) Remove APT Repository"
-    echo "48) List APT Repositories"
-    echo "49) Check System Uptime"
-    echo "50) Check Load Averages"
-    echo "51) Check Disk Inode Usage"
-    echo "52) Monitor Service Status"
-    echo "53) Run Filesystem Check (fsck)"
-    echo "54) Schedule Filesystem Check"
-    echo "55) Install Docker"
-    echo "56) Start Docker Service"
-    echo "57) Stop Docker Service"
-    echo "58) List Docker Containers"
-    echo "59) Remove Docker Container"
-    echo "60) Check AppArmor Status"
-    echo "61) Enable AppArmor"
-    echo "62) Disable AppArmor"
-    echo "63) Reload AppArmor Profiles"
-    echo "64) Set AppArmor Profile Mode"
-    echo "65) Set System Locale"
-    echo "66) Generate Locales"
-    echo "67) Verify Backup Integrity"
-    echo "68) List Available Backups"
-    echo "69) Ensure Essential Packages Installed"
-    echo "70) List Missing Essential Packages"
-    echo "71) Search Logs for Keyword"
-    echo "72) Display Recent Log Entries"
-    echo "73) Compress Old Logs"
-    echo "74) Archive Logs to Destination"
-    echo "75) Delete Archived Logs"
-    echo "76) Install Lynis"
-    echo "77) Run Lynis Security Audit"
-    echo "78) Backup Network Configuration"
-    echo "79) Restore Network Configuration"
-    echo "80) Execute Custom Script"
-    echo "81) Execute Custom Command"
-    echo "82) Update Containers (ProxmoxVE)"
-    echo "83) Exit"
-    echo "=========================================="
-
-    read -p "Select an option [1-83]: " option
-
-    case "$option" in
-        1) clean_logs ;;
-        2) fix_apt_packages ;;
-        3) fix_apt_lock ;;
-        4) clean_disk ;;
-        5) update_system ;;
-        6)
-            read -p "Enter directory to backup: " backup_dir
-            backup_system "$backup_dir"
-            ;;
-        7)
-            read -p "Enter backup file path: " backup_file
-            read -p "Enter restore directory: " restore_dir
-            restore_backup "$backup_file" "$restore_dir"
-            ;;
-        8) system_info ;;
-        9) resource_usage ;;
-        10) configure_firewall ;;
-        11) security_scan ;;
-        12)
-            read -p "Enter username to add: " username
-            add_user "$username"
-            ;;
-        13)
-            read -p "Enter username to remove: " username
-            remove_user "$username"
-            ;;
-        14)
-            read -p "Enter group name to add: " group
-            add_group "$group"
-            ;;
-        15)
-            read -p "Enter group name to remove: " group
-            remove_group "$group"
-            ;;
-        16)
-            read -p "Enter action [start|stop|restart|status|enable|disable]: " action
-            read -p "Enter service name: " service
-            manage_service "$action" "$service"
-            ;;
-        17)
-            read -p "Enter task (e.g., --clean-logs): " task
-            read -p "Enter cron schedule (e.g., '0 2 * * *'): " schedule
-            schedule_task "$task" "$schedule"
-            ;;
-        18) list_scheduled_tasks ;;
-        19)
-            read -p "Do you want to reboot now or after a delay? [now/delay]: " rb_option
-            case "$rb_option" in
-                now) reboot_system ;;
-                delay)
-                    read -p "Enter delay in minutes: " delay
-                    reboot_system "$delay"
-                    ;;
-                *) echo "Invalid option." ;;
-            esac
-            ;;
-        20) configure_logrotate ;;
-        21) trigger_logrotate ;;
-        22)
-            read -p "Enter email address for notifications: " email
-            NOTIFY_EMAIL="$email"
-            echo "Notifications will be sent to $email."
-            ;;
-        23) list_kernels ;;
-        24) remove_old_kernels ;;
-        25) install_latest_kernel ;;
-        26) set_default_kernel ;;
-        27) enable_unattended_upgrades ;;
-        28) configure_automatic_updates ;;
-        29) check_unattended_upgrades ;;
-        30) list_snap_packages ;;
-        31)
-            read -p "Enter snap package name to remove: " snap_pkg
-            remove_snap_package "$snap_pkg"
-            ;;
-        32) refresh_snap_packages ;;
-        33)
-            read -p "Enter snap package name to install: " snap_pkg
-            install_snap_package "$snap_pkg"
-            ;;
-        34) install_flatpak ;;
-        35)
-            read -p "Enter Flatpak repository URL: " flatpak_repo
-            add_flatpak_repo "$flatpak_repo"
-            ;;
-        36) list_flatpak_packages ;;
-        37)
-            read -p "Enter Flatpak package name to remove: " flatpak_pkg
-            remove_flatpak_package "$flatpak_pkg"
-            ;;
-        38) refresh_flatpak_packages ;;
-        39) check_swap ;;
-        40)
-            read -p "Enter swap size (e.g., 2G, 512M): " swap_size
-            create_swap "$swap_size"
-            ;;
-        41) remove_swap ;;
-        42) check_time_sync ;;
-        43) enable_ntp ;;
-        44) disable_ntp ;;
-        45)
-            read -p "Enter timezone (e.g., 'Europe/London'): " timezone
-            set_timezone "$timezone"
-            ;;
-        46)
-            read -p "Enter APT repository string: " apt_repo
-            read -p "Enter GPG key URL (optional): " gpg_url
-            add_apt_repo "$apt_repo" "$gpg_url"
-            ;;
-        47)
-            read -p "Enter APT repository string to remove: " apt_repo
-            remove_apt_repo "$apt_repo"
-            ;;
-        48) list_apt_repos ;;
-        49) check_uptime ;;
-        50) check_load ;;
-        51) check_disk_inodes ;;
-        52)
-            read -p "Enter service name to monitor: " service
-            monitor_service "$service"
-            ;;
-        53) run_fsck ;;
-        54) schedule_fsck ;;
-        55) install_docker ;;
-        56) start_docker ;;
-        57) stop_docker ;;
-        58) list_docker_containers ;;
-        59)
-            read -p "Enter Docker container ID to remove: " docker_id
-            remove_docker_container "$docker_id"
-            ;;
-        60) check_apparmor_status ;;
-        61) enable_apparmor ;;
-        62) disable_apparmor ;;
-        63) reload_apparmor_profiles ;;
-        64)
-            read -p "Enter AppArmor profile name: " profile
-            read -p "Enter mode [enforce|complain]: " mode
-            set_apparmor_mode "$profile" "$mode"
-            ;;
-        65)
-            read -p "Enter locale (e.g., 'en_US.UTF-8'): " locale
-            set_system_locale "$locale"
-            ;;
-        66) generate_locales ;;
-        67)
-            read -p "Enter backup file to verify: " backup_file
-            verify_backup "$backup_file"
-            ;;
-        68) list_backups ;;
-        69) ensure_essential_packages ;;
-        70) list_missing_packages ;;
-        71)
-            read -p "Enter keyword to search in logs: " keyword
-            search_logs "$keyword"
-            ;;
-        72)
-            read -p "Enter number of recent log lines to display (default 100): " num
-            recent_logs "${num:-100}"
-            ;;
-        73) compress_old_logs ;;
-        74)
-            read -p "Enter destination path for archiving logs: " dest
-            archive_logs "$dest"
-            ;;
-        75)
-            read -p "Enter archive directory: " arch_dir
-            read -p "Enter retention days: " ret_days
-            delete_archived_logs "$arch_dir" "$ret_days"
-            ;;
-        76) install_lynis ;;
-        77) run_lynis_audit ;;
-        78) backup_network_config ;;
-        79)
-            read -p "Enter backup file to restore network config: " net_backup
-            restore_network_config "$net_backup"
-            ;;
-        80)
-            read -p "Enter path to custom script: " custom_script
-            execute_custom_script "$custom_script"
-            ;;
-        81)
-            read -p "Enter custom command to execute: " custom_cmd
-            execute_custom_command "$custom_cmd"
-            ;;
-        82)
-            # Update containers (ProxmoxVE specific)
-            header_info
-            for container in $(pct list | awk '{if(NR>1) print $1}'); do
-                update_container "$container"
-            done
-            header_info
-            echo -e "${GN}The process is complete. The repositories have been switched to community-scripts/ProxmoxVE.${CL}\n"
-            ;;
-        83) echo "Exiting."; exit 0 ;;
-        *) echo "Invalid option."; ;;
+    YW=$'\033[33m' BL=$'\033[36m' RD=$'\033[01;31m' GN=$'\033[1;92m' CL=$'\033[m'
+}
+
+# Normal output goes to stdout, warnings and errors to stderr, so `maintenance.sh
+# report > report.txt` keeps the diagnostics visible on the terminal.
+log() {
+    local level=$1
+    shift
+    local msg=$*
+
+    if ((LOG_READY)); then
+        printf '[%s] [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg" >>"$LOG_FILE"
+    fi
+
+    case $level in
+        ERROR) printf '%s[Error]%s %s\n' "$RD" "$CL" "$msg" >&2 ;;
+        WARN) printf '%s[Warning]%s %s\n' "$YW" "$CL" "$msg" >&2 ;;
+        INFO) ((QUIET)) || printf '%s[Info]%s %s\n' "$BL" "$CL" "$msg" ;;
+        RUN) ((QUIET)) || printf '%s[Run]%s %s\n' "$BL" "$CL" "$msg" ;;
+        DRY) ((QUIET)) || printf '%s[Dry-run]%s %s\n' "$YW" "$CL" "$msg" ;;
+        OK) ((QUIET)) || printf '%s[OK]%s %s\n' "$GN" "$CL" "$msg" ;;
+        *) ((QUIET)) || printf '%s\n' "$msg" ;;
     esac
 }
 
-# ====== Command-Line Argument Parsing ======
+die() {
+    local code=$1
+    shift
+    log ERROR "$*"
+    exit "$code"
+}
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --clean-logs)
-            clean_logs
-            shift
-            ;;
-        --fix-apt-packages)
-            fix_apt_packages
-            shift
-            ;;
-        --fix-apt-lock)
-            fix_apt_lock
-            shift
-            ;;
-        --clean-disk)
-            clean_disk
-            shift
-            ;;
-        --update-system)
-            update_system
-            shift
-            ;;
-        --backup)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                backup_system "$2"
-                shift 2
+say() {
+    ((QUIET)) && return 0
+    printf '%s\n' "$*"
+}
+
+section() {
+    ((QUIET)) && return 0
+    printf '\n%s== %s ==%s\n' "$GN" "$*" "$CL"
+}
+
+usage() {
+    cat <<EOF
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Runs named system maintenance tasks on Debian/Ubuntu and RHEL-family hosts.
+
+Usage:
+  $PROG [options] [task ...]
+
+With no task, '$PROG report' is assumed: a read-only health summary that
+changes nothing.
+
+Tasks:
+  report          Read-only health summary: OS, uptime, load, memory, swap,
+                  filesystems and inodes above the warning threshold, /boot
+                  usage, installed vs running kernel, pending updates, pending
+                  reboot, failed systemd units, package-manager lock holders,
+                  leftover .dpkg-dist/.rpmnew config drift, journal size.
+                  Blast radius: none. Safe under any user; more complete as root.
+
+  update          Refresh the package index and upgrade installed packages.
+                  Blast radius: installs new package versions and restarts
+                  whatever the packaging scripts restart. Defaults to
+                  'upgrade', which never removes a package; --upgrade-mode
+                  dist-upgrade allows removals.
+
+  autoremove      Remove packages no longer required by anything installed.
+                  Blast radius: PURGES packages, including old kernels and
+                  their config files. Review a --dry-run first.
+
+  clean-cache     Delete downloaded package archives.
+                  Blast radius: cache only; everything is re-downloadable.
+
+  clean-logs      Vacuum the systemd journal to --journal-size/--journal-age and
+                  delete already-rotated files under --log-dir older than
+                  --log-age days.
+                  Blast radius: DELETES log history permanently. Live *.log
+                  files are never touched, and --log-exclude (default:
+                  $LOG_EXCLUDE) is skipped.
+
+  clean-tmp       Clean temporary files. Two different behaviours, and they do
+                  not have the same blast radius -- the plan printed before the
+                  run names the one that will apply on this host:
+                    tmpfiles mode (the default wherever systemd is running):
+                      defers to 'systemd-tmpfiles --clean', which follows the
+                      distribution's own tmpfiles.d policy.
+                      Blast radius: DELETES aged files EVERYWHERE that policy
+                      covers, which is more than --tmp-dirs; --tmp-dirs and
+                      --tmp-age do not apply. 'systemd-tmpfiles --cat-config'
+                      lists the rules that will be used.
+                      --dry-run runs 'systemd-tmpfiles --clean --dry-run' to
+                      show the real file list where systemd is new enough
+                      (249+); on an older one it says so and previews nothing
+                      rather than guessing. A preview is a query, so it reports
+                      a non-zero status as a warning and never fails the run.
+                    age mode (no systemd, or --tmp-mode age):
+                      regular files whose atime and mtime are both older than
+                      --tmp-age days are deleted and empty directories pruned.
+                      Blast radius: DELETES files in $TMP_DIRS. Sockets,
+                      symlinks and --tmp-exclude entries are left alone.
+
+  fix-packages    Repair an interrupted package installation:
+                  'dpkg --configure -a' then 'apt-get -f install'.
+                  Blast radius: completes half-finished package operations,
+                  which may install or configure packages. Debian/Ubuntu only.
+
+  fix-locks       Diagnose package-manager locks. Reports which process holds
+                  them and never kills it. dpkg/apt lock files are flock(2)
+                  targets and cannot go stale, so they are never deleted. A
+                  dnf pid file whose process is gone is removed with --yes.
+                  Blast radius: read-only on Debian/Ubuntu; on RHEL may delete
+                  a provably dead dnf pid file.
+
+  routine         Group: update, autoremove, clean-cache, report.
+
+Options:
+  -n, --dry-run             Print what each task would do; change nothing.
+  -y, --yes                 Run unattended; skip the confirmation. Required by
+                            cron and systemd timers for any task that mutates.
+  -q, --quiet               Suppress progress output; print only warnings,
+                            errors and a summary when something failed. Command
+                            output still goes to the log file.
+      --list-tasks          Print the task names, one per line, and exit.
+      --upgrade-mode MODE   upgrade | dist-upgrade (default: $UPGRADE_MODE).
+      --timeout SECONDS     Bounds each system-changing command individually:
+                            one apt/dnf transaction, one journal vacuum, one
+                            systemd-tmpfiles run. Not a budget for the whole
+                            run (default: $TASK_TIMEOUT, minimum 1).
+      --probe-timeout SEC   Bounds each read-only probe individually: df,
+                            dpkg-query, rpm, systemctl, journalctl
+                            --disk-usage, fuser/lsof and the simulated
+                            upgrade the report counts (default: $PROBE_TIMEOUT,
+                            minimum 1).
+      --pkg-lock-wait SEC   How long apt waits for the dpkg lock to be released
+                            before giving up (DPkg::Lock::Timeout). Not a
+                            timeout(1) bound; 0 means do not wait at all
+                            (default: $PKG_LOCK_WAIT).
+      --disk-warn PCT       Filesystem usage to report (default: $DISK_WARN).
+      --inode-warn PCT      Inode usage to report (default: $INODE_WARN).
+      --log-dir PATH        Directory cleaned by clean-logs (default: $LOG_DIR).
+      --log-age DAYS        Age of rotated logs to delete (default: $LOG_AGE_DAYS).
+      --log-exclude LIST    Space-separated names clean-logs must not touch.
+      --journal-size SIZE   journalctl --vacuum-size (default: $JOURNAL_SIZE).
+      --journal-age TIME    journalctl --vacuum-time (default: $JOURNAL_AGE).
+      --tmp-dirs LIST       Space-separated dirs for clean-tmp (default: $TMP_DIRS).
+      --tmp-age DAYS        Age threshold for clean-tmp (default: $TMP_AGE_DAYS).
+      --tmp-mode MODE       auto | tmpfiles | age (default: $TMP_MODE).
+      --tmp-exclude LIST    Space-separated names clean-tmp must not touch.
+      --needrestart-mode M  l | i | a. What to do about services still running
+                            old libraries after an update: l lists them, a
+                            RESTARTS them, i asks (default: $NEEDRESTART_CHOICE).
+      --log-file PATH       This script's own log (default: $LOG_FILE).
+      --lock-file PATH      Concurrency lock (default: $LOCK_FILE).
+      --color WHEN          auto | always | never (default: $USE_COLOR).
+  -V, --version             Print version and exit.
+  -h, --help                Print this help and exit.
+
+Every option has an environment variable, which is easier when piping this
+script in from the network. Every one is named LZC_MAINTENANCE_*, so
+'env | grep LZC_' shows a user everything that is configurable:
+  LZC_MAINTENANCE_YES=1  LZC_MAINTENANCE_DRY_RUN=1  LZC_MAINTENANCE_QUIET=1
+  LZC_MAINTENANCE_COLOR=never  LZC_MAINTENANCE_UPGRADE_MODE=upgrade
+  LZC_MAINTENANCE_TIMEOUT=3600  LZC_MAINTENANCE_PROBE_TIMEOUT=30
+  LZC_MAINTENANCE_PKG_LOCK_WAIT=600  LZC_MAINTENANCE_NEEDRESTART_MODE=l
+  LZC_MAINTENANCE_DISK_WARN=85  LZC_MAINTENANCE_INODE_WARN=85
+  LZC_MAINTENANCE_FS_EXCLUDE='tmpfs devtmpfs'
+  LZC_MAINTENANCE_LOG_DIR=/var/log  LZC_MAINTENANCE_LOG_AGE_DAYS=30
+  LZC_MAINTENANCE_LOG_EXCLUDE=audit  LZC_MAINTENANCE_JOURNAL_SIZE=500M
+  LZC_MAINTENANCE_JOURNAL_AGE=30d  LZC_MAINTENANCE_TMP_DIRS='/tmp /var/tmp'
+  LZC_MAINTENANCE_TMP_AGE_DAYS=10  LZC_MAINTENANCE_TMP_MODE=auto
+  LZC_MAINTENANCE_TMP_EXCLUDE='.X11-unix systemd-private'
+  LZC_MAINTENANCE_LOG=/var/log/maintenance.log
+  LZC_MAINTENANCE_LOCK=/run/lock/lzc-maintenance.lock
+  LZC_MAINTENANCE_LOG_MAX_BYTES=5242880  LZC_MAINTENANCE_ETC_DIR=/etc
+  LZC_MAINTENANCE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+The boolean variables (YES, DRY_RUN, QUIET) accept 1/true/yes/on and
+0/false/no/off in any case. Anything else is a usage error rather than a
+silently wrong default.
+
+--log-dir and every --tmp-dirs entry is a sweep root: files under it are
+deleted, as root. Each must therefore be an absolute path with no '.' or '..'
+component, and must not be '/' or a top-level system directory such as /usr or
+/var. Name the directory inside one that you meant instead.
+
+Exit status:
+  0    success: every task that applied to this host succeeded
+  1    the work ran but something in it failed
+  2    usage error: unknown flag, unknown task, missing or invalid value
+  3    unsupported platform or a missing prerequisite tool
+  4    must be run as root
+  5    refused: confirmation needed, but no TTY and --yes was not given
+  75   temporary failure: another instance holds the lock (EX_TEMPFAIL, so
+       cron and systemd treat it as "retry later" rather than a real fault).
+       The lock is $LOCK_FILE
+  130  interrupted (SIGINT/SIGTERM)
+
+A pending reboot is a warning in the summary, not an exit code. A task that
+does not apply to this host is reported as skipped and does not fail the run.
+
+Tell a scheduler that a held lock is not a fault:
+  systemd:  SuccessExitStatus=0 75
+  cron:     wrap in a quiet-on-success runner.
+
+Examples:
+  $PROG                                   # health report, changes nothing
+  $PROG --dry-run clean-logs clean-tmp    # show exactly what would be deleted
+  sudo $PROG --yes routine                # unattended nightly run
+  sudo $PROG --yes --upgrade-mode dist-upgrade update
+EOF
+}
+
+# --- Task table ---------------------------------------------------------------
+
+readonly -a ALL_TASKS=(report update autoremove clean-cache clean-logs
+    clean-tmp fix-packages fix-locks routine)
+
+task_is_known() {
+    case $1 in
+        report | update | autoremove | clean-cache | clean-logs | clean-tmp | fix-packages | fix-locks | routine) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# True when the task can change the system. Drives the confirmation gate and
+# whether the run needs the concurrency lock at all -- a read-only report must
+# not be blocked by a long-running update.
+#
+# fix-locks is excluded: on Debian/Ubuntu it only ever reports, and diagnosing a
+# stuck apt is precisely when you do not want to be told to pass --yes first.
+# The one destructive branch it has (a dead dnf pid file) asks for itself.
+task_mutates() {
+    case $1 in
+        report | fix-locks) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# True when the task needs root to do its job correctly. fix-locks needs it even
+# though it only reads: an unprivileged fuser cannot see file handles held by
+# other users, so it would report "nothing holds the lock" while root's dpkg
+# holds it.
+task_needs_root() {
+    case $1 in
+        report) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+task_blast_radius() {
+    case $1 in
+        report) printf '%s' 'reads only; changes nothing' ;;
+        update) printf '%s' "installs new package versions ($UPGRADE_MODE)" ;;
+        autoremove) printf '%s' 'PURGES packages no longer required, old kernels included' ;;
+        clean-cache) printf '%s' 'deletes downloaded package archives (re-downloadable)' ;;
+        clean-logs) printf '%s' "DELETES rotated logs in $LOG_DIR older than ${LOG_AGE_DAYS}d and vacuums the journal" ;;
+        # TMP_MODE is resolved from 'auto' in preflight(), before the plan is
+        # printed, so this reports the behaviour that will actually apply. The
+        # two modes have genuinely different blast radii and saying "$TMP_DIRS"
+        # for both understates the one that runs by default on a systemd host.
+        clean-tmp)
+            if [[ $TMP_MODE == tmpfiles ]]; then
+                printf '%s' "DELETES aged files everywhere the distribution tmpfiles.d policy covers, which is more than $TMP_DIRS (systemd-tmpfiles --clean)"
             else
-                echo "Please provide a directory to back up."
-                log_message "Backup failed: No directory provided."
-                exit 1
+                printf '%s' "DELETES files in $TMP_DIRS untouched for more than ${TMP_AGE_DAYS}d"
             fi
             ;;
-        --restore)
-            if [[ -n "$2" && -n "$3" && ! "$2" =~ ^-- && ! "$3" =~ ^-- ]]; then
-                restore_backup "$2" "$3"
-                shift 3
-            else
-                echo "Please provide both backup file and restore directory."
-                log_message "Restore failed: Missing backup file or restore directory."
-                exit 1
-            fi
-            ;;
-        --system-info)
-            system_info
-            shift
-            ;;
-        --resource-usage)
-            resource_usage
-            shift
-            ;;
-        --configure-firewall)
-            configure_firewall
-            shift
-            ;;
-        --security-scan)
-            security_scan
-            shift
-            ;;
-        --add-user)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                add_user "$2"
-                shift 2
-            else
-                echo "Please provide a username to add."
-                log_message "Add user failed: No username provided."
-                exit 1
-            fi
-            ;;
-        --remove-user)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_user "$2"
-                shift 2
-            else
-                echo "Please provide a username to remove."
-                log_message "Remove user failed: No username provided."
-                exit 1
-            fi
-            ;;
-        --add-group)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                add_group "$2"
-                shift 2
-            else
-                echo "Please provide a group name to add."
-                log_message "Add group failed: No group name provided."
-                exit 1
-            fi
-            ;;
-        --remove-group)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_group "$2"
-                shift 2
-            else
-                echo "Please provide a group name to remove."
-                log_message "Remove group failed: No group name provided."
-                exit 1
-            fi
-            ;;
-        --manage-service)
-            if [[ -n "$2" && -n "$3" && ! "$2" =~ ^-- && ! "$3" =~ ^-- ]]; then
-                manage_service "$2" "$3"
-                shift 3
-            else
-                echo "Please provide both action and service name."
-                log_message "Manage service failed: Missing action or service name."
-                exit 1
-            fi
-            ;;
-        --schedule-task)
-            if [[ -n "$2" && -n "$3" && ! "$2" =~ ^-- && ! "$3" =~ ^-- ]]; then
-                schedule_task "$2" "$3"
-                shift 3
-            else
-                echo "Please provide both task and schedule."
-                echo "Example: --schedule-task '--clean-logs' '0 2 * * *'"
-                log_message "Schedule task failed: Missing task or schedule."
-                exit 1
-            fi
-            ;;
-        --list-scheduled-tasks)
-            list_scheduled_tasks
-            shift
-            ;;
-        --reboot)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                reboot_system "$2"
-                shift 2
-            else
-                reboot_system
-                shift
-            fi
-            ;;
-        --logrotate-configure)
-            configure_logrotate
-            shift
-            ;;
-        --logrotate-trigger)
-            trigger_logrotate
-            shift
-            ;;
-        --send-notification)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                NOTIFY_EMAIL="$2"
-                shift 2
-            else
-                echo "Please provide an email address to send notifications."
-                log_message "Send notification failed: No email provided."
-                exit 1
-            fi
-            ;;
-        --list-kernels)
-            list_kernels
-            shift
-            ;;
-        --remove-old-kernels)
-            remove_old_kernels
-            shift
-            ;;
-        --install-latest-kernel)
-            install_latest_kernel
-            shift
-            ;;
-        --set-default-kernel)
-            set_default_kernel
-            shift
-            ;;
-        --enable-unattended-upgrades)
-            enable_unattended_upgrades
-            shift
-            ;;
-        --configure-auto-updates)
-            configure_automatic_updates
-            shift
-            ;;
-        --check-unattended-status)
-            check_unattended_upgrades
-            shift
-            ;;
-        --list-snap-packages)
-            list_snap_packages
-            shift
-            ;;
-        --remove-snap-package)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_snap_package "$2"
-                shift 2
-            else
-                echo "Please provide a snap package name to remove."
-                log_message "Remove snap package failed: No package name provided."
-                exit 1
-            fi
-            ;;
-        --refresh-snap-packages)
-            refresh_snap_packages
-            shift
-            ;;
-        --install-snap-package)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                install_snap_package "$2"
-                shift 2
-            else
-                echo "Please provide a snap package name to install."
-                log_message "Install snap package failed: No package name provided."
-                exit 1
-            fi
-            ;;
-        --install-flatpak)
-            install_flatpak
-            shift
-            ;;
-        --add-flatpak-repo)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                add_flatpak_repo "$2"
-                shift 2
-            else
-                echo "Please provide a Flatpak repository URL."
-                log_message "Add Flatpak repo failed: No repository URL provided."
-                exit 1
-            fi
-            ;;
-        --list-flatpak-packages)
-            list_flatpak_packages
-            shift
-            ;;
-        --remove-flatpak-package)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_flatpak_package "$2"
-                shift 2
-            else
-                echo "Please provide a Flatpak package name to remove."
-                log_message "Remove Flatpak package failed: No package name provided."
-                exit 1
-            fi
-            ;;
-        --refresh-flatpak-packages)
-            refresh_flatpak_packages
-            shift
-            ;;
-        --check-swap)
-            check_swap
-            shift
-            ;;
-        --create-swap)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                create_swap "$2"
-                shift 2
-            else
-                echo "Please provide swap size (e.g., 2G, 512M)."
-                log_message "Create swap failed: No swap size provided."
-                exit 1
-            fi
-            ;;
-        --remove-swap)
-            remove_swap
-            shift
-            ;;
-        --check-time-sync)
-            check_time_sync
-            shift
-            ;;
-        --enable-ntp)
-            enable_ntp
-            shift
-            ;;
-        --disable-ntp)
-            disable_ntp
-            shift
-            ;;
-        --set-timezone)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                set_timezone "$2"
-                shift 2
-            else
-                echo "Please provide a timezone (e.g., 'Europe/London')."
-                log_message "Set timezone failed: No timezone provided."
-                exit 1
-            fi
-            ;;
-        --add-apt-repo)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                local repo="$2"
-                local key_url="$3"
-                if [[ -n "$3" && ! "$3" =~ ^-- ]]; then
-                    add_apt_repo "$repo" "$key_url"
-                    shift 3
-                else
-                    add_apt_repo "$repo"
-                    shift 2
-                fi
-            else
-                echo "Please provide an APT repository string."
-                log_message "Add APT repo failed: No repository string provided."
-                exit 1
-            fi
-            ;;
-        --remove-apt-repo)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_apt_repo "$2"
-                shift 2
-            else
-                echo "Please provide an APT repository string to remove."
-                log_message "Remove APT repo failed: No repository string provided."
-                exit 1
-            fi
-            ;;
-        --list-apt-repos)
-            list_apt_repos
-            shift
-            ;;
-        --check-uptime)
-            check_uptime
-            shift
-            ;;
-        --check-load)
-            check_load
-            shift
-            ;;
-        --check-inodes)
-            check_disk_inodes
-            shift
-            ;;
-        --monitor-service)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                monitor_service "$2"
-                shift 2
-            else
-                echo "Please provide a service name to monitor."
-                log_message "Monitor service failed: No service name provided."
-                exit 1
-            fi
-            ;;
-        --run-fsck)
-            run_fsck
-            shift
-            ;;
-        --schedule-fsck)
-            schedule_fsck
-            shift
-            ;;
-        --install-docker)
-            install_docker
-            shift
-            ;;
-        --start-docker)
-            start_docker
-            shift
-            ;;
-        --stop-docker)
-            stop_docker
-            shift
-            ;;
-        --list-docker-containers)
-            list_docker_containers
-            shift
-            ;;
-        --remove-docker-container)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                remove_docker_container "$2"
-                shift 2
-            else
-                echo "Please provide a Docker container ID to remove."
-                log_message "Remove Docker container failed: No container ID provided."
-                exit 1
-            fi
-            ;;
-        --check-apparmor-status)
-            check_apparmor_status
-            shift
-            ;;
-        --enable-apparmor)
-            enable_apparmor
-            shift
-            ;;
-        --disable-apparmor)
-            disable_apparmor
-            shift
-            ;;
-        --reload-apparmor-profiles)
-            reload_apparmor_profiles
-            shift
-            ;;
-        --set-apparmor-mode)
-            if [[ -n "$2" && -n "$3" && ! "$2" =~ ^-- && ! "$3" =~ ^-- ]]; then
-                set_apparmor_mode "$2" "$3"
-                shift 3
-            else
-                echo "Please provide both profile name and mode ('enforce' or 'complain')."
-                log_message "Set AppArmor mode failed: Missing profile name or mode."
-                exit 1
-            fi
-            ;;
-        --set-locale)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                set_system_locale "$2"
-                shift 2
-            else
-                echo "Please provide a locale (e.g., 'en_US.UTF-8')."
-                log_message "Set locale failed: No locale provided."
-                exit 1
-            fi
-            ;;
-        --generate-locales)
-            generate_locales
-            shift
-            ;;
-        --verify-backup)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                verify_backup "$2"
-                shift 2
-            else
-                echo "Please provide a backup file to verify."
-                log_message "Verify backup failed: No backup file provided."
-                exit 1
-            fi
-            ;;
-        --list-backups)
-            list_backups
-            shift
-            ;;
-        --ensure-essential-packages)
-            ensure_essential_packages
-            shift
-            ;;
-        --list-missing-packages)
-            list_missing_packages
-            shift
-            ;;
-        --search-logs)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                search_logs "$2"
-                shift 2
-            else
-                echo "Please provide a keyword to search in logs."
-                log_message "Search logs failed: No keyword provided."
-                exit 1
-            fi
-            ;;
-        --recent-logs)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                recent_logs "$2"
-                shift 2
-            else
-                recent_logs
-                shift
-            fi
-            ;;
-        --compress-logs)
-            compress_old_logs
-            shift
-            ;;
-        --archive-logs)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                archive_logs "$2"
-                shift 2
-            else
-                echo "Please provide a destination path for archiving logs."
-                log_message "Archive logs failed: No destination provided."
-                exit 1
-            fi
-            ;;
-        --delete-archived-logs)
-            if [[ -n "$2" && -n "$3" && ! "$2" =~ ^-- && ! "$3" =~ ^-- ]]; then
-                delete_archived_logs "$2" "$3"
-                shift 3
-            else
-                echo "Please provide both archive directory and retention days."
-                log_message "Delete archived logs failed: Missing archive directory or retention days."
-                exit 1
-            fi
-            ;;
-        --install-lynis)
-            install_lynis
-            shift
-            ;;
-        --run-lynis-audit)
-            run_lynis_audit
-            shift
-            ;;
-        --backup-network-config)
-            backup_network_config
-            shift
-            ;;
-        --restore-network-config)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                restore_network_config "$2"
-                shift 2
-            else
-                echo "Please provide a backup file to restore network config."
-                log_message "Restore network config failed: No backup file provided."
-                exit 1
-            fi
-            ;;
-        --exec-script)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                execute_custom_script "$2"
-                shift 2
-            else
-                echo "Please provide the path to the script to execute."
-                log_message "Execute custom script failed: No script path provided."
-                exit 1
-            fi
-            ;;
-        --exec-command)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                execute_custom_command "$2"
-                shift 2
-            else
-                echo "Please provide the command to execute."
-                log_message "Execute custom command failed: No command provided."
-                exit 1
-            fi
-            ;;
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            show_help
-            exit 1
+        fix-packages) printf '%s' 'completes interrupted dpkg/apt operations' ;;
+        fix-locks) printf '%s' 'reports lock holders; may delete a dead dnf pid file' ;;
+        *) printf '%s' 'unknown' ;;
+    esac
+}
+
+expand_task() {
+    case $1 in
+        routine) printf '%s\n' update autoremove clean-cache report ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+# --- Argument parsing --------------------------------------------------------
+
+need_value() {
+    ((${1} >= 2)) || die "$EX_USAGE" "$2 requires a value"
+}
+
+# Maps an internal setting name to the flag and environment variable a user
+# actually types, so a validation error points at something they can change.
+setting_label() {
+    case $1 in
+        TASK_TIMEOUT) printf '%s' '--timeout / LZC_MAINTENANCE_TIMEOUT' ;;
+        PROBE_TIMEOUT) printf '%s' '--probe-timeout / LZC_MAINTENANCE_PROBE_TIMEOUT' ;;
+        PKG_LOCK_WAIT) printf '%s' '--pkg-lock-wait / LZC_MAINTENANCE_PKG_LOCK_WAIT' ;;
+        DISK_WARN) printf '%s' '--disk-warn / LZC_MAINTENANCE_DISK_WARN' ;;
+        INODE_WARN) printf '%s' '--inode-warn / LZC_MAINTENANCE_INODE_WARN' ;;
+        LOG_AGE_DAYS) printf '%s' '--log-age / LZC_MAINTENANCE_LOG_AGE_DAYS' ;;
+        TMP_AGE_DAYS) printf '%s' '--tmp-age / LZC_MAINTENANCE_TMP_AGE_DAYS' ;;
+        LOG_MAX_BYTES) printf '%s' 'LZC_MAINTENANCE_LOG_MAX_BYTES' ;;
+        LOG_DIR) printf '%s' '--log-dir / LZC_MAINTENANCE_LOG_DIR' ;;
+        TMP_DIRS) printf '%s' '--tmp-dirs / LZC_MAINTENANCE_TMP_DIRS' ;;
+        NEEDRESTART_CHOICE) printf '%s' '--needrestart-mode / LZC_MAINTENANCE_NEEDRESTART_MODE' ;;
+        ETC_DIR) printf '%s' 'LZC_MAINTENANCE_ETC_DIR' ;;
+        LOG_FILE) printf '%s' '--log-file / LZC_MAINTENANCE_LOG' ;;
+        LOCK_FILE) printf '%s' '--lock-file / LZC_MAINTENANCE_LOCK' ;;
+        ASSUME_YES) printf '%s' '--yes / LZC_MAINTENANCE_YES' ;;
+        DRY_RUN) printf '%s' '--dry-run / LZC_MAINTENANCE_DRY_RUN' ;;
+        QUIET) printf '%s' '--quiet / LZC_MAINTENANCE_QUIET' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Accepts the spellings people actually write in cron files and unit files.
+# Without this, LZC_MAINTENANCE_YES=true reaches (( )) as a bare word and the
+# script dies with "true: unbound variable" under `set -u` -- a real crash a
+# user hits by writing the obvious thing. Normalise to 1/0 before any
+# arithmetic context reads the value.
+_normalise_bool() {
+    local name=$1 value
+    case ${!name,,} in
+        1 | true | yes | on) value=1 ;;
+        0 | false | no | off | '') value=0 ;;
+        *) die "$EX_USAGE" "$(setting_label "$name") must be one of 1/true/yes/on or 0/false/no/off, got '${!name}'" ;;
+    esac
+    printf -v "$name" '%s' "$value"
+}
+
+# Validates, range-checks and normalises a numeric setting.
+#
+# The 18-digit bound is what makes the 10# normalisation safe: bash arithmetic
+# is signed 64-bit and wraps without complaint, so a 20-digit argument can
+# normalise to a negative number and disable a timeout silently
+# (12345678901234567890 -> -6101065172474983726). 18 digits cannot overflow.
+_normalise_int() {
+    local name=$1 min=$2 max=${3:-} value
+    [[ ${!name} =~ ^[0-9]{1,18}$ ]] ||
+        die "$EX_USAGE" "$(setting_label "$name") must be a non-negative integer of at most 18 digits, got '${!name}'"
+    # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
+    # an invalid octal literal, and every later ((...)) on it raises "value too
+    # great for base" and evaluates false -- silently dropping the very limit
+    # the option was setting.
+    value=$((10#${!name}))
+    ((value >= min)) || die "$EX_USAGE" "$(setting_label "$name") must be at least $min, got '${!name}'"
+    [[ -z $max ]] || ((value <= max)) ||
+        die "$EX_USAGE" "$(setting_label "$name") must be at most $max, got '${!name}'"
+    printf -v "$name" '%s' "$value"
+}
+
+# clean-logs and clean-tmp delete files under a directory the caller names, as
+# root. That makes a sweep root the one setting where a typo is unrecoverable:
+# '--log-dir /' deletes every '*.gz' and '*.[0-9]' on the root device -- the
+# whole man page tree included -- and '--tmp-dirs /' deletes every regular file
+# on it that is older than the age threshold.
+#
+# The guard is stated as a principle rather than a blacklist of bad values: a
+# sweep root must be absolute, must not contain traversal, and must never be a
+# directory that IS the operating system.
+assert_sweep_root() {
+    local label=$1 dir=$2 trimmed
+    [[ $dir == /* ]] || die "$EX_USAGE" "$label must be an absolute path, got '$dir' (a relative path is resolved against the working directory, which cron does not set)"
+    [[ $dir != *//* ]] || die "$EX_USAGE" "$label must not contain '//', got '$dir'"
+    trimmed=${dir%/}
+    # '.' and '..' walk straight through every check below: '/tmp/../' is
+    # absolute, is not literally a system directory, and still resolves to '/'
+    # by the time find(1) sees it. Reject traversal outright rather than trying
+    # to enumerate the paths it can reach.
+    case $trimmed/ in
+        */../* | */./*)
+            die "$EX_USAGE" "$label must not contain '.' or '..' components, got '$dir'"
             ;;
     esac
-done
+    # '/tmp' is deliberately absent from the list below: it is the one top-level
+    # directory whose contents are disposable by definition, and it is a default
+    # sweep root. Every other name here is the operating system itself.
+    case $trimmed in
+        '')
+            die "$EX_USAGE" "$label must not be '/': sweeping the root filesystem would delete the operating system"
+            ;;
+        /bin | /boot | /dev | /etc | /home | /lib | /lib32 | /lib64 | /libx32 | \
+            /proc | /root | /run | /sbin | /srv | /sys | /usr | /var)
+            die "$EX_USAGE" "$label must not be '$trimmed': that is a system directory, not a sweep root. Name the directory inside it that you meant."
+            ;;
+    esac
+}
 
-# If no arguments are provided, display the interactive menu.
-if [[ $# -eq 0 ]]; then
-    while true; do
-        interactive_menu
-        echo ""
-        read -p "Do you want to perform another task? [y/N]: " cont
-        case "$cont" in
-            y|Y) continue ;;
-            *) 
-                header_info
-                echo -e "${GN}The process is complete. All selected maintenance tasks have been executed.${CL}\n"
-                notify_after_task
-                exit 0 
+parse_args() {
+    local positional_only=0 arg
+    while (($#)); do
+        if ((positional_only)); then
+            TASKS+=("$1")
+            shift
+            continue
+        fi
+        case $1 in
+            -n | --dry-run) DRY_RUN=1 ;;
+            -y | --yes) ASSUME_YES=1 ;;
+            -q | --quiet) QUIET=1 ;;
+            --list-tasks)
+                printf '%s\n' "${ALL_TASKS[@]}"
+                exit 0
+                ;;
+            --upgrade-mode)
+                need_value "$#" "$1"
+                UPGRADE_MODE=$2
+                shift
+                ;;
+            --timeout)
+                need_value "$#" "$1"
+                TASK_TIMEOUT=$2
+                shift
+                ;;
+            --probe-timeout)
+                need_value "$#" "$1"
+                PROBE_TIMEOUT=$2
+                shift
+                ;;
+            --pkg-lock-wait)
+                need_value "$#" "$1"
+                PKG_LOCK_WAIT=$2
+                shift
+                ;;
+            --disk-warn)
+                need_value "$#" "$1"
+                DISK_WARN=$2
+                shift
+                ;;
+            --inode-warn)
+                need_value "$#" "$1"
+                INODE_WARN=$2
+                shift
+                ;;
+            --log-dir)
+                need_value "$#" "$1"
+                LOG_DIR=$2
+                shift
+                ;;
+            --log-age)
+                need_value "$#" "$1"
+                LOG_AGE_DAYS=$2
+                shift
+                ;;
+            --log-exclude)
+                need_value "$#" "$1"
+                LOG_EXCLUDE=$2
+                shift
+                ;;
+            --journal-size)
+                need_value "$#" "$1"
+                JOURNAL_SIZE=$2
+                shift
+                ;;
+            --journal-age)
+                need_value "$#" "$1"
+                JOURNAL_AGE=$2
+                shift
+                ;;
+            --tmp-dirs)
+                need_value "$#" "$1"
+                TMP_DIRS=$2
+                shift
+                ;;
+            --tmp-age)
+                need_value "$#" "$1"
+                TMP_AGE_DAYS=$2
+                shift
+                ;;
+            --tmp-mode)
+                need_value "$#" "$1"
+                TMP_MODE=$2
+                shift
+                ;;
+            --needrestart-mode)
+                need_value "$#" "$1"
+                NEEDRESTART_CHOICE=$2
+                shift
+                ;;
+            --tmp-exclude)
+                need_value "$#" "$1"
+                TMP_EXCLUDE=$2
+                shift
+                ;;
+            --log-file)
+                need_value "$#" "$1"
+                LOG_FILE=$2
+                shift
+                ;;
+            --lock-file)
+                need_value "$#" "$1"
+                LOCK_FILE=$2
+                shift
+                ;;
+            --color)
+                need_value "$#" "$1"
+                USE_COLOR=$2
+                shift
+                ;;
+            -V | --version)
+                printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+                exit 0
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --)
+                positional_only=1
+                ;;
+            -*)
+                die "$EX_USAGE" "Unknown option: $1 (try --help)"
+                ;;
+            *)
+                TASKS+=("$1")
                 ;;
         esac
+        shift
     done
-fi
 
-# Send notification if email is set
-notify_after_task
+    [[ $USE_COLOR =~ ^(auto|always|never)$ ]] || die "$EX_USAGE" "--color must be auto, always or never, got '$USE_COLOR'"
+    [[ $UPGRADE_MODE =~ ^(upgrade|dist-upgrade)$ ]] || die "$EX_USAGE" "--upgrade-mode must be upgrade or dist-upgrade, got '$UPGRADE_MODE'"
+    [[ $TMP_MODE =~ ^(auto|tmpfiles|age)$ ]] || die "$EX_USAGE" "--tmp-mode must be auto, tmpfiles or age, got '$TMP_MODE'"
+    # Validated like every other setting rather than passed through: this value
+    # is exported into the environment of the package transaction, and 'a' means
+    # "restart running services", which is the most disruptive thing this script
+    # can be asked to do. An unrecognised value must be a usage error, not an
+    # undefined behaviour that surfaces mid-upgrade.
+    [[ $NEEDRESTART_CHOICE =~ ^[lia]$ ]] ||
+        die "$EX_USAGE" "$(setting_label NEEDRESTART_CHOICE) must be l (list), i (interactive) or a (auto-restart), got '$NEEDRESTART_CHOICE'"
+    [[ $JOURNAL_SIZE =~ ^[0-9]+[KMGT]?$ ]] || die "$EX_USAGE" "--journal-size must look like 500M, got '$JOURNAL_SIZE'"
+    [[ $JOURNAL_AGE =~ ^[0-9]+(s|m|h|d|w|month|y)?$ ]] || die "$EX_USAGE" "--journal-age must look like 30d, got '$JOURNAL_AGE'"
+
+    # Booleans first: every one of these is read in an arithmetic context later,
+    # and a bare word reaching (( )) under `set -u` is fatal.
+    local name
+    for name in ASSUME_YES DRY_RUN QUIET; do
+        _normalise_bool "$name"
+    done
+
+    # Minimum 1, not 0, for anything handed to timeout(1): `timeout 0` means NO
+    # limit, so accepting 0 would silently remove the protection the option
+    # exists to provide.
+    for name in TASK_TIMEOUT PROBE_TIMEOUT; do
+        _normalise_int "$name" 1
+    done
+    # PKG_LOCK_WAIT is apt's DPkg::Lock::Timeout, not a timeout(1) bound: 0 is
+    # the meaningful "do not wait for the lock at all".
+    _normalise_int PKG_LOCK_WAIT 0
+    _normalise_int LOG_MAX_BYTES 1
+    _normalise_int DISK_WARN 0 100
+    _normalise_int INODE_WARN 0 100
+    # 0 days is legitimate here: it means "everything already rotated", which is
+    # what an operator reclaiming a full disk actually asks for.
+    _normalise_int LOG_AGE_DAYS 0
+    _normalise_int TMP_AGE_DAYS 0
+
+    for name in ETC_DIR LOG_FILE LOCK_FILE; do
+        [[ ${!name} == /* ]] ||
+            die "$EX_USAGE" "$(setting_label "$name") must be an absolute path, got '${!name}'"
+    done
+
+    # Both sweep roots get the floor guard. LOG_DIR is a single path; TMP_DIRS
+    # is a list, and every entry is swept, so every entry is checked.
+    assert_sweep_root "$(setting_label LOG_DIR)" "$LOG_DIR"
+    local -a tmp_toks=()
+    read -r -a tmp_toks <<<"$TMP_DIRS"
+    ((${#tmp_toks[@]})) ||
+        die "$EX_USAGE" "$(setting_label TMP_DIRS) must name at least one directory"
+    local dir
+    for dir in "${tmp_toks[@]}"; do
+        assert_sweep_root "$(setting_label TMP_DIRS)" "$dir"
+    done
+
+    ((${#TASKS[@]})) || TASKS=(report)
+
+    local -a expanded=()
+    for arg in "${TASKS[@]}"; do
+        task_is_known "$arg" || die "$EX_USAGE" "Unknown task: $arg (try --list-tasks)"
+        local sub
+        while read -r sub; do
+            in_array "$sub" expanded || expanded+=("$sub")
+        done < <(expand_task "$arg")
+    done
+    TASKS=("${expanded[@]}")
+}
+
+in_array() {
+    local needle=$1 item
+    local -n _haystack=$2
+    ((${#_haystack[@]})) || return 1
+    for item in "${_haystack[@]}"; do
+        [[ $item == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# --- Environment probing -----------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Read-only probes get a short leash: a wedged `dnf check-update` against a dead
+# mirror is the classic reason a cron health check never returns.
+probe() {
+    if ((HAVE_TIMEOUT && PROBE_TIMEOUT > 0)); then
+        timeout --foreground "$PROBE_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
+is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
+
+# A prompt is only possible with a terminal to write the question to and one to
+# read the answer from. /dev/tty is checked as well because under `curl | bash`
+# stdin is the script itself, not the user.
+can_prompt() {
+    [[ -t 1 ]] || return 1
+    [[ -t 0 ]] && return 0
+    [[ -r /dev/tty ]]
+}
+
+detect_family() {
+    if have apt-get; then
+        FAMILY=debian
+        PKG_TOOL=apt-get
+        return 0
+    fi
+    if have dnf; then
+        FAMILY=rhel
+        PKG_TOOL=dnf
+        return 0
+    fi
+    if have yum; then
+        FAMILY=rhel
+        PKG_TOOL=yum
+        return 0
+    fi
+    return 1
+}
+
+preflight() {
+    # bash 4.4 is the floor: `mapfile -d ''` reads the NUL-delimited file lists
+    # that make the cleanup tasks safe against newlines in filenames.
+    if ((BASH_VERSINFO[0] < 4)) || { ((BASH_VERSINFO[0] == 4)) && ((BASH_VERSINFO[1] < 4)); }; then
+        die "$EX_PREREQ" "bash 4.4 or newer required, found ${BASH_VERSION}"
+    fi
+
+    have timeout && HAVE_TIMEOUT=1
+    ((HAVE_TIMEOUT)) || log WARN "timeout (coreutils) not found; long-running commands will not be bounded"
+
+    detect_family || log WARN "No apt-get, dnf or yum found; package tasks will be skipped"
+
+    # Resolved here, before print_plan runs, so that the blast radius shown to
+    # the operator and the code that does the deleting read the same value.
+    # Deciding it inside the task instead would leave the plan guessing.
+    if [[ $TMP_MODE == auto ]]; then
+        if have systemd-tmpfiles && [[ -d /run/systemd/system ]]; then
+            TMP_MODE=tmpfiles
+        else
+            TMP_MODE=age
+        fi
+    fi
+
+    # Rotate before opening, so an unattended host does not grow the log without
+    # bound between logrotate runs.
+    if [[ -f $LOG_FILE ]]; then
+        local size
+        # 2>/dev/null must precede the input redirection: bash applies
+        # redirections left to right and reports a failing one on stderr as it
+        # stands at that moment, so a trailing 2>/dev/null suppresses nothing.
+        size=$(wc -c 2>/dev/null <"$LOG_FILE") || size=0
+        if ((size > LOG_MAX_BYTES)); then
+            mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+        fi
+    fi
+
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    # Again: 2>/dev/null first, or an unwritable log path prints a raw
+    # "No such file or directory" from bash before the tidy warning below.
+    if : 2>/dev/null >>"$LOG_FILE"; then
+        chmod 0640 "$LOG_FILE" 2>/dev/null || true
+        LOG_READY=1
+        LOG_SINK=$LOG_FILE
+    else
+        printf '%s[Warning]%s Cannot write %s; continuing without a log file.\n' \
+            "$YW" "$CL" "$LOG_FILE" >&2
+    fi
+}
+
+# Only ever called for a run that will actually change the system, so a
+# read-only report is never blocked by an update already in flight -- and never
+# refused on a host that has no flock.
+acquire_lock() {
+    # A mutating run without the lock is exactly the concurrent apt/dpkg
+    # collision this script exists to avoid, so a missing flock is a missing
+    # prerequisite rather than something to warn about and carry on through.
+    have flock || die "$EX_PREREQ" "flock (util-linux) not found; refusing to change the system without concurrency protection. Preview with --dry-run instead."
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+    exec 9>"$LOCK_FILE" || die "$EX_PREREQ" "Cannot open lock file $LOCK_FILE"
+    # The lock file is never deleted. Two processes can each hold a lock on a
+    # different inode at the same path if one unlinks it and the next recreates
+    # it, which defeats the point.
+    flock -n 9 || die "$EX_LOCKED" "Another $PROG run holds $LOCK_FILE. Refusing to run concurrently."
+    LOCK_HELD=1
+}
+
+# --- Command execution -------------------------------------------------------
+
+# Runs a system-changing command. Honours --dry-run, echoes the exact argv, tees
+# output to the log, and bounds the runtime when a timeout is configured.
+run_cmd() {
+    local secs=$1
+    shift
+    if ((DRY_RUN)); then
+        log DRY "would run: $*"
+        return 0
+    fi
+
+    log RUN "$*"
+    exec_cmd "$secs" "$@"
+}
+
+# The execution half of run_cmd, without the --dry-run gate. Called directly
+# only for a command that is itself a preview and therefore has to run during a
+# dry run -- 'systemd-tmpfiles --clean --dry-run' is the one case.
+exec_cmd() {
+    local secs=$1
+    shift
+    local rc
+    if ((QUIET)); then
+        if ((HAVE_TIMEOUT && secs > 0)); then
+            timeout --foreground "$secs" "$@" >>"$LOG_SINK" 2>&1
+        else
+            "$@" >>"$LOG_SINK" 2>&1
+        fi
+        rc=$?
+    else
+        if ((HAVE_TIMEOUT && secs > 0)); then
+            timeout --foreground "$secs" "$@" 2>&1 | tee -a "$LOG_SINK"
+        else
+            "$@" 2>&1 | tee -a "$LOG_SINK"
+        fi
+        rc=${PIPESTATUS[0]}
+    fi
+
+    if ((rc == 124)); then
+        log ERROR "timed out after ${secs}s: $*"
+    fi
+    return "$rc"
+}
+
+# apt options used for every transaction:
+#   --force-confdef/--force-confold  take the maintainer default where one
+#     exists, otherwise keep the local file; never stop to ask.
+#   DPkg::Lock::Timeout  wait for unattended-upgrades instead of racing it.
+#     This is what replaces the hand-rolled "wait for the lock" loops.
+#   Dpkg::Use-Pty=0  no progress redraws in the log.
+apt_opts() {
+    printf '%s\n' \
+        -y \
+        -o "Dpkg::Options::=--force-confdef" \
+        -o "Dpkg::Options::=--force-confold" \
+        -o "DPkg::Lock::Timeout=$PKG_LOCK_WAIT" \
+        -o "Dpkg::Use-Pty=0"
+}
+
+export_pkg_env() {
+    # DEBIAN_FRONTEND only silences debconf; the conffile prompts come from dpkg
+    # and are handled by apt_opts above.
+    export DEBIAN_FRONTEND=noninteractive
+    export DEBIAN_PRIORITY=critical
+    export UCF_FORCE_CONFOLD=1
+    # 'l' lists services needing a restart instead of restarting them. Restarting
+    # services is a decision for whoever scheduled the run, so it is opt-in via
+    # LZC_MAINTENANCE_NEEDRESTART_MODE=a.
+    export NEEDRESTART_MODE="$NEEDRESTART_CHOICE"
+}
+
+unsupported_family() {
+    local task=$1 want=$2
+    log WARN "Task '$task' is $want only; this host is ${FAMILY:-unknown}. Skipping."
+    SKIPPED_TASKS+=("$task (not applicable to ${FAMILY:-unknown})")
+    TASK_SKIPPED=1
+    return 0
+}
+
+# --- Task: report -------------------------------------------------------------
+
+report_identity() {
+    section 'Host'
+    local pretty=''
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck source=/dev/null  # distro-provided file, not in this repo
+        pretty=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-${NAME:-}}")
+    fi
+    printf '  Hostname      : %s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+    printf '  OS            : %s\n' "${pretty:-unknown}"
+    printf '  Kernel        : %s\n' "$(uname -r 2>/dev/null || printf 'unknown')"
+    printf '  Package family: %s\n' "${FAMILY:-unknown}"
+    if have uptime; then
+        printf '  Uptime/load   : %s\n' "$(uptime 2>/dev/null | sed 's/^ *//')"
+    fi
+}
+
+report_memory() {
+    have free || return 0
+    section 'Memory and swap'
+    probe free -h 2>/dev/null | sed 's/^/  /'
+}
+
+# Emits "percent<TAB>available<TAB>mountpoint" for every filesystem, for
+# kind=disk or kind=inode.
+#
+# df's first column routinely contains spaces -- '//nas/my share', a bind mount,
+# 'C:/Program Files/...' under Cygwin -- so counting fields from the left is
+# wrong and silently reports the wrong number against the wrong mount point.
+# `--output` (coreutils 8.21+) drops the device column entirely and is used when
+# available; the fallback locates the NN% capacity field by scanning from the
+# right and treats everything after it as the mount point, which also survives a
+# mount point containing spaces.
+df_rows() {
+    local kind=$1
+    local pcent=pcent avail=avail
+    if [[ $kind == inode ]]; then
+        pcent=ipcent avail=iavail
+    fi
+
+    local -a excl=() toks=()
+    read -r -a toks <<<"$FS_EXCLUDE"
+    local t
+    for t in "${toks[@]}"; do
+        excl+=(-x "$t")
+    done
+
+    if probe df -h --output="$pcent","$avail",target >/dev/null 2>&1; then
+        probe df -h --output="$pcent","$avail",target ${excl[@]+"${excl[@]}"} 2>/dev/null |
+            awk 'NR > 1 {
+                p = $1; sub(/%/, "", p); a = $2
+                m = ""
+                for (i = 3; i <= NF; i++) m = (m == "" ? $i : m " " $i)
+                printf "%s\t%s\t%s\n", p, a, m
+            }'
+        return 0
+    fi
+
+    local -a dfargs=(-P -h)
+    [[ $kind == inode ]] && dfargs+=(-i)
+    probe df "${dfargs[@]}" ${excl[@]+"${excl[@]}"} 2>/dev/null |
+        awk 'NR > 1 {
+            c = 0
+            for (i = NF; i >= 1; i--) if ($i ~ /^[0-9]+%$/) { c = i; break }
+            if (c == 0 || c < 2) next
+            p = $c; sub(/%/, "", p); a = $(c - 1)
+            m = ""
+            for (i = c + 1; i <= NF; i++) m = (m == "" ? $i : m " " $i)
+            printf "%s\t%s\t%s\n", p, a, m
+        }'
+}
+
+report_filesystems() {
+    have df || return 0
+    local out
+
+    section "Filesystems at or above ${DISK_WARN}% used"
+    out=$(df_rows disk |
+        awk -F'\t' -v w="$DISK_WARN" '$1 + 0 >= w { printf "  %-28s %3s%% used, %s free\n", $3, $1, $2 }')
+    if [[ -n $out ]]; then
+        printf '%s\n' "$out"
+    else
+        printf '  none\n'
+    fi
+
+    section "Inodes at or above ${INODE_WARN}% used"
+    out=$(df_rows inode |
+        awk -F'\t' -v w="$INODE_WARN" '$1 + 0 >= w { printf "  %-28s %3s%% used, %s free\n", $3, $1, $2 }')
+    if [[ -n $out ]]; then
+        printf '%s\n' "$out"
+    else
+        printf '  none\n'
+    fi
+}
+
+# /boot filling up is the single most common way a Debian host stops being able
+# to install a kernel update, so it is reported whether or not it is over the
+# threshold, alongside what is installed and what is actually running.
+report_kernels() {
+    section 'Kernel and /boot'
+    printf '  Running       : %s\n' "$(uname -r 2>/dev/null || printf 'unknown')"
+    if have df && [[ -d /boot ]]; then
+        printf '  /boot         : %s\n' "$(fs_usage_line /boot)"
+    fi
+    case $FAMILY in
+        debian)
+            have dpkg-query || return 0
+            local installed
+            # shellcheck disable=SC2016 # ${db:Status-Abbrev} and ${Package} are dpkg-query format placeholders; the shell must not expand them
+            installed=$(probe dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*' 2>/dev/null |
+                awk '$1 ~ /^ii/ && $2 ~ /^linux-image-[0-9]/ { print $2 }')
+            if [[ -n $installed ]]; then
+                printf '  Installed     : %s\n' "$(printf '%s\n' "$installed" | wc -l | tr -d ' ') image package(s)"
+                printf '%s\n' "$installed" | sed 's/^/    /'
+                printf '  Removal path  : maintenance.sh --yes autoremove\n'
+            fi
+            ;;
+        rhel)
+            have rpm || return 0
+            local kernels
+            kernels=$(probe rpm -q kernel 2>/dev/null)
+            [[ -n $kernels ]] && printf '%s\n' "$kernels" | sed 's/^/    /'
+            printf '  Removal path  : installonly_limit in /etc/dnf/dnf.conf\n'
+            ;;
+    esac
+}
+
+report_updates() {
+    section 'Pending updates'
+    case $FAMILY in
+        debian)
+            # Debug::NoLocking lets this run while another apt process holds the
+            # lock, so a health check never blocks on an in-flight upgrade.
+            #
+            # The simulation is captured and its status checked before anything
+            # is counted. Piping it straight into `grep -c` loses that status:
+            # grep prints "0" for empty input whether apt found no upgrades or
+            # failed outright, so a broken sources.list, an unreachable mirror
+            # or a probe timeout would all be reported as "0 package(s)" -- a
+            # health check answering "all clear" because it could not look. The
+            # rhel branch below already reads its status; this now matches.
+            local sim rc
+            sim=$(probe apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null)
+            rc=$?
+            if ((rc == 0)); then
+                printf '  Upgradable    : %s package(s)\n' \
+                    "$(printf '%s\n' "$sim" | grep -c '^Inst ' || true)"
+            else
+                printf '  Upgradable    : unknown (apt-get -s upgrade exited %s)\n' "$rc"
+            fi
+            if have apt-mark; then
+                local held
+                held=$(probe apt-mark showhold 2>/dev/null)
+                [[ -n $held ]] && printf '  On hold       : %s\n' "$(printf '%s' "$held" | tr '\n' ' ')"
+            fi
+            ;;
+        rhel)
+            local out rc
+            out=$(probe "$PKG_TOOL" -q check-update 2>/dev/null)
+            rc=$?
+            case $rc in
+                0) printf '  Upgradable    : 0 package(s)\n' ;;
+                100) printf '  Upgradable    : %s package(s) (approximate)\n' \
+                    "$(printf '%s\n' "$out" | awk 'NF && $1 !~ /^(Last|Obsoleting|Security:)/ { n = n + 1 } END { print n + 0 }')" ;;
+                *) printf '  Upgradable    : unknown (%s check-update exited %s)\n' "$PKG_TOOL" "$rc" ;;
+            esac
+            ;;
+        *) printf '  Upgradable    : unknown (no supported package manager)\n' ;;
+    esac
+}
+
+check_reboot_required() {
+    case $FAMILY in
+        debian)
+            if [[ -f /run/reboot-required || -f /var/run/reboot-required ]]; then
+                REBOOT_REQUIRED=1
+                return 0
+            fi
+            ;;
+        rhel)
+            # needs-restarting uses an inverted convention: exit 1 means "reboot
+            # required". That makes availability checking mandatory -- dnf also
+            # exits non-zero when the subcommand does not exist, and
+            # dnf-plugins-core is not installed by default. Reading that as
+            # "reboot required" would make every such host permanently report a
+            # pending reboot. An absent tool means unknown, never yes.
+            local -a nr=()
+            if have needs-restarting; then
+                nr=(needs-restarting)
+            elif [[ -n $PKG_TOOL ]] && probe "$PKG_TOOL" needs-restarting --help >/dev/null 2>&1; then
+                nr=("$PKG_TOOL" needs-restarting)
+            fi
+            if ((${#nr[@]})); then
+                probe "${nr[@]}" -r >/dev/null 2>&1 || REBOOT_REQUIRED=1
+                ((REBOOT_REQUIRED)) && return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+report_reboot() {
+    section 'Reboot'
+    if check_reboot_required; then
+        printf '  Required      : yes\n'
+        if [[ -r /run/reboot-required.pkgs ]]; then
+            printf '  Triggered by  : %s\n' "$(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+        fi
+    else
+        printf '  Required      : no (or undetectable on this distribution)\n'
+    fi
+}
+
+report_units() {
+    have systemctl || return 0
+    [[ -d /run/systemd/system ]] || return 0
+    section 'Failed systemd units'
+    local out
+    out=$(probe systemctl --failed --no-legend --plain 2>/dev/null | awk 'NF { print "  " $1 }')
+    if [[ -n $out ]]; then
+        printf '%s\n' "$out"
+    else
+        printf '  none\n'
+    fi
+}
+
+# Packages that ship a changed config file leave the new version beside the old
+# one instead of prompting (dpkg with --force-confold, rpm always). Nothing
+# reports these, so drift accumulates silently until something misbehaves.
+report_config_drift() {
+    have find || return 0
+    section "Config drift under $ETC_DIR"
+    local out
+    out=$(probe find "$ETC_DIR" -xdev -type f \
+        \( -name '*.dpkg-dist' -o -name '*.dpkg-new' -o -name '*.dpkg-old' \
+        -o -name '*.ucf-dist' -o -name '*.rpmnew' -o -name '*.rpmsave' \) \
+        2>/dev/null | sed 's/^/  /')
+    if [[ -n $out ]]; then
+        printf '%s\n' "$out"
+        printf '  Review each: the packaged version is not the active one.\n'
+    else
+        printf '  none\n'
+    fi
+}
+
+report_journal() {
+    have journalctl || return 0
+    section 'Journal'
+    printf '  %s\n' "$(probe journalctl --disk-usage 2>/dev/null || printf 'unreadable')"
+}
+
+report_locks() {
+    section 'Package-manager locks'
+    local -a locks=()
+    lock_paths locks
+    if ((${#locks[@]} == 0)); then
+        printf '  none applicable\n'
+        return 0
+    fi
+    # Same false negative as fix-locks guards against: an unprivileged fuser sees
+    # only this user's handles, so "no holder" would really mean "could not
+    # look". report is the one task that routinely runs unprivileged, so it has
+    # to say so rather than print a reassuring 'none held'.
+    if ! is_root; then
+        printf '  unknown (needs root to see other users file handles)\n'
+        return 0
+    fi
+
+    local path holders any=0
+    for path in "${locks[@]}"; do
+        [[ -e $path ]] || continue
+        holders=$(lock_holders "$path")
+        if [[ $holders == unknown ]]; then
+            printf '  %-40s holder unknown (no fuser/lsof)\n' "$path"
+            any=1
+        elif [[ -n $holders ]]; then
+            printf '  %-40s held by PID %s\n' "$path" "$holders"
+            any=1
+        fi
+    done
+    ((any)) || printf '  none held\n'
+}
+
+report_body() {
+    report_identity
+    report_memory
+    report_filesystems
+    report_kernels
+    report_updates
+    report_reboot
+    report_units
+    report_config_drift
+    report_journal
+    report_locks
+    printf '\n'
+}
+
+# The report body is written with plain printf rather than through log(), so
+# under --quiet it would otherwise flood stdout -- and it is part of 'routine',
+# which the README schedules as `--yes --quiet routine`. That would mail the
+# whole report every night and destroy the "mail means something failed"
+# contract that --quiet exists to provide.
+#
+# Under --quiet the body is redirected into the log file instead of being
+# skipped, so that check_reboot_required still runs and a pending reboot is
+# still recorded where an unattended run can be audited afterwards. QUIET is
+# shadowed to 0 for the duration so section() keeps emitting its headers --
+# without that the log copy is a run of bare "none" lines with nothing to
+# attach them to.
+#
+# When the log file is not writable LOG_SINK is /dev/null, so `--quiet report`
+# on such a host prints nothing and stores nothing. That is the documented
+# meaning of --quiet, not a lost report.
+task_report() {
+    if ((QUIET)); then
+        local QUIET=0
+        report_body >>"$LOG_SINK"
+    else
+        report_body
+    fi
+    return 0
+}
+
+# --- Task: update / autoremove / clean-cache ----------------------------------
+
+task_update() {
+    [[ -n $FAMILY ]] || {
+        unsupported_family update 'apt/dnf'
+        return 0
+    }
+    export_pkg_env
+    local rc=0
+    case $FAMILY in
+        debian)
+            local -a opts=()
+            mapfile -t opts < <(apt_opts)
+            run_cmd "$TASK_TIMEOUT" apt-get "${opts[@]}" update || rc=$?
+            ((rc == 0)) || {
+                log ERROR "apt-get update failed (status $rc); not upgrading against a stale index"
+                return "$rc"
+            }
+            run_cmd "$TASK_TIMEOUT" apt-get "${opts[@]}" "$UPGRADE_MODE" || rc=$?
+            ;;
+        rhel)
+            local mode=upgrade
+            [[ $UPGRADE_MODE == dist-upgrade ]] && mode=distro-sync
+            # strict=0 lets a multi-package transaction proceed when one package
+            # is unresolvable instead of failing the whole run.
+            run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y --setopt=strict=0 --refresh "$mode" || rc=$?
+            ;;
+    esac
+    check_reboot_required
+    return "$rc"
+}
+
+task_autoremove() {
+    [[ -n $FAMILY ]] || {
+        unsupported_family autoremove 'apt/dnf'
+        return 0
+    }
+    export_pkg_env
+    local rc=0
+    case $FAMILY in
+        debian)
+            local -a opts=()
+            mapfile -t opts < <(apt_opts)
+            run_cmd "$TASK_TIMEOUT" apt-get "${opts[@]}" --purge autoremove || rc=$?
+            ;;
+        rhel)
+            run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y autoremove || rc=$?
+            ;;
+    esac
+    return "$rc"
+}
+
+task_clean_cache() {
+    [[ -n $FAMILY ]] || {
+        unsupported_family clean-cache 'apt/dnf'
+        return 0
+    }
+    local rc=0
+    case $FAMILY in
+        debian)
+            run_cmd "$TASK_TIMEOUT" apt-get clean || rc=$?
+            ;;
+        rhel)
+            # 'clean packages' keeps the repo metadata, so the next transaction
+            # does not have to re-download every repomd.xml.
+            run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" clean packages || rc=$?
+            ;;
+    esac
+    return "$rc"
+}
+
+# --- Task: clean-logs ---------------------------------------------------------
+
+# Turns a space-separated exclusion list into `find` prune arguments. The
+# trailing '*' makes a single token cover both a directory (audit/) and the
+# rotated files beneath a prefix (wtmp.1, btmp.1).
+build_prune_args() {
+    local list=$1
+    local -a toks=()
+    read -r -a toks <<<"$list"
+    ((${#toks[@]})) || return 0
+    local i
+    printf '%s\n' '('
+    for i in "${!toks[@]}"; do
+        ((i > 0)) && printf '%s\n' '-o'
+        printf '%s\n%s\n' '-name' "${toks[i]}*"
+    done
+    printf '%s\n%s\n%s\n' ')' '-prune' '-o'
+}
+
+# Usage summary for a single path. Asking for used/avail/pcent without the
+# target column means there is no variable-width field to miscount, whatever the
+# device is called.
+fs_usage_line() {
+    have df || return 0
+    local out
+    out=$(probe df -h --output=used,avail,pcent -- "$1" 2>/dev/null |
+        awk 'NR == 2 { print $1 " used, " $2 " free (" $3 ")" }')
+    if [[ -z $out ]]; then
+        out=$(probe df -P -h -- "$1" 2>/dev/null |
+            awk 'NR > 1 { for (i = NF; i >= 1; i--) if ($i ~ /^[0-9]+%$/) { print $(i - 2) " used, " $(i - 1) " free (" $i ")"; exit } }')
+    fi
+    printf '%s' "$out"
+}
+
+# Deletes the given NUL-delimited file list, honouring --dry-run. Returns
+# non-zero if any removal failed.
+delete_files() {
+    local label=$1
+    shift
+    local -a victims=("$@")
+    local rc=0 f
+
+    if ((${#victims[@]} == 0)); then
+        log INFO "$label: nothing older than the threshold"
+        return 0
+    fi
+
+    log INFO "$label: ${#victims[@]} file(s) selected"
+    for f in "${victims[@]}"; do
+        if ((DRY_RUN)); then
+            log DRY "would delete $f"
+        else
+            # Not gated on QUIET: log() already suppresses the terminal copy and
+            # always writes the file, and which files were deleted is the one
+            # record an unattended run must leave behind.
+            if rm -f -- "$f"; then
+                log RUN "deleted $f"
+            else
+                log WARN "could not delete $f"
+                rc=1
+            fi
+        fi
+    done
+    return "$rc"
+}
+
+task_clean_logs() {
+    local rc=0
+
+    if have journalctl && [[ -d /run/systemd/system ]]; then
+        run_cmd "$TASK_TIMEOUT" journalctl --vacuum-size="$JOURNAL_SIZE" || rc=1
+        run_cmd "$TASK_TIMEOUT" journalctl --vacuum-time="$JOURNAL_AGE" || rc=1
+    else
+        log INFO "journald not present; skipping the journal vacuum"
+    fi
+
+    if ! have find; then
+        log ERROR "find not found; cannot sweep rotated logs"
+        return 1
+    fi
+    if [[ ! -d $LOG_DIR ]]; then
+        log WARN "$LOG_DIR is not a directory; skipping the rotated-log sweep"
+        return "$rc"
+    fi
+
+    local before after
+    before=$(fs_usage_line "$LOG_DIR")
+
+    local -a prune=()
+    mapfile -t prune < <(build_prune_args "$LOG_EXCLUDE")
+
+    # Only already-rotated files are eligible. A live *.log is never touched:
+    # truncating one that a daemon holds open is what turns "free some space"
+    # into "the service stopped logging".
+    #
+    # The numeric suffixes are matched with globs rather than -regex on purpose:
+    # GNU find defaults to the Emacs regex dialect, in which '\+' is a literal
+    # plus sign, so the obvious '.*\.[0-9]\+$' silently matches nothing.
+    local -a victims=()
+    mapfile -d '' -t victims < <(
+        find "$LOG_DIR" -xdev -mindepth 1 \
+            ${prune[@]+"${prune[@]}"} \
+            -type f \
+            \( -name '*.gz' -o -name '*.xz' -o -name '*.bz2' -o -name '*.zst' \
+            -o -name '*.old' -o -name '*.[0-9]' -o -name '*.[0-9][0-9]' \) \
+            -mtime +"$LOG_AGE_DAYS" -print0 2>/dev/null
+    )
+
+    delete_files "Rotated logs older than ${LOG_AGE_DAYS}d in $LOG_DIR" ${victims[@]+"${victims[@]}"} || rc=1
+
+    after=$(fs_usage_line "$LOG_DIR")
+    [[ -n $before ]] && log INFO "$LOG_DIR before: $before"
+    [[ -n $after ]] && log INFO "$LOG_DIR after : $after"
+    return "$rc"
+}
+
+# --- Task: clean-tmp ----------------------------------------------------------
+
+# Removes directories left empty by the file sweep, deepest first. `find -delete`
+# is deliberately not used here: it implies -depth, and -depth makes -prune a
+# no-op, which would let the sweep remove the very directories the exclusion
+# list exists to protect (/tmp/.X11-unix and friends). Each pass can only expose
+# one more level of empty parent, so a small fixed number of passes is enough.
+prune_empty_dirs() {
+    local dir=$1
+    shift
+    local -a prune=("$@")
+    local -a empties=()
+    local d i
+
+    for ((i = 0; i < 3; i++)); do
+        empties=()
+        mapfile -d '' -t empties < <(
+            find "$dir" -xdev -mindepth 1 ${prune[@]+"${prune[@]}"} \
+                -type d -empty -print0 2>/dev/null
+        )
+        ((${#empties[@]})) || return 0
+        if ((DRY_RUN)); then
+            for d in "${empties[@]}"; do log DRY "would remove empty directory $d"; done
+            return 0
+        fi
+        for d in "${empties[@]}"; do
+            rmdir -- "$d" 2>/dev/null && log RUN "removed empty directory $d"
+        done
+    done
+    return 0
+}
+
+# systemd-tmpfiles grew --dry-run in systemd 249. Older releases are still in
+# service (Debian 11 ships 247), so support is probed rather than assumed, and
+# the absence of it is reported instead of being papered over.
+# The help text is captured and matched in the shell rather than piped into
+# `grep -q`. Under `pipefail`, `producer | grep -q` reports the pipeline as
+# failed whenever grep exits on the first match before the producer has finished
+# writing: the producer gets SIGPIPE and dies with 141, which pipefail promotes.
+# That would make a systemd that DOES support --dry-run look as though it does
+# not, and silently drop the preview -- and it only bites once the help text
+# outgrows the pipe buffer, so it is the kind of bug that appears on someone
+# else's distribution and never in a test.
+tmpfiles_has_dry_run() {
+    local help_text
+    help_text=$(probe systemd-tmpfiles --help 2>/dev/null) || return 1
+    [[ $help_text == *--dry-run* ]]
+}
+
+task_clean_tmp() {
+    # TMP_MODE has already been resolved from 'auto' by preflight, so this is
+    # the same value the plan showed the operator.
+    local rc=0
+
+    if [[ $TMP_MODE == tmpfiles ]]; then
+        have systemd-tmpfiles || {
+            log ERROR "systemd-tmpfiles not found; use --tmp-mode age"
+            return 1
+        }
+        # The distribution's own tmpfiles.d policy already encodes which paths
+        # are safe to remove and after how long, including the sockets that must
+        # survive. Deferring to it beats re-deriving the rules here -- but it
+        # also means the set of files at risk is the whole policy, not --tmp-dirs.
+        log INFO "Using the distribution tmpfiles.d policy: --tmp-dirs and --tmp-age do not apply, and paths outside them may be cleaned. 'systemd-tmpfiles --cat-config' lists the rules."
+        if ((DRY_RUN)); then
+            if tmpfiles_has_dry_run; then
+                log DRY 'systemd-tmpfiles --clean --dry-run (lists what it would remove; removes nothing)'
+                # Deliberately not run_cmd: this argv is the preview itself, so
+                # printing "would run" instead of running it would make
+                # --dry-run useless for the default clean-tmp path.
+                #
+                # Its status is reported but does not fail the task. A preview is
+                # a query: --dry-run deliberately skips the root check so an
+                # unprivileged operator can decide whether to run this at all,
+                # and such a run cannot stat everything the policy covers.
+                # Marking the maintenance run failed because a preview was
+                # incomplete would be wrong, and every other task's --dry-run
+                # returns 0 as well.
+                local prc=0
+                exec_cmd "$TASK_TIMEOUT" systemd-tmpfiles --clean --dry-run || prc=$?
+                ((prc == 0)) ||
+                    log WARN "systemd-tmpfiles --clean --dry-run exited $prc; the list above may be incomplete (a full preview needs root)."
+                return 0
+            else
+                # No preview available. Say so and change nothing -- never fall
+                # through to the real --clean to produce some output.
+                log DRY 'would run: systemd-tmpfiles --clean'
+                log WARN "This systemd-tmpfiles predates --dry-run (systemd 249), so the file list cannot be previewed. Inspect the policy with 'systemd-tmpfiles --cat-config', or use --tmp-mode age for a previewable sweep."
+            fi
+            return "$rc"
+        fi
+        run_cmd "$TASK_TIMEOUT" systemd-tmpfiles --clean || rc=1
+        return "$rc"
+    fi
+
+    have find || {
+        log ERROR "find not found; cannot clean temporary directories"
+        return 1
+    }
+
+    local -a dirs=()
+    read -r -a dirs <<<"$TMP_DIRS"
+    local -a prune=()
+    mapfile -t prune < <(build_prune_args "$TMP_EXCLUDE")
+
+    local dir before after
+    for dir in "${dirs[@]}"; do
+        if [[ ! -d $dir ]]; then
+            log WARN "$dir is not a directory; skipping"
+            continue
+        fi
+        before=$(fs_usage_line "$dir")
+
+        # Regular files only, and both atime and mtime must be past the
+        # threshold. A directory is never removed for being old -- only once it
+        # is empty -- so a stale-looking directory holding fresh files survives.
+        local -a victims=()
+        mapfile -d '' -t victims < <(
+            find "$dir" -xdev -mindepth 1 \
+                ${prune[@]+"${prune[@]}"} \
+                -type f -atime +"$TMP_AGE_DAYS" -mtime +"$TMP_AGE_DAYS" \
+                -print0 2>/dev/null
+        )
+        delete_files "Files older than ${TMP_AGE_DAYS}d in $dir" ${victims[@]+"${victims[@]}"} || rc=1
+        prune_empty_dirs "$dir" ${prune[@]+"${prune[@]}"}
+
+        after=$(fs_usage_line "$dir")
+        [[ -n $before ]] && log INFO "$dir before: $before"
+        [[ -n $after ]] && log INFO "$dir after : $after"
+    done
+    return "$rc"
+}
+
+# --- Task: fix-packages -------------------------------------------------------
+
+task_fix_packages() {
+    [[ $FAMILY == debian ]] || {
+        unsupported_family fix-packages 'Debian/Ubuntu'
+        return 0
+    }
+    export_pkg_env
+    local rc=0
+    local -a opts=()
+    mapfile -t opts < <(apt_opts)
+
+    # The documented repair order: replay the dpkg journal first, then let apt
+    # resolve whatever dependencies the interrupted transaction left unmet.
+    run_cmd "$TASK_TIMEOUT" dpkg --configure -a || rc=$?
+    run_cmd "$TASK_TIMEOUT" apt-get "${opts[@]}" -f install || rc=$?
+    return "$rc"
+}
+
+# --- Task: fix-locks ----------------------------------------------------------
+
+lock_paths() {
+    local -n _out=$1
+    _out=()
+    case $FAMILY in
+        debian)
+            _out=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+                /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+            ;;
+        rhel)
+            _out=(/var/lib/rpm/.rpm.lock)
+            ;;
+    esac
+}
+
+# Prints the PIDs holding a path, an empty string when nothing holds it, or the
+# literal 'unknown' when neither fuser nor lsof is available. "No tool to check"
+# must never be reported as "nothing holds it".
+lock_holders() {
+    local path=$1
+    if have fuser; then
+        probe fuser "$path" 2>/dev/null | tr -s ' ' ' ' | sed 's/^ *//; s/ *$//'
+        return 0
+    fi
+    if have lsof; then
+        probe lsof -t -- "$path" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'
+        return 0
+    fi
+    printf 'unknown'
+}
+
+pid_alive() {
+    [[ $1 =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$1" 2>/dev/null
+}
+
+task_fix_locks() {
+    [[ -n $FAMILY ]] || {
+        unsupported_family fix-locks 'apt/dnf'
+        return 0
+    }
+
+    local -a locks=()
+    lock_paths locks
+    local path holders busy=0 unknown=0
+
+    # An unprivileged fuser/lsof only sees this user's own file handles, so an
+    # empty result would mean "I could not look", not "nothing holds it".
+    if ! is_root; then
+        log WARN 'Not running as root: file handles held by other users are invisible, so lock state cannot be established.'
+        unknown=1
+    fi
+
+    for path in "${locks[@]}"; do
+        [[ -e $path ]] || continue
+        holders=$(lock_holders "$path")
+        if [[ $holders == unknown ]]; then
+            log WARN "$path: cannot determine the holder (install psmisc for fuser, or lsof)"
+            unknown=1
+            continue
+        fi
+        if [[ -n $holders ]]; then
+            busy=1
+            log WARN "$path is held by PID(s): $holders"
+            local -a pids=()
+            read -r -a pids <<<"$holders"
+            local pid
+            for pid in "${pids[@]}"; do
+                # The holder can exit between pid_alive and this read, so the
+                # 2>/dev/null has to come before the input redirection or bash
+                # prints its own error over the diagnosis being produced.
+                pid_alive "$pid" && log WARN "  PID $pid: $(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || printf 'unreadable')"
+            done
+        fi
+    done
+
+    if ((busy)); then
+        log ERROR "A package manager is running. Wait for it, or let apt wait: apt-get -o DPkg::Lock::Timeout=$PKG_LOCK_WAIT ..."
+        log ERROR "This task never kills the holder and never deletes a dpkg lock file: those are flock(2) targets that the kernel releases when the process dies, so they cannot go stale. Deleting one while a holder is alive is what corrupts /var/lib/dpkg."
+        return 1
+    fi
+
+    if ((unknown)); then
+        log ERROR "Refusing to act on locks whose holder could not be determined."
+        return 1
+    fi
+
+    log OK "No package-manager lock is held."
+
+    # dnf, unlike dpkg, uses a pid file rather than flock, so that one really can
+    # outlive its process.
+    if [[ $FAMILY == rhel ]]; then
+        local pidfile
+        for pidfile in /run/dnf.pid /var/run/dnf.pid; do
+            [[ -f $pidfile ]] || continue
+            local pid
+            pid=$(head -n1 "$pidfile" 2>/dev/null | tr -dc '0-9')
+            if [[ -n $pid ]] && pid_alive "$pid"; then
+                log ERROR "$pidfile belongs to live PID $pid; leaving it alone"
+                return 1
+            fi
+            log WARN "$pidfile refers to PID '${pid:-none}', which is not running"
+            if ((DRY_RUN)); then
+                log DRY "would delete $pidfile"
+            elif confirm_step "delete the stale pid file $pidfile"; then
+                rm -f -- "$pidfile" && log OK "removed stale $pidfile"
+            fi
+        done
+    fi
+
+    # An interrupted dpkg run leaves entries in its journal. Replaying them is
+    # the actual repair; that is what fix-packages does.
+    if [[ $FAMILY == debian ]] && [[ -d /var/lib/dpkg/updates ]]; then
+        local pending
+        pending=$(find /var/lib/dpkg/updates -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+        if [[ ${pending:-0} != 0 ]]; then
+            log WARN "dpkg has $pending unreplayed journal entries; run: $PROG --yes fix-packages"
+        fi
+    fi
+    return 0
+}
+
+# --- Dispatch -----------------------------------------------------------------
+
+run_task() {
+    case $1 in
+        report) task_report ;;
+        update) task_update ;;
+        autoremove) task_autoremove ;;
+        clean-cache) task_clean_cache ;;
+        clean-logs) task_clean_logs ;;
+        clean-tmp) task_clean_tmp ;;
+        fix-packages) task_fix_packages ;;
+        fix-locks) task_fix_locks ;;
+        *) return 2 ;;
+    esac
+}
+
+# force=1 prints the plan even under --quiet. A confirmation prompt exists to
+# show the operator the blast radius before they answer it, so suppressing the
+# plan and then asking "Proceed? [y/N]" would leave nothing to consent to.
+# --quiet still silences the plan for the runs it was meant for: --yes and
+# --dry-run, neither of which asks a question.
+print_plan() {
+    local force=${1:-0} task
+    ((QUIET)) && ((!force)) && return 0
+    printf '\n'
+    printf 'Plan for %s:\n' "$(hostname 2>/dev/null || printf 'this host')"
+    for task in "${TASKS[@]}"; do
+        printf '  %-13s %s\n' "$task" "$(task_blast_radius "$task")"
+    done
+    printf '\n'
+}
+
+confirm_plan() {
+    local reply
+    if [[ -t 0 ]]; then
+        read -r -p 'Proceed? [y/N] ' reply || return 1
+    else
+        # Under `curl | bash` stdin is the script text, so the answer has to come
+        # from the terminal directly.
+        read -r -p 'Proceed? [y/N] ' reply </dev/tty || return 1
+    fi
+    [[ ${reply,,} == y* ]]
+}
+
+# Gate for a destructive step inside an otherwise read-only task. Same rules as
+# the whole-run gate: --dry-run never asks, --yes never asks, no terminal means
+# refuse rather than silently proceed.
+confirm_step() {
+    local what=$1
+    ((DRY_RUN)) && return 0
+    ((ASSUME_YES)) && return 0
+    if can_prompt; then
+        # printf, not say(): say() is silenced by --quiet, and a confirmation
+        # prompt with nothing above it gives the operator nothing to consent to.
+        # Same reasoning as print_plan's force flag. This is the only gate
+        # fix-locks has -- it is not a mutating task, so the whole-run gate in
+        # main() never fires for it.
+        printf 'About to %s.\n' "$what"
+        confirm_plan && return 0
+        log INFO "Skipped: $what"
+        return 1
+    fi
+    log ERROR "Refusing to $what unattended. Re-run with --yes."
+    return 1
+}
+
+summary() {
+    ((SUMMARY_DONE)) && return 0
+    SUMMARY_DONE=1
+
+    local item
+    local failed=${#FAILED_TASKS[@]}
+
+    # Quiet means quiet on success only: a failure must always reach the
+    # operator, which under cron means it must reach stderr.
+    if ((QUIET)) && ((failed == 0)); then
+        return 0
+    fi
+
+    ((QUIET)) || printf '\n'
+    if ((failed)); then
+        log ERROR "Summary: ${#OK_TASKS[@]} ok, ${#SKIPPED_TASKS[@]} skipped, $failed failed"
+        for item in "${FAILED_TASKS[@]}"; do printf '  FAILED  %s\n' "$item" >&2; done
+    else
+        log INFO "Summary: ${#OK_TASKS[@]} ok, ${#SKIPPED_TASKS[@]} skipped, 0 failed"
+    fi
+    if ((!QUIET)); then
+        ((${#OK_TASKS[@]})) && for item in "${OK_TASKS[@]}"; do printf '  ok      %s\n' "$item"; done
+        ((${#SKIPPED_TASKS[@]})) && for item in "${SKIPPED_TASKS[@]}"; do printf '  skipped %s\n' "$item"; done
+    fi
+    ((REBOOT_REQUIRED)) && log WARN "This host needs a reboot."
+    ((LOG_READY)) && log INFO "Full log: $LOG_FILE"
+    return 0
+}
+
+on_exit() {
+    local rc=$?
+    trap - EXIT INT TERM
+    summary
+    ((LOCK_HELD)) && exec 9>&-
+    exit "$rc"
+}
+
+on_signal() {
+    log WARN 'Interrupted'
+    exit "$EX_INTERRUPT"
+}
+
+# --- Main ---------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+    setup_color
+
+    ((QUIET)) || [[ ! -t 1 ]] || printf '%s%s v%s%s\n' "$GN" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$CL"
+
+    preflight
+
+    local task mutating=0 needs_root=0
+    for task in "${TASKS[@]}"; do
+        task_mutates "$task" && mutating=1
+        task_needs_root "$task" && needs_root=1
+    done
+
+    # Root is needed to change anything, but not to preview it: --dry-run stays
+    # usable for an unprivileged operator deciding whether to run this at all.
+    if ((needs_root)) && ((!DRY_RUN)) && ! is_root; then
+        die "$EX_NOROOT" "These tasks must run as root. Try: sudo $PROG ${TASKS[*]}"
+    fi
+
+    # Decided before the plan is printed, because the answer is what decides
+    # whether --quiet is allowed to suppress it.
+    local will_prompt=0
+    ((!DRY_RUN)) && ((mutating)) && ((!ASSUME_YES)) && can_prompt && will_prompt=1
+    print_plan "$will_prompt"
+
+    if ((DRY_RUN)); then
+        log INFO 'Dry run: nothing will be changed.'
+    elif ((mutating)) && ((!ASSUME_YES)); then
+        if ((will_prompt)); then
+            confirm_plan || {
+                log INFO 'Cancelled.'
+                return 0
+            }
+        else
+            die "$EX_NOCONFIRM" "Refusing to change this system unattended. Re-run with --yes (or LZC_MAINTENANCE_YES=1), or preview with --dry-run."
+        fi
+    fi
+
+    # The lock is only taken when something will actually change, so a read-only
+    # report is never blocked by an update that is already running.
+    ((mutating)) && ((!DRY_RUN)) && acquire_lock
+
+    trap on_exit EXIT
+    trap on_signal INT TERM
+    # An SSH disconnect sends HUP to the foreground process group. Ignoring it
+    # here means dpkg -- which inherits the ignored disposition across exec --
+    # is not killed mid-transaction, which is the usual cause of a package
+    # database that then needs `dpkg --configure -a` to recover.
+    trap '' HUP
+
+    log INFO "Starting $SCRIPT_NAME v$SCRIPT_VERSION on $(hostname 2>/dev/null || printf 'this host')"
+
+    local rc
+    for task in "${TASKS[@]}"; do
+        section "task: $task"
+        rc=0
+        TASK_SKIPPED=0
+        run_task "$task" || rc=$?
+        if ((TASK_SKIPPED)); then
+            continue # the task already recorded why it did nothing
+        fi
+        if ((rc == 0)); then
+            OK_TASKS+=("$task")
+            log OK "$task completed"
+        else
+            FAILED_TASKS+=("$task (status $rc)")
+            log ERROR "$task failed with status $rc"
+        fi
+    done
+
+    # A pending reboot does not get an exit code of its own: the repo-wide table
+    # reserves every code it defines, and "needs a reboot" is not one of those
+    # situations. summary() reports it as a warning, which is what reaches the
+    # operator through cron mail anyway.
+    ((${#FAILED_TASKS[@]})) && return "$EX_FAIL"
+    return 0
+}
+
+main "$@"
