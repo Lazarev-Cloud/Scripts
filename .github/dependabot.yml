@@ -44,9 +44,13 @@ updates:
     # Let a release sit before proposing it. Yanked and immediately-respun
     # releases are common enough, and nothing in this repo is urgent enough to
     # want day-zero. Security updates ignore this.
+    #
+    # `default-days` only. The semver-specific keys (semver-major-days and its
+    # siblings) are supported for neither of the two ecosystems in this file,
+    # and Dependabot rejects the whole config rather than the one key -- an
+    # invalid file means no updates at all, and it fails quietly.
     cooldown:
       default-days: 3
-      semver-major-days: 7
 
   # monitoring/requirements.txt. This is only useful because that file pins
   # exact versions -- a range would leave Dependabot nothing to bump.
@@ -66,9 +70,9 @@ updates:
           - patch
           - minor
 
+    # default-days only here too; see the github-actions block above.
     cooldown:
       default-days: 3
-      semver-major-days: 7
 
 # Pins Dependabot cannot see. Check these by hand:
 #

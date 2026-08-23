@@ -1003,15 +1003,18 @@ take_backup() {
 # fchmod, which bash has no way to call. A path dropped here is reported rather
 # than skipped quietly -- it means the tree changed mid-run, which is worth
 # knowing about whether or not anyone was attacking.
+# `src`/`dst` rather than `in`/`out`: `out` is the nameref array in
+# parse_id_spec, and reusing the name here makes shellcheck read this string
+# assignment as clobbering that array (SC2178/SC2128).
 drop_symlinks() {
-    local in=$1 out=$2 p dropped=0
+    local src=$1 dst=$2 p dropped=0
     while IFS= read -r -d '' p; do
         if [[ -L $p ]]; then
             dropped=$((dropped + 1))
             continue
         fi
         printf '%s\0' "$p"
-    done <"$in" >"$out"
+    done <"$src" >"$dst"
 
     if ((dropped)); then
         log WARN "$dropped path(s) became symlinks between the scan and the apply and were not chmod'ed."
