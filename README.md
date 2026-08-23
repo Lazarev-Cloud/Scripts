@@ -46,6 +46,11 @@ PSScriptAnalyzer over every `.ps1` on each push and pull request. Both are
 pinned and both currently report zero findings; any new finding fails the
 build.
 
+`./tests/run_checks.sh` runs the same checks locally before you push, reading
+the pinned versions out of the workflow so the two cannot drift. It adds two
+CI cannot do: that every script answers `--help` with status 0, and that every
+runnable script is committed executable.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

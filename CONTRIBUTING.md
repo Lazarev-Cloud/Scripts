@@ -93,10 +93,19 @@ The exit-code table still applies.
 ## Before you open a pull request
 
 ```bash
-shellcheck -s bash <changed files>      # must be silent
-bash -n <changed files>                 # must be silent
+./tests/run_checks.sh                   # everything CI runs, plus --help and file modes
 <script> --help                         # read it; does it match the code?
 <script> --dry-run                      # does it describe the right thing?
+```
+
+`run_checks.sh` reads the pinned linter versions out of the workflow, so it
+cannot drift from CI. It also covers two things CI cannot: that every script
+answers `--help` with status 0, and that every runnable script is committed
+executable. Run the individual tools by hand if you prefer:
+
+```bash
+shellcheck -s bash <changed files>      # must be silent
+bash -n <changed files>                 # must be silent
 ```
 
 For PowerShell:
