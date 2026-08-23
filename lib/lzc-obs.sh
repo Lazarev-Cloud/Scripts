@@ -53,19 +53,59 @@
 [[ -n ${_LZC_OBS_LOADED:-} ]] && return 0
 _LZC_OBS_LOADED=1
 
-LZC_LOGS_URL="${LZC_LOGS_URL:-}"
-LZC_LOGS_FORMAT="${LZC_LOGS_FORMAT:-jsonline}"
-LZC_METRICS_URL="${LZC_METRICS_URL:-}"
-LZC_METRICS_FORMAT="${LZC_METRICS_FORMAT:-prometheus}"
-LZC_OBS_JOB="${LZC_OBS_JOB:-}"
-LZC_OBS_INSTANCE="${LZC_OBS_INSTANCE:-}"
-LZC_OBS_LABELS="${LZC_OBS_LABELS:-}"
-LZC_OBS_TIMEOUT="${LZC_OBS_TIMEOUT:-10}"
-LZC_OBS_RETRIES="${LZC_OBS_RETRIES:-1}"
-LZC_OBS_CONNECT_TIMEOUT="${LZC_OBS_CONNECT_TIMEOUT:-5}"
-LZC_OBS_INSECURE="${LZC_OBS_INSECURE:-0}"
-LZC_OBS_BUFFER="${LZC_OBS_BUFFER:-500}"
-LZC_OBS_DEBUG="${LZC_OBS_DEBUG:-0}"
+# Assigned through a helper that tolerates a readonly variable already present
+# in the caller's environment. A bare assignment to a readonly name fails, and
+# under a `set -e` caller using the plain sourcing snippet from
+# docs/observability.md that aborts the whole script at source time -- this
+# file failing closed on the caller is precisely what it must never do. A
+# readonly value is already set, so keeping it is also the right outcome.
+# printf -v onto a name that is readonly in the caller's environment fails, and
+# a failure here would propagate the way the assignments above would have. The
+# value is already fixed in that case, so keeping it is also correct.
+# Writes the normalised value to a private name that logic reads, and mirrors
+# it onto the public LZC_* name when that is writable. The private copy is what
+# makes this safe: a caller may have made LZC_OBS_BUFFER readonly *and* invalid,
+# in which case nothing can repair the public name -- and arithmetic on it would
+# abort the caller with "bogus: unbound variable", which is the exact crash this
+# whole validation section exists to prevent.
+_obs_setpair() {
+    _obs_set "$2" "$3"
+    _obs_set "$1" "$3"
+    return 0
+}
+
+_obs_set() {
+    local decl
+    # Assigning to a readonly name is a *fatal* shell error -- `|| true` does
+    # not rescue it, the shell exits there and then -- so the only safe move is
+    # not to assign at all. A readonly value is already fixed by the caller, so
+    # leaving it is the right outcome as well as the survivable one.
+    decl=$(declare -p "$1" 2>/dev/null) || decl=''
+    [[ $decl =~ ^declare\ -[a-zA-Z]*r ]] && return 0
+    printf -v "$1" '%s' "$2"
+    return 0
+}
+
+_obs_default() {
+    local name=$1 value=$2
+    [[ -n ${!name:-} ]] && return 0
+    _obs_set "$name" "$value"
+    return 0
+}
+
+_obs_default LZC_LOGS_URL ''
+_obs_default LZC_LOGS_FORMAT 'jsonline'
+_obs_default LZC_METRICS_URL ''
+_obs_default LZC_METRICS_FORMAT 'prometheus'
+_obs_default LZC_OBS_JOB ''
+_obs_default LZC_OBS_INSTANCE ''
+_obs_default LZC_OBS_LABELS ''
+_obs_default LZC_OBS_TIMEOUT '10'
+_obs_default LZC_OBS_RETRIES '1'
+_obs_default LZC_OBS_CONNECT_TIMEOUT '5'
+_obs_default LZC_OBS_INSECURE '0'
+_obs_default LZC_OBS_BUFFER '500'
+_obs_default LZC_OBS_DEBUG '0'
 
 _obs_log_buf=''
 _obs_metric_buf=''
@@ -74,6 +114,14 @@ _obs_auth_cfg=''
 _obs_started=0
 _obs_disabled=0
 _obs_warned=0
+# Normalised copies of the tunables. Logic reads these, never the public LZC_*
+# names, so a caller cannot make one readonly-and-invalid and take the run down.
+_obs_timeout=10
+_obs_connect_timeout=5
+_obs_retries=1
+_obs_buffer=500
+_obs_insecure=0
+_obs_debug=0
 
 # --- Small utilities ---------------------------------------------------------
 
@@ -113,16 +161,16 @@ _obs_config_warn() {
 # be able to fail a root maintenance run that would otherwise have succeeded.
 
 _obs_norm_bool() {
-    local name=$1 default=$2
+    local name=$1 dest=$2 default=$3
     case ${!name:-} in
-        '') printf -v "$name" '%s' "$default" ;;
+        '') _obs_setpair "$name" "$dest" "$default" ;;
         *)
             case ${!name,,} in
-                1 | true | yes | on) printf -v "$name" '%s' 1 ;;
-                0 | false | no | off) printf -v "$name" '%s' 0 ;;
+                1 | true | yes | on) _obs_setpair "$name" "$dest" 1 ;;
+                0 | false | no | off) _obs_setpair "$name" "$dest" 0 ;;
                 *)
                     _obs_config_warn "$name must be true or false, got '${!name}'; using $default"
-                    printf -v "$name" '%s' "$default"
+                    _obs_setpair "$name" "$dest" "$default"
                     ;;
             esac
             ;;
@@ -130,9 +178,9 @@ _obs_norm_bool() {
 }
 
 _obs_norm_int() {
-    local name=$1 default=$2 min=$3 value
+    local name=$1 dest=$2 default=$3 min=$4 value
     if [[ -z ${!name:-} ]]; then
-        printf -v "$name" '%s' "$default"
+        _obs_setpair "$name" "$dest" "$default"
         return 0
     fi
     # Bounded to nine digits, not just "digits": $((10#...)) wraps silently on
@@ -141,7 +189,7 @@ _obs_norm_int() {
     # unlimited --max-time -- the exact outcome the minimum exists to prevent.
     if [[ ! ${!name} =~ ^[0-9]{1,9}$ ]]; then
         _obs_config_warn "$name must be a whole number, got '${!name}'; using $default"
-        printf -v "$name" '%s' "$default"
+        _obs_setpair "$name" "$dest" "$default"
         return 0
     fi
     # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
@@ -151,7 +199,7 @@ _obs_norm_int() {
         _obs_config_warn "$name must be at least $min, got '${!name}'; using $default"
         value=$default
     fi
-    printf -v "$name" '%s' "$value"
+    _obs_setpair "$name" "$dest" "$value"
 }
 
 # Idempotent, and called twice on purpose: once when this file is sourced, so a
@@ -161,20 +209,26 @@ _obs_norm_int() {
 _obs_normalise_settings() {
     # Minimum 1 on the timeouts, not 0: curl reads 0 as "no limit", which
     # silently removes the very bound these settings exist to provide.
-    _obs_norm_int LZC_OBS_TIMEOUT 10 1
-    _obs_norm_int LZC_OBS_CONNECT_TIMEOUT 5 1
-    _obs_norm_int LZC_OBS_RETRIES 1 0
-    _obs_norm_int LZC_OBS_BUFFER 500 1
-    _obs_norm_bool LZC_OBS_INSECURE 0
-    _obs_norm_bool LZC_OBS_DEBUG 0
+    _obs_norm_int LZC_OBS_TIMEOUT _obs_timeout 10 1
+    _obs_norm_int LZC_OBS_CONNECT_TIMEOUT _obs_connect_timeout 5 1
+    _obs_norm_int LZC_OBS_RETRIES _obs_retries 1 0
+    _obs_norm_int LZC_OBS_BUFFER _obs_buffer 500 1
+    _obs_norm_bool LZC_OBS_INSECURE _obs_insecure 0
+    _obs_norm_bool LZC_OBS_DEBUG _obs_debug 0
 }
 
+# Both use printf's %(...)T, which is a bash builtin, rather than date(1).
+# date was the last external command in here that was called unguarded, and a
+# host without it -- the same minimal container the hostname fallback above
+# already anticipates -- turned a successful run into exit 127 under `set -e`,
+# because obs_finish runs from the caller's EXIT trap. A builtin cannot be
+# missing. TZ=UTC because %(...)T formats in local time, where date -u did not.
 _obs_now_rfc3339() {
-    date -u '+%Y-%m-%dT%H:%M:%SZ'
+    TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T\n' -1
 }
 
 _obs_epoch() {
-    date -u '+%s'
+    printf '%(%s)T\n' -1
 }
 
 # Escapes a value for embedding in a JSON string.
@@ -299,12 +353,12 @@ _obs_post() {
     # Kept deliberately impatient: a dead collector must cost the maintenance
     # run seconds, not minutes. Shipping is best-effort by design.
     local -a cmd=(curl --silent --show-error --fail
-        --connect-timeout "$LZC_OBS_CONNECT_TIMEOUT"
-        --max-time "$LZC_OBS_TIMEOUT"
-        --retry "$LZC_OBS_RETRIES" --retry-delay 1
+        --connect-timeout "$_obs_connect_timeout"
+        --max-time "$_obs_timeout"
+        --retry "$_obs_retries" --retry-delay 1
         -X POST -H "Content-Type: $ctype" --data-binary @-)
 
-    ((LZC_OBS_INSECURE)) && cmd+=(--insecure)
+    ((_obs_insecure)) && cmd+=(--insecure)
     [[ -n $_obs_auth_cfg ]] && cmd+=(--config "$_obs_auth_cfg")
 
     if [[ -n ${LZC_OBS_TENANT:-} ]]; then
@@ -314,7 +368,7 @@ _obs_post() {
 
     cmd+=("$url")
 
-    if ((LZC_OBS_DEBUG)); then
+    if ((_obs_debug)); then
         printf '[obs] POST %s (%s)\n%s\n' "$url" "$ctype" "$payload" >&2
         return 0
     fi
@@ -385,7 +439,7 @@ obs_log() {
     _obs_log_buf+="$line"$'\n'
     _obs_buffered=$((_obs_buffered + 1))
 
-    ((_obs_buffered >= LZC_OBS_BUFFER)) && obs_flush_logs
+    ((_obs_buffered >= _obs_buffer)) && obs_flush_logs
     return 0
 }
 
