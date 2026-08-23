@@ -89,6 +89,29 @@ LZC_UPDATE_LXCS_CLUSTER=1 LZC_UPDATE_LXCS_YES=1 bash -c "$s"
 | `--nodes LIST` | `LZC_UPDATE_LXCS_NODES` | Explicit node names instead of discovery. |
 | `--local-only` | — | Force single-node operation. |
 | `--ssh-user USER` | `LZC_UPDATE_LXCS_SSH_USER` | SSH user for remote nodes (`root`). |
+
+### Tunables with no flag
+
+Environment-only, all seconds unless noted, all with a minimum of 1 except
+`RETRY_DELAY` (minimum 0). Defaults in brackets.
+
+| Variable | Meaning |
+| --- | --- |
+| `LZC_UPDATE_LXCS_LOCK` | Lock file [`/run/lock/lxc-updater.lock`]. |
+| `LZC_UPDATE_LXCS_LOG_MAX_BYTES` | Rotate the log once it exceeds this [5242880]. |
+| `LZC_UPDATE_LXCS_START_TIMEOUT` | Wait for a started container to become ready [60]. |
+| `LZC_UPDATE_LXCS_READY_PROBE_TIMEOUT` | Each individual readiness probe [5]. |
+| `LZC_UPDATE_LXCS_READY_POLL_INTERVAL` | Gap between readiness probes [2]. |
+| `LZC_UPDATE_LXCS_SHUTDOWN_TIMEOUT` | Graceful shutdown before a forced stop [60]. |
+| `LZC_UPDATE_LXCS_PROBE_TIMEOUT` | In-guest probes: distro detection, `df` [20]. |
+| `LZC_UPDATE_LXCS_RETRY_DELAY` | Pause between update attempts [10]. |
+| `LZC_UPDATE_LXCS_SSH_TIMEOUT` | SSH connect timeout [15]. |
+| `LZC_UPDATE_LXCS_SSH_OPTS` | Extra `ssh` options, whitespace separated []. |
+
+In a **file-mode** cluster run these apply to the node you launch from, not to
+the remote nodes: only `--timeout`, `--retries`, `--exclude`, `--include`,
+`--skip-stopped` and `--dry-run` travel over SSH as flags. Set them in the
+remote environment, or on each node, if they need to apply fleet-wide.
 | `--logs-url URL` | `LZC_LOGS_URL` | Ship structured logs to a collector. |
 | `--metrics-url URL` | `LZC_METRICS_URL` | Ship run metrics to a collector. |
 
