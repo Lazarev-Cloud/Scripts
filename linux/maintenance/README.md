@@ -1,6 +1,7 @@
 # Linux Maintenance Runner
 
-`maintenance.sh` runs named housekeeping tasks on Debian/Ubuntu and RHEL-family
+`maintenance.sh` runs named housekeeping tasks on Debian/Ubuntu, RHEL-family,
+Arch (including Manjaro), SUSE and Alpine
 hosts: a health report, package updates, cache/log/tmp cleanup, and repair of an
 interrupted package operation.
 
@@ -36,7 +37,7 @@ runs commands unbounded. `apt-get`, `dnf`/`yum`, `journalctl`,
 | --- | --- | --- | --- |
 | `report` | no | Health summary (see below). | None. The only task that runs without root. |
 | `update` | yes | Refreshes the index, then upgrades. | Installs new package versions; packaging scripts may restart services. |
-| `autoremove` | yes | Removes packages nothing needs any more. | **Purges packages and their config**, old kernels included. |
+| `autoremove` | yes | Removes packages nothing needs any more. | **Purges packages and their config**, old kernels included on Debian/RHEL. Skipped on SUSE and Alpine — see below. |
 | `clean-cache` | yes | Deletes downloaded package archives. | Cache only; all of it is re-downloadable. |
 | `clean-logs` | yes | Vacuums the journal, deletes aged rotated logs. | **Deletes log history permanently.** |
 | `clean-tmp` | yes | Cleans temporary files. | **Deletes files.** In `age` mode, in `--tmp-dirs`. In `tmpfiles` mode — the default under systemd — everywhere the distribution's `tmpfiles.d` policy covers, which is wider. |
@@ -47,6 +48,45 @@ runs commands unbounded. `apt-get`, `dnf`/`yum`, `journalctl`,
 \* `fix-locks` still requires root: an unprivileged `fuser` cannot see file
 handles held by other users, so it would report "nothing holds the lock" while
 root's `dpkg` holds it. Rather than guess, it refuses.
+
+## What each task runs, per family
+
+The family is detected from which package manager is on `PATH`, in the order
+`apt-get`, `dnf`, `yum`, `pacman`, `zypper`, `apk`. A task with no safe
+counterpart is skipped and reported as skipped — never approximated.
+
+| | Debian | RHEL | Arch | SUSE | Alpine |
+| --- | --- | --- | --- | --- | --- |
+| `update` | `apt-get update` then `upgrade`/`dist-upgrade` | `dnf --refresh upgrade`/`distro-sync` | `pacman -Syu` | `zypper refresh` then `update`/`dist-upgrade` | `apk -U upgrade` |
+| `autoremove` | `apt-get --purge autoremove` | `dnf autoremove` | `pacman -Rns` on `-Qtdq` orphans | skipped | skipped |
+| `clean-cache` | `apt-get clean` | `dnf clean packages` | `paccache -rk1`, else `pacman -Sc` | `zypper clean` | `apk cache clean` |
+| Pending updates | `apt-get -s upgrade` | `dnf check-update` | `checkupdates` | `zypper list-updates` | `apk version -l '<'` |
+| Reboot needed | `/run/reboot-required` | `needs-restarting -r` | running kernel's modules dir gone | `zypper needs-restarting -r` | not detectable |
+
+Notes on the three that are not just a different spelling of the same idea:
+
+- **Arch never does a bare `pacman -Sy`.** Refreshing the database without
+  upgrading in the same transaction is a partial upgrade, which upstream Arch
+  treats as unsupported and which is the classic way to break a rolling-release
+  box. So `update` is a single `-Syu`, and `--upgrade-mode` is ignored: pacman
+  has no `upgrade`/`dist-upgrade` distinction. Arch also carries one version per
+  kernel package rather than accumulating them, so there are no old kernels to
+  prune.
+- **`checkupdates`, `zypper list-updates` and `apk version` all read; none of
+  them refresh.** A health report must not mutate repository metadata, so on
+  those three families the count is only as fresh as the last refresh, and the
+  report says so. `checkupdates` ships in `pacman-contrib`; without it the
+  answer is `unknown`, never `0`.
+- **SUSE and Alpine have no autoremove.** zypper can *list* unneeded packages
+  but only as a human-readable table, and parsing a table to build a purge argv
+  is how an unattended run removes something it should not have. apk prunes
+  unused dependencies during ordinary transactions, so there is no orphan set to
+  collect. Both are reported as skipped with the reason.
+
+Only the Arch path has been exercised on real hardware. The Debian and RHEL
+paths predate this and are unchanged; SUSE and Alpine were verified against
+command stubs on `PATH` — dispatch, argv and output parsing — but not on a real
+host of either kind.
 
 Tasks run in the order given and each name runs once, so `routine report` runs
 the report a single time, at the end.
@@ -151,7 +191,7 @@ repo-wide namespace, so `env | grep LZC_` shows everything that is configurable.
 | `-q, --quiet` | `LZC_MAINTENANCE_QUIET` | off | Silent on success; output only on failure. |
 | `--list-tasks` | — | — | Print task names and exit. |
 | `--upgrade-mode MODE` | `LZC_MAINTENANCE_UPGRADE_MODE` | `upgrade` | `upgrade` or `dist-upgrade`. |
-| `--timeout SECONDS` | `LZC_MAINTENANCE_TIMEOUT` | `3600` | Bounds **each system-changing command** individually: one apt/dnf transaction, one journal vacuum, one `systemd-tmpfiles` run. Not a budget for the whole run. Minimum `1`. |
+| `--timeout SECONDS` | `LZC_MAINTENANCE_TIMEOUT` | `3600` | Bounds **each system-changing command** individually: one package transaction, one journal vacuum, one `systemd-tmpfiles` run. Not a budget for the whole run. Minimum `1`. |
 | `--probe-timeout SEC` | `LZC_MAINTENANCE_PROBE_TIMEOUT` | `30` | Bounds **each read-only probe** individually: `df`, `dpkg-query`, `rpm`, `systemctl`, `journalctl --disk-usage`, `fuser`/`lsof`, and the simulated upgrade the report counts. Minimum `1`. |
 | `--pkg-lock-wait SEC` | `LZC_MAINTENANCE_PKG_LOCK_WAIT` | `600` | How long apt waits for the dpkg lock to be released before giving up (`DPkg::Lock::Timeout`). Not a `timeout(1)` bound; `0` means do not wait. |
 | `--disk-warn PCT` | `LZC_MAINTENANCE_DISK_WARN` | `85` | Filesystem usage worth reporting (0–100). |
