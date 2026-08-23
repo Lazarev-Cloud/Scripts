@@ -72,8 +72,6 @@ updates:
 
 # Pins Dependabot cannot see. Check these by hand:
 #
-#   _config.yml                     remote_theme just-the-docs@v0.10.1.
-#                                   Jekyll remote themes are not an ecosystem.
 #   .github/workflows/lint.yml      SHELLCHECK_VERSION, PSSCRIPTANALYZER_VERSION.
 #                                   Plain env vars, not a manifest.
 #   monitoring/setup_prometheus_exporter.sh

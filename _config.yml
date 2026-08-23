@@ -1,44 +1,42 @@
 # Jekyll configuration for the GitHub Pages site.
 #
-# The site is built from the repository's own README files. Each one carries
-# YAML front matter, which GitHub hides when it renders markdown, so there is a
-# single source for both the repo view and the published site. Do not duplicate
-# script documentation into a separate docs tree.
+# The site is built from the repository's own README files. There is no
+# separate docs tree and no per-page front matter: these READMEs are read on
+# GitHub far more often than on the site, and GitHub renders YAML front matter
+# as a metadata table rather than hiding it, so adding it would put a block of
+# Jekyll bookkeeping at the top of every page in the repository view.
+#
+# That constraint drives the two settings below. `jekyll-optional-front-matter`
+# is a default GitHub Pages plugin and is what lets a plain .md file be treated
+# as a page at all; `defaults` then gives every one of those pages a layout,
+# which is what a themed site needs and what front matter would otherwise
+# supply. A theme with a generated sidebar (just-the-docs and friends) cannot
+# work here, because its navigation is built from per-page `title`/`nav_order`
+# front matter. Navigation is the index links the READMEs already carry.
+#
+# jekyll-theme-primer is one of the themes GitHub Pages supports natively, so
+# it needs no `remote_theme` and no pinned third-party revision.
 
 title: Lazarev Cloud Scripts
 description: Maintenance scripts for Linux, Proxmox VE and Windows. Safe by default, cron-ready, zero lint findings.
-remote_theme: just-the-docs/just-the-docs@v0.10.1
+theme: jekyll-theme-primer
 url: https://lazarev-cloud.github.io
 baseurl: /Scripts
 
 permalink: pretty
 
-# Sidebar and navigation
-aux_links:
-  View on GitHub:
-    - https://github.com/Lazarev-Cloud/Scripts
-aux_links_new_tab: true
-
-search_enabled: true
-search:
-  heading_level: 2
-  previews: 3
-
-color_scheme: dark
-heading_anchors: true
-
-back_to_top: true
-back_to_top_text: Back to top
-
-footer_content: >-
-  MIT licensed.
-  These scripts run as root — read the blast radius section before you do.
+defaults:
+  - scope:
+      path: ''
+    values:
+      layout: default
 
 # Everything that is not documentation.
 exclude:
   - .github/
   - .gitattributes
   - .gitignore
+  - CLAUDE.md
   - install.sh
   - lib/
   - monitoring/prometheus_unified_metrics.py
@@ -52,5 +50,6 @@ exclude:
   - "**/*.py"
 
 plugins:
-  - jekyll-remote-theme
+  - jekyll-optional-front-matter
+  - jekyll-relative-links
   - jekyll-seo-tag
