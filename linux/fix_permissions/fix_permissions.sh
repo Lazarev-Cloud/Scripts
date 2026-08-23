@@ -100,6 +100,10 @@ COUNT_OTHER=0
 COUNT_SETID=0
 COUNT_REFUSED=0
 COUNT_UNREADABLE=0
+# Paths that turned into symlinks between the scan and the apply. Not a failure
+# -- nothing was changed and nothing was missed that should have been changed --
+# but it is reported, because it means the tree moved under the run.
+COUNT_RACED=0
 FAILURES=0
 YW='' BL='' RD='' GN='' CL=''
 
@@ -983,6 +987,39 @@ take_backup() {
     return 0
 }
 
+# Re-checks a chmod batch for symlinks immediately before it is applied.
+#
+# The scan already classifies symlinks out of the chmod lists, but the scan and
+# the apply are separated by the report, and by an interactive confirmation that
+# can sit there for minutes. `chmod` follows symlinks given on the command line
+# and has no --no-dereference, so without this the owner of the home -- the one
+# person guaranteed to be able to write in it -- can replace a listed regular
+# file with a link to /etc/shadow after the plan is printed and have root chmod
+# the target instead. `chown -h` is already immune; chmod is what needs this.
+#
+# This narrows the window from "the length of the whole report and prompt" to
+# the interval between this lstat and chmod's own path resolution. That last
+# gap cannot be closed from a shell script: it needs openat(O_NOFOLLOW) and
+# fchmod, which bash has no way to call. A path dropped here is reported rather
+# than skipped quietly -- it means the tree changed mid-run, which is worth
+# knowing about whether or not anyone was attacking.
+drop_symlinks() {
+    local in=$1 out=$2 p dropped=0
+    while IFS= read -r -d '' p; do
+        if [[ -L $p ]]; then
+            dropped=$((dropped + 1))
+            continue
+        fi
+        printf '%s\0' "$p"
+    done <"$in" >"$out"
+
+    if ((dropped)); then
+        log WARN "$dropped path(s) became symlinks between the scan and the apply and were not chmod'ed."
+        COUNT_RACED=$((COUNT_RACED + dropped))
+    fi
+    return 0
+}
+
 # Runs one batch through xargs. Returns non-zero if any invocation failed, so
 # the caller can turn that into exit 1 instead of a cheerful "done".
 run_batch() {
@@ -1028,6 +1065,14 @@ apply_changes() {
     fi
 
     if ((DO_CHMOD)); then
+        # Every chmod list is re-checked for symlinks first; see drop_symlinks.
+        local batch
+        for batch in dirs files pdirs pfiles; do
+            [[ -s $WORK_DIR/$batch ]] || continue
+            drop_symlinks "$WORK_DIR/$batch" "$WORK_DIR/$batch.safe"
+            mv -f "$WORK_DIR/$batch.safe" "$WORK_DIR/$batch"
+        done
+
         run_batch "$WORK_DIR/dirs" 'chmod directories' chmod "$dir_spec" ||
             FAILURES=$((FAILURES + 1))
         run_batch "$WORK_DIR/files" 'chmod files' chmod "$file_spec" ||
@@ -1118,7 +1163,8 @@ main() {
         return "$EX_FAIL"
     fi
 
-    log SUCCESS "Applied $COUNT_CHOWN ownership and $COUNT_CHMOD permission change(s) under $HOME_DIR"
+    log SUCCESS "Applied $COUNT_CHOWN ownership and $((COUNT_CHMOD - COUNT_RACED)) permission change(s) under $HOME_DIR"
+    ((COUNT_RACED)) && log WARN "$COUNT_RACED planned permission change(s) were skipped: the path became a symlink after the scan. Re-run to pick them up."
     [[ -n $BACKUP_FILE ]] && log INFO "Undo with: setfacl --restore=$BACKUP_FILE"
     return 0
 }

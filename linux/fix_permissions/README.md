@@ -316,11 +316,19 @@ this appears" pass the pattern twice:
   sharpest edge in the script: the deny list stops it aiming at the operating
   system, but it cannot tell a real home from any other directory you own. Read
   the dry run before adding `--apply`.
-- **Not safe against an actively hostile target user.** Linux has no `lchmod`,
-  so between the scan and the apply the user could replace a regular file with
-  a symlink and redirect one `chmod` outside the home. Run this when the target
-  user has no processes running. Ownership changes are not affected — those use
-  `chown -h` throughout.
+- **Hardened against, but not proof against, an actively hostile target user.**
+  Linux has no `lchmod`, and `chmod` follows a symlink named on its command
+  line, so a user who can write in their own home can in principle swap a
+  listed regular file for a link to `/etc/shadow` and have root `chmod` the
+  target instead. Each `chmod` batch is therefore re-checked for symlinks
+  immediately before it is applied, which cuts the window from the length of
+  the report and the confirmation prompt — potentially minutes — down to the
+  interval between that check and `chmod`'s own path resolution. Closing the
+  last gap needs `openat(O_NOFOLLOW)` and `fchmod`, which a shell script cannot
+  call, so for a genuinely hostile user the rule stands: run this when they
+  have no processes running. Anything dropped by the re-check is reported, not
+  skipped quietly. Ownership changes were never affected — those use `chown -h`
+  throughout.
 - The snapshot records ownership and permission bits for the files and
   directories being changed. It does not record file contents, ACLs beyond the
   base entries, extended attributes, symlinks, or the other inode types
