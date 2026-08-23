@@ -177,7 +177,8 @@ Options:
   -n, --dry-run             Report only. This is the default, and it wins if
                             combined with --apply or --yes.
   -u, --user NAME           User whose home to repair. Default: the invoking
-                            user (\$SUDO_USER under sudo), currently '${TARGET_USER:-$(default_user)}'.
+                            user (\$SUDO_USER under sudo).
+                            Currently '${TARGET_USER:-$(default_user)}'.
   -g, --group NAME          Group to set. Default: the user's primary group.
       --home PATH           Repair this directory instead of the passwd home.
       --strict              Also remove all group and other access (0700/0600
@@ -197,7 +198,8 @@ Options:
                             cannot be undone. Without this, a host with no
                             getfacl refuses to apply (exit 3) rather than make
                             thousands of irreversible changes unrecorded.
-      --backup-dir PATH     Where to write the snapshot (default: $BACKUP_DIR).
+      --backup-dir PATH     Where to write the snapshot.
+                            Default: $BACKUP_DIR.
       --timeout SECONDS     Bounds the scan of the home directory: the single
                             find(1) walk that builds the plan (default: $SCAN_TIMEOUT).
       --apply-timeout SEC   Bounds each chown/chmod batch on its own, not the
@@ -207,7 +209,8 @@ Options:
                             must be at least 1: 'timeout 0' means no limit,
                             which would remove the protection entirely.
       --max-list N          Example paths to print per category (default: $MAX_LIST).
-      --lock-file PATH      Concurrency lock (default: $LOCK_FILE).
+      --lock-file PATH      Concurrency lock.
+                            Default: $LOCK_FILE.
       --color WHEN          auto | always | never (default: auto).
   -V, --version             Print version and exit.
   -h, --help                Print this help and exit.
@@ -216,7 +219,7 @@ Colour is used only when stdout is a terminal, and NO_COLOR (any non-empty
 value, see no-color.org) turns it off; --color always overrides both.
 
 An --apply run takes an exclusive flock on the lock file and exits 75 if another
-run holds it. A dry run takes no lock, so it still works as an unprivileged user.
+run holds it. A dry run takes no lock, so it still works unprivileged.
 
 Every option has an environment variable, which is the easier route when this
 script is piped in from the network. Boolean variables accept 1/true/yes/on and
@@ -231,7 +234,8 @@ script is piped in from the network. Boolean variables accept 1/true/yes/on and
   LZC_FIX_PERMISSIONS_BACKUP_DIR=/var/backups/fix-permissions
   LZC_FIX_PERMISSIONS_SCAN_TIMEOUT=600  LZC_FIX_PERMISSIONS_APPLY_TIMEOUT=1800
   LZC_FIX_PERMISSIONS_BACKUP_TIMEOUT=600  LZC_FIX_PERMISSIONS_MAX_LIST=20
-  LZC_FIX_PERMISSIONS_LOCK=$LOCK_FILE  LZC_FIX_PERMISSIONS_COLOR=never
+  LZC_FIX_PERMISSIONS_LOCK=$LOCK_FILE
+  LZC_FIX_PERMISSIONS_COLOR=never
 
 LZC_FIX_PERMISSIONS_YES only suppresses the prompt: unlike the -y flag it does
 not imply --apply, so a stray value in an environment file cannot turn a dry run
@@ -595,7 +599,7 @@ preflight() {
     fi
 
     if [[ $EUID -ne 0 ]]; then
-        log WARN "Not running as root: directories you cannot read are invisible to this scan."
+        log WARN "Not running as root: unreadable directories are invisible here."
     fi
     return 0
 }
@@ -1241,7 +1245,7 @@ main() {
     fi
 
     if ((!APPLY)); then
-        log INFO "Dry run: nothing was changed. Re-run with --apply (or --yes for cron) to write these changes."
+        log INFO "Dry run: nothing changed. Re-run with --apply, or --yes for cron."
         return 0
     fi
 

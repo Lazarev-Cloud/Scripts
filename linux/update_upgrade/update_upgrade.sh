@@ -245,7 +245,8 @@ piping this script in from the network. They all begin LZC_UPDATE_UPGRADE_, so
   LZC_UPDATE_UPGRADE_LOG_MAX_BYTES=5242880
   LZC_UPDATE_UPGRADE_LOCK=/run/lock/lzc-update_upgrade.lock
   LZC_UPDATE_UPGRADE_ETC_DIR=/etc
-  LZC_UPDATE_UPGRADE_REBOOT_MARKERS='/run/reboot-required /var/run/reboot-required'
+  LZC_UPDATE_UPGRADE_REBOOT_MARKERS='/run/reboot-required
+                                     /var/run/reboot-required'
   LZC_UPDATE_UPGRADE_REBOOT_PKGS=/run/reboot-required.pkgs
   LZC_UPDATE_UPGRADE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
   LZC_UPDATE_UPGRADE_LOCALE=C

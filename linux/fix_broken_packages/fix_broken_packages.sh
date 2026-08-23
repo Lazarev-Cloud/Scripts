@@ -168,7 +168,8 @@ The repair sequence, in the order it has to happen:
                                configured. APT refuses to do almost anything
                                while dpkg is mid-transaction, so this is first.
   2. apt-get update            refresh the indexes, so step 3 can find the
-                               packages it needs to download. Skip with --no-update.
+                               packages it needs to download. Skip
+                               with --no-update.
   3. apt-get --fix-broken install
                                resolve unsatisfied dependencies.
   4. dpkg --configure -a       again, for anything step 3 unpacked.

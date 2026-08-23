@@ -158,6 +158,35 @@ human_bytes() {
     fi
 }
 
+# Wraps a whitespace-separated list into indented lines no wider than $2.
+#
+# Used for the parts of --help and the report that are generated from a
+# configurable default. Interpolating such a list straight into a heredoc
+# produces one line as long as the list happens to be -- the dnf lock list
+# reached 216 columns that way -- and it silently gets worse every time a
+# default gains an entry, which is exactly the kind of thing nobody notices in
+# review.
+wrap_list() {
+    local indent=$1 width=$2 spec=$3
+    local -a items=()
+    read -r -a items <<<"$spec"
+    ((${#items[@]})) || return 0
+
+    local item line=''
+    for item in "${items[@]}"; do
+        if [[ -z $line ]]; then
+            line="$indent$item"
+        elif ((${#line} + 1 + ${#item} <= width)); then
+            line+=" $item"
+        else
+            printf '%s\n' "$line"
+            line="$indent$item"
+        fi
+    done
+    [[ -n $line ]] && printf '%s\n' "$line"
+    return 0
+}
+
 usage() {
     cat <<EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
@@ -179,7 +208,7 @@ Blast radius:
   The default patterns are deliberately narrow, and the digit classes are
   bounded to one and two digits so that MySQL binary logs (mysql-bin.000001)
   and similar numbered data files never match:
-    ${DEFAULT_PATTERNS[*]}
+$(wrap_list '    ' 76 "${DEFAULT_PATTERNS[*]}")
 
   With --truncate-active it additionally truncates -- not deletes -- live log
   files larger than --truncate-larger-than. That destroys their current
@@ -210,8 +239,10 @@ Options:
       --journal-time TIME      Journal age to keep, journalctl syntax
                                (default: --days as Nd).
       --truncate-active        Also truncate live logs. DESTROYS their contents.
-      --truncate-larger-than N Byte threshold for the above (default: $TRUNCATE_MIN_BYTES).
-      --list-limit N           Paths to print per section, 0 = all (default: $LIST_LIMIT).
+      --truncate-larger-than N Byte threshold for the above.
+                               Default: $TRUNCATE_MIN_BYTES.
+      --list-limit N           Paths to print per section, 0 = all.
+                               Default: $LIST_LIMIT.
       --timeout SECONDS        Wall-clock limit for each single du call that
                                measures the journal and for the journalctl
                                vacuum call. It does NOT bound the file scan or
@@ -631,7 +662,7 @@ preflight() {
     TMP_DIR=$(mktemp -d 2>/dev/null) || die "$EX_FAIL" "cannot create a temporary directory"
 
     if [[ $EUID -ne 0 ]]; then
-        log WARN "Not running as root; parts of the tree may be unreadable and the report incomplete."
+        log WARN "Not running as root; some paths may be unreadable."
     fi
 }
 
@@ -857,7 +888,9 @@ report_plan() {
     printf '%s v%s\n\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf 'Roots        : %s\n' "${ROOTS[*]}"
     printf 'Older than   : %s day(s)\n' "$MAX_AGE_DAYS"
-    printf 'Patterns     : %s\n' "${PATTERNS[*]}"
+    # Continuation lines are indented to the width of the label, so the
+    # wrapped patterns line up under the first one instead of under the label.
+    printf 'Patterns     : %s\n' "$(wrap_list '' 62 "${PATTERNS[*]}" | sed '2,$s/^/               /')"
     ((${#EXCLUDES[@]})) && printf 'Excluding    : %s\n' "${EXCLUDES[*]}"
     if ((APPLY)); then
         printf 'Mode         : %sAPPLY -- files will be deleted%s\n' "$RD" "$CL"
@@ -888,7 +921,7 @@ report_plan() {
 
     if ((UNREADABLE)); then
         printf '\n'
-        log WARN "$UNREADABLE path(s) were unreadable during the scan; run as root for a complete report."
+        log WARN "$UNREADABLE path(s) unreadable during the scan; run as root for a full report."
     fi
 }
 

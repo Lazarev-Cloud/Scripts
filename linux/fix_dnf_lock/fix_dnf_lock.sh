@@ -134,6 +134,35 @@ die() {
     exit "$code"
 }
 
+# Wraps a whitespace-separated list into indented lines no wider than $2.
+#
+# Used for the parts of --help and the report that are generated from a
+# configurable default. Interpolating such a list straight into a heredoc
+# produces one line as long as the list happens to be -- the dnf lock list
+# reached 216 columns that way -- and it silently gets worse every time a
+# default gains an entry, which is exactly the kind of thing nobody notices in
+# review.
+wrap_list() {
+    local indent=$1 width=$2 spec=$3
+    local -a items=()
+    read -r -a items <<<"$spec"
+    ((${#items[@]})) || return 0
+
+    local item line=''
+    for item in "${items[@]}"; do
+        if [[ -z $line ]]; then
+            line="$indent$item"
+        elif ((${#line} + 1 + ${#item} <= width)); then
+            line+=" $item"
+        else
+            printf '%s\n' "$line"
+            line="$indent$item"
+        fi
+    done
+    [[ -n $line ]] && printf '%s\n' "$line"
+    return 0
+}
+
 usage() {
     cat <<EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
@@ -194,7 +223,8 @@ be whole; the value in brackets is what this run would use.
   LZC_FIX_DNF_LOCK_COLOR           auto | always | never [$USE_COLOR]
   LZC_FIX_DNF_LOCK_PATHS           whitespace-separated lock files to inspect,
                                    globs allowed
-  LZC_FIX_DNF_LOCK_SELF_LOCK       this script's own lock file [$SELF_LOCK]
+  LZC_FIX_DNF_LOCK_SELF_LOCK       this script's own lock file
+                                   [$SELF_LOCK]
   LZC_FIX_DNF_LOCK_PROC_LOCKS      kernel lock table to read [$PROC_LOCKS]
 
 Colour: NO_COLOR (any non-empty value) disables it, as does --color never.
@@ -226,7 +256,7 @@ How a lock is judged:
 Blast radius:
   With --yes (or an answered prompt) this script deletes lock files that no
   process holds or has open, from this list --
-    ${LOCK_PATHS_SPEC}
+$(wrap_list '    ' 76 "$LOCK_PATHS_SPEC")
   All of them are recreated automatically by dnf, yum or rpm. Deleting an unheld
   lock is a no-op for root; it is included because the situation this script
   diagnoses is usually misdiagnosed as needing it.
@@ -247,7 +277,8 @@ Exit status:
   5    refused: confirmation was needed, but there is no TTY and --yes was not
        given -- nothing was changed
   75   temporary failure, retry later (EX_TEMPFAIL): a package manager is
-       running, another copy of this script holds $SELF_LOCK,
+       running, another copy of this script holds
+       $SELF_LOCK,
        or a lock's state could not be determined -- nothing was changed
   130  interrupted (SIGINT/SIGTERM)
 

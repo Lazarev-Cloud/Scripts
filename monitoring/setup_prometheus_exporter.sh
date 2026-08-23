@@ -150,27 +150,32 @@ usage() {
     cat <<EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
 
-Installs $PAYLOAD_NAME as a sandboxed systemd service running from its own
-Python virtual environment. Idempotent: re-run it to converge the host.
+Installs $PAYLOAD_NAME as a sandboxed systemd service
+running from its own Python virtual environment.
+Idempotent: re-run it to converge the host.
 
 Usage:
   setup_prometheus_exporter.sh [options]
 
 Options:
   -y, --yes                  Run unattended; skip all prompts.
-  -n, --dry-run              Print the plan and change nothing. Works as non-root.
+  -n, --dry-run              Print the plan and change nothing.
+                             Works as non-root.
       --uninstall            Remove everything this script installs (see below).
-      --install-dir PATH     Install prefix (default: $INSTALL_DIR).
+      --install-dir PATH     Install prefix.
+                             Default: $INSTALL_DIR.
                              Absolute, at least two levels deep, no '.' or '..'
                              components and no whitespace: it is passed to
                              \`rm -rf\` by --uninstall and written into the unit.
-      --service-name NAME    systemd unit name (default: $SERVICE_NAME).
+      --service-name NAME    systemd unit name.
+                             Default: $SERVICE_NAME.
       --user NAME            Service account (default: $SERVICE_USER).
       --group NAME           Service group (default: same as the account).
       --listen-address ADDR  Bind address (default: $LISTEN_ADDRESS). No
                              whitespace: it is written into the unit verbatim.
       --port PORT            Bind port (default: $LISTEN_PORT).
-      --src PATH             Path to $PAYLOAD_NAME. Default: next to this script.
+      --src PATH             Path to $PAYLOAD_NAME.
+                             Default: next to this script.
       --requirements PATH    pip requirements file. Default: requirements.txt
                              next to the payload, else the built-in pins.
       --sensors WHEN         auto | yes | no. Install lm-sensors, nvme-cli and
@@ -212,7 +217,8 @@ LZC_EXPORTER_BIND and LZC_EXPORTER_PORT are shared with the exporter itself:
 they are what this installer writes into the environment file, and they are the
 defaults the exporter reads for --bind and --port.
 
-$ENV_DIR/$SERVICE_NAME.local is yours: this installer never writes, reads for
+$ENV_DIR/$SERVICE_NAME.local is yours:
+this installer never writes it, and reads it for
 configuration or removes it, and the unit sources it after the managed file, so
 settings there survive re-installs. Three variables are the exception, because
 the unit is rendered from install-time values while that file is read at start
@@ -256,9 +262,10 @@ before any change is made, rather than a crash halfway through the install.
 Blast radius:
   install    Installs distribution packages (Python, and unless --sensors no,
              lm-sensors + nvme-cli + smartmontools); creates the system account
-             $SERVICE_USER; creates $INSTALL_DIR and a virtualenv inside it;
+             $SERVICE_USER;
+             creates $INSTALL_DIR and a virtualenv in it;
              writes $UNIT_DIR/$SERVICE_NAME.service and
-             $ENV_DIR/$SERVICE_NAME; enables and starts the service.
+             $ENV_DIR/$SERVICE_NAME; enables and starts it.
              It never downloads the payload, never runs sensors-detect, never
              loads kernel modules and never installs a GPU driver.
   --disk-health
@@ -269,7 +276,8 @@ Blast radius:
              with PrivateDevices=yes and disk temperatures are simply absent.
   --uninstall
              Stops and disables the service, removes the unit, the managed
-             environment file, $INSTALL_DIR (recursively) and the
+             environment file, $INSTALL_DIR (recursively)
+             and the
              $SERVICE_USER account. Your own <env-file>.local is left alone.
              It does NOT remove distribution packages it may have installed and
              does NOT touch Prometheus itself. Requires --yes when there is no
@@ -666,7 +674,7 @@ report_hardware() {
                 log WARN "service will run as root and still report no disk temperatures."
             fi
         else
-            log INFO "Local disks present, but --disk-health is off: disk temperatures will be absent"
+            log INFO "Local disks present but --disk-health is off: no disk temperatures"
         fi
     else
         log INFO "No local block devices found: disk temperature metrics will be empty"

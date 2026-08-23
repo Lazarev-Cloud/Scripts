@@ -138,7 +138,7 @@ Runs named system maintenance tasks on Debian/Ubuntu, RHEL-family, Arch
 Usage:
   $PROG [options] [task ...]
 
-With no task, '$PROG report' is assumed: a read-only health summary that
+With no task, '$PROG report' is assumed: a read-only summary that
 changes nothing.
 
 Tasks:
@@ -147,7 +147,7 @@ Tasks:
                   usage, installed vs running kernel, pending updates, pending
                   reboot, failed systemd units, package-manager lock holders,
                   leftover .dpkg-dist/.rpmnew config drift, journal size.
-                  Blast radius: none. Safe under any user; more complete as root.
+                  Blast radius: none. Safe under any user; fuller as root.
 
   update          Refresh the package index and upgrade installed packages.
                   Blast radius: installs new package versions and restarts
@@ -233,15 +233,18 @@ Options:
       --log-exclude LIST    Space-separated names clean-logs must not touch.
       --journal-size SIZE   journalctl --vacuum-size (default: $JOURNAL_SIZE).
       --journal-age TIME    journalctl --vacuum-time (default: $JOURNAL_AGE).
-      --tmp-dirs LIST       Space-separated dirs for clean-tmp (default: $TMP_DIRS).
+      --tmp-dirs LIST       Space-separated dirs for clean-tmp.
+                            Default: $TMP_DIRS.
       --tmp-age DAYS        Age threshold for clean-tmp (default: $TMP_AGE_DAYS).
       --tmp-mode MODE       auto | tmpfiles | age (default: $TMP_MODE).
       --tmp-exclude LIST    Space-separated names clean-tmp must not touch.
       --needrestart-mode M  l | i | a. What to do about services still running
                             old libraries after an update: l lists them, a
                             RESTARTS them, i asks (default: $NEEDRESTART_CHOICE).
-      --log-file PATH       This script's own log (default: $LOG_FILE).
-      --lock-file PATH      Concurrency lock (default: $LOCK_FILE).
+      --log-file PATH       This script's own log.
+                            Default: $LOG_FILE.
+      --lock-file PATH      Concurrency lock.
+                            Default: $LOCK_FILE.
       --color WHEN          auto | always | never (default: $USE_COLOR).
   -V, --version             Print version and exit.
   -h, --help                Print this help and exit.
@@ -294,9 +297,9 @@ Tell a scheduler that a held lock is not a fault:
   cron:     wrap in a quiet-on-success runner.
 
 Examples:
-  $PROG                                   # health report, changes nothing
-  $PROG --dry-run clean-logs clean-tmp    # show exactly what would be deleted
-  sudo $PROG --yes routine                # unattended nightly run
+  $PROG                                # health report, changes nothing
+  $PROG --dry-run clean-logs clean-tmp # exactly what would be deleted
+  sudo $PROG --yes routine             # unattended nightly run
   sudo $PROG --yes --upgrade-mode dist-upgrade update
 EOF
 }
