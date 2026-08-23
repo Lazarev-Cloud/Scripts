@@ -178,10 +178,11 @@ Usage:
   update-lxcs.sh [options]
 
 Options:
-  -y, --yes                 Run unattended; skip all prompts (required for cron).
+  -y, --yes                 Run unattended; skip prompts (needed for cron).
   -n, --dry-run             Report what would be done; change nothing.
   -e, --exclude IDS         Comma-separated CT IDs to skip. Repeatable.
-  -i, --include IDS         Comma-separated CT IDs to update exclusively. Repeatable.
+  -i, --include IDS         Comma-separated CT IDs to update only.
+                            Repeatable.
       --skip-stopped        Leave stopped containers alone (default: start,
                             update, then return them to stopped).
       --timeout SECONDS     Per-container update timeout (default: $UPDATE_TIMEOUT).
@@ -207,10 +208,12 @@ and a node that is already running the updater is reported, not disturbed.
 Most options also have an environment variable, which is the easier route when
 piping this script in from the network. --dry-run, --color and --local-only are
 flag-only. Boolean variables accept 1/true/yes/on and 0/false/no/off:
-  LZC_UPDATE_LXCS_YES=1  LZC_UPDATE_LXCS_EXCLUDE=100,101  LZC_UPDATE_LXCS_INCLUDE=
+  LZC_UPDATE_LXCS_YES=1  LZC_UPDATE_LXCS_EXCLUDE=100,101
+  LZC_UPDATE_LXCS_INCLUDE=
   LZC_UPDATE_LXCS_SKIP_STOPPED=1  LZC_UPDATE_LXCS_UPDATE_TIMEOUT=1800
   LZC_UPDATE_LXCS_RETRIES=2  LZC_UPDATE_LXCS_LOG=/var/log/lxc-updater.log
-  LZC_UPDATE_LXCS_CLUSTER=1  LZC_UPDATE_LXCS_NODES=pve1,pve2  LZC_UPDATE_LXCS_SSH_USER=root
+  LZC_UPDATE_LXCS_CLUSTER=1  LZC_UPDATE_LXCS_NODES=pve1,pve2
+  LZC_UPDATE_LXCS_SSH_USER=root
 
 Exit status:
   0    every selected container updated, or was skipped by choice

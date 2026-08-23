@@ -73,7 +73,8 @@ Options:
   -y, --yes            Do not prompt.
   -n, --dry-run        Show what would happen; change nothing.
       --prefix PATH    Install prefix (default: $PREFIX).
-                       Binaries go to PREFIX/sbin, the library to PREFIX/lib/lzc.
+                       Binaries go to PREFIX/sbin, the library to
+                       PREFIX/lib/lzc.
       --uninstall      Remove everything this installer created.
       --color WHEN     auto | always | never.
   -h, --help           Show this help.

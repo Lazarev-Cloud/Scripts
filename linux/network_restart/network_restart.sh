@@ -137,7 +137,8 @@ Safety:
     --rollback SECONDS.
   * SIGHUP is ignored, so a dropped SSH session cannot kill the run between
     "down" and "up".
-  * An applying run takes an exclusive lock on $LOCK_FILE
+  * An applying run takes an exclusive lock on
+    $LOCK_FILE
     and exits 75 if another instance already holds it, so two runs can never
     bounce the same host at once. It is taken only once the run has decided it
     will change something: a plan, and a run refused by the SSH check, never

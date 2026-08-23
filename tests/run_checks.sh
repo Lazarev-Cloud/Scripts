@@ -69,10 +69,11 @@ Options:
 
 Checks:
   bash -n              every *.sh parses
-  shellcheck           every *.sh, pinned to the version $WORKFLOW uses
+  shellcheck           every *.sh, at the version the workflow pins
   python              the exporter compiles
   yaml                 every workflow and _config.yml parses
   help                 every executable script answers --help with status 0
+  help width           no --help line exceeds 80 columns
   modes                every runnable script is committed executable
   psscriptanalyzer     every *.ps1, when pwsh is available -- indicative only,
                        because CI analyses under Windows PowerShell 5.1, which
@@ -286,6 +287,37 @@ check_modes() {
     fi
 }
 
+# Also beyond CI. --help is emitted verbatim from a heredoc, so unlike
+# PowerShell's Get-Help nothing reflows it to the terminal: a line longer than
+# the window wraps mid-word, and a generated list interpolated into the heredoc
+# gets one line longer every time its default gains an entry. The dnf lock list
+# reached 216 columns that way before anyone noticed, which is the argument for
+# checking it mechanically rather than by eye.
+#
+# 80 is the threshold because that is what a default terminal is. A few lines
+# interpolate host-specific values -- a long user name or a custom lock path --
+# so this can in principle trip on an unusual host without the source being at
+# fault; the message says which line, so that is easy to tell apart.
+check_width() {
+    head_line 'help width'
+    local f rel rc=0 long
+    while IFS= read -r -d '' f; do
+        rel=${f#"$REPO_ROOT"/}
+        [[ $rel == lib/* ]] && continue
+        long=$(bash "$f" --help 2>&1 | awk 'length($0) > 80 { printf "    [%d] %s\n", length($0), $0 }')
+        if [[ -n $long ]]; then
+            err "  --help exceeds 80 columns: $rel"
+            printf '%s\n' "$long" >&2
+            rc=1
+        fi
+    done < <(sh_files)
+    if ((rc == 0)); then
+        record pass '--help fits 80 columns'
+    else
+        record fail '--help fits 80 columns'
+    fi
+}
+
 check_psscriptanalyzer() {
     head_line 'psscriptanalyzer'
     if ! command -v pwsh >/dev/null 2>&1; then
@@ -352,6 +384,7 @@ main() {
     check_python
     check_yaml
     check_help
+    check_width
     check_modes
     check_psscriptanalyzer
 
