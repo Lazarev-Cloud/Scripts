@@ -1226,8 +1226,18 @@ check_reboot_required() {
                 nr=("$PKG_TOOL" needs-restarting)
             fi
             if ((${#nr[@]})); then
-                probe "${nr[@]}" -r >/dev/null 2>&1 || REBOOT_REQUIRED=1
-                ((REBOOT_REQUIRED)) && return 0
+                # Exactly 1 means "reboot required". Every other non-zero
+                # status is the tool failing, not answering -- 124 from the
+                # probe timeout, or dnf's own error codes -- and a bare
+                # `|| REBOOT_REQUIRED=1` read all of them as yes, so a slow or
+                # unhappy dnf produced a permanent phantom pending reboot.
+                local nrc=0
+                probe "${nr[@]}" -r >/dev/null 2>&1 || nrc=$?
+                if ((nrc == 1)); then
+                    REBOOT_REQUIRED=1
+                    return 0
+                fi
+                ((nrc > 1)) && log WARN "needs-restarting exited $nrc; reboot state unknown"
             fi
             ;;
         arch)
@@ -1241,9 +1251,27 @@ check_reboot_required() {
             #
             # Both paths are checked because /lib is a symlink to /usr/lib on a
             # merged-/usr Arch install but not necessarily on a derivative.
-            local kver
+            local kver dir=''
             kver=$(uname -r 2>/dev/null) || kver=''
-            if [[ -n $kver && ! -d /usr/lib/modules/$kver && ! -d /lib/modules/$kver ]]; then
+            [[ -n $kver ]] || return 1
+            # Both paths, because /lib is a symlink to /usr/lib on a merged-/usr
+            # Arch install but not necessarily on a derivative.
+            [[ -d /usr/lib/modules/$kver ]] && dir=/usr/lib/modules/$kver
+            [[ -z $dir && -d /lib/modules/$kver ]] && dir=/lib/modules/$kver
+
+            # Gone is the easy case. Present-but-unowned is the one that matters
+            # and the one a plain -d test misses: Manjaro's kernel tooling keeps
+            # the running kernel's module tree alive across an upgrade so the
+            # live kernel can still load modules, so the directory still exists
+            # while the package that owned it has moved to a new version. It is
+            # left orphaned, and `pacman -Qoq` on it fails -- which is the
+            # signal. A -d test alone reports "no reboot needed" on exactly the
+            # host that needs one most.
+            if [[ -z $dir ]]; then
+                REBOOT_REQUIRED=1
+                return 0
+            fi
+            if have pacman && ! probe pacman -Qoq "$dir" >/dev/null 2>&1; then
                 REBOOT_REQUIRED=1
                 return 0
             fi
@@ -1256,8 +1284,17 @@ check_reboot_required() {
             # make every host without the subcommand report one forever, so
             # availability is probed first and an absent tool means unknown.
             if [[ -n $PKG_TOOL ]] && probe "$PKG_TOOL" needs-restarting --help >/dev/null 2>&1; then
-                probe "$PKG_TOOL" needs-restarting -r >/dev/null 2>&1 || REBOOT_REQUIRED=1
-                ((REBOOT_REQUIRED)) && return 0
+                # Only 1 means "reboot required"; see the rhel branch. zypper
+                # additionally exits 7 when another zypper holds the ZYPP lock,
+                # which is a state this report is meant to tolerate, not to
+                # translate into a pending reboot.
+                local zrc=0
+                probe "$PKG_TOOL" needs-restarting -r >/dev/null 2>&1 || zrc=$?
+                if ((zrc == 1)); then
+                    REBOOT_REQUIRED=1
+                    return 0
+                fi
+                ((zrc > 1)) && log WARN "zypper needs-restarting exited $zrc; reboot state unknown"
             fi
             ;;
         alpine)
@@ -1418,7 +1455,20 @@ task_update() {
             [[ $UPGRADE_MODE == dist-upgrade ]] && mode=distro-sync
             # strict=0 lets a multi-package transaction proceed when one package
             # is unresolvable instead of failing the whole run.
-            run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y --setopt=strict=0 --refresh "$mode" || rc=$?
+            # --refresh and --setopt=strict are dnf-only. Classic yum (the
+            # only way PKG_TOOL is `yum`, since dnf is detected first) rejects
+            # both and the task fails before it starts, so it gets an explicit
+            # cache expiry instead.
+            if [[ $PKG_TOOL == yum ]]; then
+                run_cmd "$TASK_TIMEOUT" yum -y clean expire-cache || rc=$?
+                ((rc == 0)) || {
+                    log ERROR "yum clean expire-cache failed (status $rc); not upgrading against a stale cache"
+                    return "$rc"
+                }
+                run_cmd "$TASK_TIMEOUT" yum -y "$mode" || rc=$?
+            else
+                run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y --setopt=strict=0 --refresh "$mode" || rc=$?
+            fi
             ;;
         arch)
             # One -Syu, never a separate -Sy followed by an upgrade. Refreshing
@@ -1487,10 +1537,18 @@ task_autoremove() {
                 return 0
             fi
             log INFO "Orphaned packages: $(printf '%s' "$orphans" | tr '\n' ' ')"
+            # Read into an array and expand it quoted. Unquoted $orphans would
+            # word-split (wanted) but also glob-expand (not wanted): a local-db
+            # entry named `[a-z]*` would turn into every matching name in the
+            # current directory, handed to a root `pacman -Rns`. Pacman's own
+            # name grammar excludes those characters, so this needs a corrupt
+            # db to bite -- but a root deletion argv should not depend on the
+            # db being well-formed, and the array costs nothing.
+            local -a orphan_list=()
+            mapfile -t orphan_list <<<"$orphans"
             # -Rns: remove the packages, their now-unneeded dependencies, and
             # their configuration. Matches --purge autoremove on the debian side.
-            # shellcheck disable=SC2086 # deliberate word splitting: one package per argument
-            run_cmd "$TASK_TIMEOUT" pacman -Rns --noconfirm $orphans || rc=$?
+            run_cmd "$TASK_TIMEOUT" pacman -Rns --noconfirm "${orphan_list[@]}" || rc=$?
             ;;
         suse)
             # zypper can list unneeded packages but has no autoremove that
@@ -1533,8 +1591,10 @@ task_clean_cache() {
             # paccache keeps the most recent version of each package, which
             # leaves a downgrade path if an upgrade goes wrong. `pacman -Sc`
             # keeps nothing but the currently-installed versions, so it is the
-            # fallback rather than the first choice. Neither touches the sync
-            # database, matching the rhel branch's 'clean packages'.
+            # fallback rather than the first choice. Neither drops the sync
+            # database, matching the rhel branch's 'clean packages' -- though
+            # `pacman -Sc --noconfirm` does also answer yes to its second
+            # question and drop caches for repositories no longer configured.
             if have paccache; then
                 run_cmd "$TASK_TIMEOUT" paccache -rk1 || rc=$?
             else
