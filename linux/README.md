@@ -12,14 +12,14 @@ pass `--yes`. `-n`/`--dry-run` forces report-only.
 
 | Folder | What it does | Env prefix |
 | --- | --- | --- |
-| [`update_upgrade/`](update_upgrade/) | Refreshes APT indexes, upgrades packages non-interactively, and reports follow-up work: pending reboot, conffile drift, held packages. Debian/Ubuntu. | `LZC_UPDATE_UPGRADE_` |
+| [`update_upgrade/`](update_upgrade/) | Refreshes APT indexes, upgrades packages non-interactively, and reports follow-up work: pending reboot, conffile drift, held packages. Debian/Ubuntu — on any other family it refuses and points at `maintenance.sh update`. | `LZC_UPDATE_UPGRADE_` |
 | [`fix_broken_packages/`](fix_broken_packages/) | Repairs a half-finished dpkg transaction or unsatisfied dependencies, then verifies the system is actually consistent again. Debian/Ubuntu. | `LZC_FIX_BROKEN_PACKAGES_` |
 | [`fix_apt_lock/`](fix_apt_lock/) | Diagnoses a stuck `Could not get lock /var/lib/dpkg/lock-frontend` and clears the lock **only** when no process holds it. Can run `dpkg --configure -a` afterwards. | `LZC_FIX_APT_LOCK_` |
 | [`fix_dnf_lock/`](fix_dnf_lock/) | The same doctor for dnf/yum: diagnoses `Waiting for process with pid NNNN`, clears a lock only when nothing holds it. | `LZC_FIX_DNF_LOCK_` |
 | [`clean_logs/`](clean_logs/) | Deletes rotated log archives older than a cutoff and vacuums the systemd journal. Can also truncate oversized live logs (off by default). | `LZC_CLEAN_LOGS_` |
 | [`fix_permissions/`](fix_permissions/) | Repairs ownership and permissions inside a single user's home directory, never following symlinks out of it. | `LZC_FIX_PERMISSIONS_` |
 | [`network_restart/`](network_restart/) | Restarts one interface and verifies it came back, with an armed rollback so a failed bounce recovers without console access. Refuses to bounce the interface carrying your SSH session unless forced. | `LZC_NETWORK_RESTART_` |
-| [`maintenance/`](maintenance/) | Runs named maintenance tasks on Debian/Ubuntu and RHEL-family hosts. With no task it produces a read-only health report. | `LZC_MAINTENANCE_` |
+| [`maintenance/`](maintenance/) | Runs named maintenance tasks on Debian/Ubuntu, RHEL-family, Arch (incl. Manjaro), SUSE and Alpine hosts. With no task it produces a read-only health report. | `LZC_MAINTENANCE_` |
 | [`proxmox/ve/`](proxmox/ve/) | Updates the packages inside every LXC container on a Proxmox VE node, or across a whole cluster over SSH. | `LZC_UPDATE_LXCS_` |
 
 `maintenance/` tasks: `report`, `update`, `autoremove`, `clean-cache`,

@@ -477,9 +477,20 @@ require_apt_system() {
 
     local what=${tokens[0]:-}
     [[ -n $what ]] || what='this system'
+
+    # The pointer matters as much as the refusal. This script is APT all the way
+    # down -- dpkg conffile handling, apt-mark holds, apt-get's own argv -- so
+    # there is nothing to generalise here, but maintenance.sh dispatches on the
+    # package family and covers apt, dnf/yum and pacman. Sending people there
+    # is the difference between "no" and "not here, use that".
+    local -a alt=()
+    if [[ $pretty == 'pacman' || $pretty == 'dnf or yum' ]]; then
+        alt=("Use 'maintenance.sh --yes update' instead, which handles $pretty.")
+    fi
+
     if [[ -n $pretty ]]; then
         die "$EX_UNSUPPORTED" \
-            "$what uses $pretty, not APT. This script only handles Debian/Ubuntu and derivatives. Nothing was changed."
+            "$what uses $pretty, not APT. This script only handles Debian/Ubuntu and derivatives.${alt[0]:+ ${alt[0]}} Nothing was changed."
     fi
     die "$EX_UNSUPPORTED" \
         "No APT package manager found on $what. This script only handles Debian/Ubuntu and derivatives. Nothing was changed."

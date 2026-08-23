@@ -3,7 +3,7 @@
 # Linux system maintenance runner.
 #
 # Runs named maintenance tasks -- health reporting, package updates, cache/log/
-# tmp cleanup and package-state repair -- on Debian/Ubuntu and RHEL-family
+# tmp cleanup and package-state repair -- on Debian/Ubuntu, RHEL, Arch, SUSE and Alpine
 # hosts. Nothing runs unless you name it, every task that changes the system is
 # previewable with --dry-run, and unattended runs need --yes.
 #
@@ -132,7 +132,8 @@ usage() {
     cat <<EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
 
-Runs named system maintenance tasks on Debian/Ubuntu and RHEL-family hosts.
+Runs named system maintenance tasks on Debian/Ubuntu, RHEL-family, Arch
+(including Manjaro), SUSE and Alpine hosts.
 
 Usage:
   $PROG [options] [task ...]
@@ -213,7 +214,7 @@ Options:
       --list-tasks          Print the task names, one per line, and exit.
       --upgrade-mode MODE   upgrade | dist-upgrade (default: $UPGRADE_MODE).
       --timeout SECONDS     Bounds each system-changing command individually:
-                            one apt/dnf transaction, one journal vacuum, one
+                            one package transaction, one journal vacuum, one
                             systemd-tmpfiles run. Not a budget for the whole
                             run (default: $TASK_TIMEOUT, minimum 1).
       --probe-timeout SEC   Bounds each read-only probe individually: df,
@@ -340,8 +341,26 @@ task_needs_root() {
 task_blast_radius() {
     case $1 in
         report) printf '%s' 'reads only; changes nothing' ;;
-        update) printf '%s' "installs new package versions ($UPGRADE_MODE)" ;;
-        autoremove) printf '%s' 'PURGES packages no longer required, old kernels included' ;;
+        # Both of these read differently on Arch, and the difference is exactly
+        # the kind a blast-radius line exists to convey. pacman has no
+        # upgrade/dist-upgrade split, so naming UPGRADE_MODE there would report
+        # a setting that has no effect; and it keeps one version per kernel
+        # package, so "old kernels included" would be describing a risk the
+        # host does not have while omitting the one it does -- orphan removal.
+        update)
+            if [[ $FAMILY == arch ]]; then
+                printf '%s' 'installs new package versions (full -Syu; pacman has no partial mode)'
+            else
+                printf '%s' "installs new package versions ($UPGRADE_MODE)"
+            fi
+            ;;
+        autoremove)
+            if [[ $FAMILY == arch ]]; then
+                printf '%s' 'PURGES orphans: packages installed as dependencies that nothing now requires'
+            else
+                printf '%s' 'PURGES packages no longer required, old kernels included'
+            fi
+            ;;
         clean-cache) printf '%s' 'deletes downloaded package archives (re-downloadable)' ;;
         clean-logs) printf '%s' "DELETES rotated logs in $LOG_DIR older than ${LOG_AGE_DAYS}d and vacuums the journal" ;;
         # TMP_MODE is resolved from 'auto' in preflight(), before the plan is
@@ -722,6 +741,21 @@ detect_family() {
         PKG_TOOL=yum
         return 0
     fi
+    if have pacman; then
+        FAMILY=arch
+        PKG_TOOL=pacman
+        return 0
+    fi
+    if have zypper; then
+        FAMILY=suse
+        PKG_TOOL=zypper
+        return 0
+    fi
+    if have apk; then
+        FAMILY=alpine
+        PKG_TOOL=apk
+        return 0
+    fi
     return 1
 }
 
@@ -735,7 +769,7 @@ preflight() {
     have timeout && HAVE_TIMEOUT=1
     ((HAVE_TIMEOUT)) || log WARN "timeout (coreutils) not found; long-running commands will not be bounded"
 
-    detect_family || log WARN "No apt-get, dnf or yum found; package tasks will be skipped"
+    detect_family || log WARN "No apt-get, dnf, yum, pacman, zypper or apk found; package tasks will be skipped"
 
     # Resolved here, before print_plan runs, so that the blast radius shown to
     # the operator and the code that does the deleting read the same value.
@@ -852,6 +886,10 @@ apt_opts() {
 }
 
 export_pkg_env() {
+    # Debian-family only. pacman and dnf ignore these, but exporting them into
+    # every transaction on every distribution is how a variable ends up being
+    # blamed for behaviour it had nothing to do with.
+    [[ $FAMILY == debian ]] || return 0
     # DEBIAN_FRONTEND only silences debconf; the conffile prompts come from dpkg
     # and are handled by apt_opts above.
     export DEBIAN_FRONTEND=noninteractive
@@ -861,6 +899,18 @@ export_pkg_env() {
     # services is a decision for whoever scheduled the run, so it is opt-in via
     # LZC_MAINTENANCE_NEEDRESTART_MODE=a.
     export NEEDRESTART_MODE="$NEEDRESTART_CHOICE"
+}
+
+# Distinct from unsupported_family, which means "wrong distribution". This one
+# means "right distribution, and this package manager has no safe equivalent" --
+# a different fact for whoever reads the summary, and one that should not read
+# as though the host were unrecognised.
+no_equivalent() {
+    local task=$1 why=$2
+    log WARN "Task '$task' has no safe equivalent on $FAMILY: $why Skipping."
+    SKIPPED_TASKS+=("$task (no equivalent on $FAMILY)")
+    TASK_SKIPPED=1
+    return 0
 }
 
 unsupported_family() {
@@ -996,6 +1046,55 @@ report_kernels() {
             [[ -n $kernels ]] && printf '%s\n' "$kernels" | sed 's/^/    /'
             printf '  Removal path  : installonly_limit in /etc/dnf/dnf.conf\n'
             ;;
+        arch)
+            have pacman || return 0
+            # Walked from /usr/lib/modules, not /boot/vmlinuz-*. On Manjaro the
+            # image in /boot is generated at install time and pacman answers
+            # "No package owns" for it, so the obvious query returns nothing at
+            # all; the modules tree is owned by the kernel package itself.
+            # Asking about the vmlinuz *inside* that tree rather than the
+            # directory keeps the answer to the kernel package alone -- the
+            # directory is also owned by the matching -headers package.
+            #
+            # Arch carries one version per kernel package instead of
+            # accumulating them, so unlike Debian and RHEL there is no backlog
+            # to prune: upgrading `linux` replaces the image in place. This is
+            # inventory, not a cleanup prompt, which is why there is no removal
+            # path to offer.
+            local d ver owner mark running
+            running=$(uname -r 2>/dev/null) || running=''
+            for d in /usr/lib/modules/*/; do
+                [[ -d $d ]] || continue
+                ver=${d%/}
+                ver=${ver##*/}
+                owner=$(probe pacman -Qoq "${d}vmlinuz" 2>/dev/null | head -n1)
+                [[ -n $owner ]] || owner=$(probe pacman -Qoq "$d" 2>/dev/null | head -n1)
+                mark=''
+                [[ $ver == "$running" ]] && mark=' -- running'
+                printf '    %s (%s)%s\n' "${owner:-unknown}" "$ver" "$mark"
+            done
+            printf '  Removal path  : none needed; Arch keeps one version per kernel package\n'
+            ;;
+        suse)
+            have rpm || return 0
+            # Matched on exact flavour names rather than a `kernel-*` glob:
+            # kernel-firmware, kernel-macros and friends all match that glob and
+            # none of them is a kernel.
+            local ks
+            ks=$(probe rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null |
+                awk '$1 ~ /^kernel-(default|preempt|rt|kvmsmall|azure)$/ { print $1 "-" $2 }' | sort -u)
+            [[ -n $ks ]] && printf '%s\n' "$ks" | sed 's/^/    /'
+            printf '  Removal path  : multiversion.kernels in /etc/zypp/zypp.conf, then purge-kernels\n'
+            ;;
+        alpine)
+            have apk || return 0
+            # `apk info` prints installed package names one per line, so the
+            # flavour packages (linux-lts, linux-virt) can be matched exactly.
+            local ks
+            ks=$(probe apk info 2>/dev/null | grep -E '^linux-(lts|virt|edge|rpi|rpi4)$' | sort -u)
+            [[ -n $ks ]] && printf '%s\n' "$ks" | sed 's/^/    /'
+            printf '  Removal path  : apk del <flavour>; Alpine keeps one version per flavour\n'
+            ;;
     esac
 }
 
@@ -1039,6 +1138,65 @@ report_updates() {
                 *) printf '  Upgradable    : unknown (%s check-update exited %s)\n' "$PKG_TOOL" "$rc" ;;
             esac
             ;;
+        arch)
+            # checkupdates, not `pacman -Sy && pacman -Qu`. Syncing the database
+            # without upgrading leaves the system in a partial-upgrade state,
+            # which Arch upstream calls unsupported -- and a health report has
+            # no business changing the machine at all. checkupdates copies the
+            # database to a temporary location and queries that, so it is
+            # read-only. It ships in pacman-contrib, which is not installed by
+            # default; absent means unknown, never zero.
+            if have checkupdates; then
+                local out rc
+                out=$(probe checkupdates 2>/dev/null)
+                rc=$?
+                case $rc in
+                    0) printf '  Upgradable    : %s package(s)\n' \
+                        "$(printf '%s\n' "$out" | grep -c . || true)" ;;
+                    2) printf '  Upgradable    : 0 package(s)\n' ;;
+                    *) printf '  Upgradable    : unknown (checkupdates exited %s)\n' "$rc" ;;
+                esac
+            else
+                printf '  Upgradable    : unknown (install pacman-contrib for checkupdates)\n'
+            fi
+            # Arch's equivalent of a hold is IgnorePkg in pacman.conf.
+            if [[ -r /etc/pacman.conf ]]; then
+                local ignored
+                ignored=$(sed -n 's/^[[:space:]]*IgnorePkg[[:space:]]*=[[:space:]]*//p' /etc/pacman.conf |
+                    tr '\n' ' ' | tr -s ' ' | sed 's/ *$//')
+                [[ -n $ignored ]] && printf '  On hold       : %s\n' "$ignored"
+            fi
+            ;;
+        suse)
+            # No refresh: a health report must not mutate repository metadata.
+            # That makes the answer only as fresh as the last refresh, which is
+            # said out loud rather than left for someone to infer.
+            local out rc
+            out=$(probe zypper --non-interactive --quiet list-updates 2>/dev/null)
+            rc=$?
+            if ((rc == 0)); then
+                printf '  Upgradable    : %s package(s) (from cached metadata)\n' \
+                    "$(printf '%s\n' "$out" | awk -F'|' '$1 ~ /^v[[:space:]]*$/ { n = n + 1 } END { print n + 0 }')"
+            else
+                printf '  Upgradable    : unknown (zypper list-updates exited %s)\n' "$rc"
+            fi
+            if [[ -r /etc/zypp/locks ]] && [[ -s /etc/zypp/locks ]]; then
+                printf '  On hold       : see /etc/zypp/locks (zypper locks)\n'
+            fi
+            ;;
+        alpine)
+            # Same reasoning as suse: no `apk update` from a report, so this
+            # reflects the index as it stands on disk.
+            local out rc
+            out=$(probe apk version -l '<' 2>/dev/null)
+            rc=$?
+            if ((rc == 0)); then
+                printf '  Upgradable    : %s package(s) (from cached index)\n' \
+                    "$(printf '%s\n' "$out" | awk 'NR > 1 && NF { n = n + 1 } END { print n + 0 }')"
+            else
+                printf '  Upgradable    : unknown (apk version exited %s)\n' "$rc"
+            fi
+            ;;
         *) printf '  Upgradable    : unknown (no supported package manager)\n' ;;
     esac
 }
@@ -1068,6 +1226,43 @@ check_reboot_required() {
                 probe "${nr[@]}" -r >/dev/null 2>&1 || REBOOT_REQUIRED=1
                 ((REBOOT_REQUIRED)) && return 0
             fi
+            ;;
+        arch)
+            # Arch has no reboot-required marker. What it does have is a very
+            # reliable side effect: upgrading the kernel package replaces
+            # /usr/lib/modules/<version>, so once the running kernel's module
+            # directory has gone, the running kernel no longer matches the
+            # installed one and nothing further can be modprobe'd. That is the
+            # symptom people actually hit, and it is exactly the condition worth
+            # reporting.
+            #
+            # Both paths are checked because /lib is a symlink to /usr/lib on a
+            # merged-/usr Arch install but not necessarily on a derivative.
+            local kver
+            kver=$(uname -r 2>/dev/null) || kver=''
+            if [[ -n $kver && ! -d /usr/lib/modules/$kver && ! -d /lib/modules/$kver ]]; then
+                REBOOT_REQUIRED=1
+                return 0
+            fi
+            ;;
+        suse)
+            # Same inverted convention as dnf's needs-restarting, and the same
+            # trap: `zypper needs-restarting -r` documents "returns 1 if a full
+            # reboot is required, 0 if not", and zypper also exits non-zero for
+            # an unknown subcommand. Reading that as "reboot required" would
+            # make every host without the subcommand report one forever, so
+            # availability is probed first and an absent tool means unknown.
+            if [[ -n $PKG_TOOL ]] && probe "$PKG_TOOL" needs-restarting --help >/dev/null 2>&1; then
+                probe "$PKG_TOOL" needs-restarting -r >/dev/null 2>&1 || REBOOT_REQUIRED=1
+                ((REBOOT_REQUIRED)) && return 0
+            fi
+            ;;
+        alpine)
+            # Alpine ships no reboot marker and no needs-restarting equivalent.
+            # Reported as unknown rather than guessed at from kernel versions,
+            # which on a container host -- Alpine's usual role -- would be
+            # answering a question the host cannot be asked.
+            :
             ;;
     esac
     return 1
@@ -1199,7 +1394,7 @@ task_report() {
 
 task_update() {
     [[ -n $FAMILY ]] || {
-        unsupported_family update 'apt/dnf'
+        unsupported_family update 'apt/dnf/pacman/zypper/apk'
         return 0
     }
     export_pkg_env
@@ -1222,6 +1417,40 @@ task_update() {
             # is unresolvable instead of failing the whole run.
             run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y --setopt=strict=0 --refresh "$mode" || rc=$?
             ;;
+        arch)
+            # One -Syu, never a separate -Sy followed by an upgrade. Refreshing
+            # the database without upgrading in the same transaction produces a
+            # partial upgrade, which on a rolling release can leave a library
+            # and its dependants at incompatible versions; upstream Arch treats
+            # it as unsupported and it is the classic way to break a Manjaro
+            # box. The two-step the debian branch uses -- refresh, check, then
+            # upgrade -- is therefore deliberately not mirrored here.
+            #
+            # UPGRADE_MODE is not consulted: pacman has no upgrade/dist-upgrade
+            # distinction, -Syu is always a full-system upgrade.
+            run_cmd "$TASK_TIMEOUT" pacman -Syu --noconfirm || rc=$?
+            ;;
+        suse)
+            # Refresh, verify, then upgrade -- the same two-step as the debian
+            # branch and for the same reason: upgrading against a stale or
+            # half-fetched index is worse than not upgrading.
+            run_cmd "$TASK_TIMEOUT" zypper --non-interactive refresh || rc=$?
+            ((rc == 0)) || {
+                log ERROR "zypper refresh failed (status $rc); not upgrading against a stale index"
+                return "$rc"
+            }
+            # dup is a genuine counterpart to dist-upgrade: it allows vendor
+            # changes and package removal, which `update` will not do. Mapping
+            # UPGRADE_MODE onto it keeps one flag meaning one thing everywhere.
+            local zmode=update
+            [[ $UPGRADE_MODE == dist-upgrade ]] && zmode=dist-upgrade
+            run_cmd "$TASK_TIMEOUT" zypper --non-interactive "$zmode" || rc=$?
+            ;;
+        alpine)
+            # -U is `apk update` folded into the same invocation, so the index
+            # refresh and the upgrade cannot be separated by an interruption.
+            run_cmd "$TASK_TIMEOUT" apk -U upgrade || rc=$?
+            ;;
     esac
     check_reboot_required
     return "$rc"
@@ -1229,7 +1458,7 @@ task_update() {
 
 task_autoremove() {
     [[ -n $FAMILY ]] || {
-        unsupported_family autoremove 'apt/dnf'
+        unsupported_family autoremove 'apt/dnf/pacman/zypper/apk'
         return 0
     }
     export_pkg_env
@@ -1243,13 +1472,48 @@ task_autoremove() {
         rhel)
             run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" -y autoremove || rc=$?
             ;;
+        arch)
+            # pacman has no autoremove. The equivalent is the orphan list:
+            # packages installed as dependencies that nothing depends on any
+            # more. `pacman -Qtdq` exits 1 when there are none, which is not an
+            # error and must not be reported as one.
+            local orphans
+            orphans=$(probe pacman -Qtdq 2>/dev/null) || orphans=''
+            if [[ -z $orphans ]]; then
+                log INFO 'No orphaned packages'
+                return 0
+            fi
+            log INFO "Orphaned packages: $(printf '%s' "$orphans" | tr '\n' ' ')"
+            # -Rns: remove the packages, their now-unneeded dependencies, and
+            # their configuration. Matches --purge autoremove on the debian side.
+            # shellcheck disable=SC2086 # deliberate word splitting: one package per argument
+            run_cmd "$TASK_TIMEOUT" pacman -Rns --noconfirm $orphans || rc=$?
+            ;;
+        suse)
+            # zypper can list unneeded packages but has no autoremove that
+            # consumes that list, and the list itself only comes out of a
+            # human-readable table. Parsing a table to build a purge argv is
+            # how an unattended maintenance run removes something it should not
+            # have. Reported rather than approximated.
+            no_equivalent autoremove \
+                'zypper has no autoremove; review "zypper packages --unneeded" and remove by name.'
+            return 0
+            ;;
+        alpine)
+            # apk tracks explicitly-installed packages in /etc/apk/world and
+            # prunes unneeded dependencies as part of ordinary transactions, so
+            # there is no separate orphan set to collect.
+            no_equivalent autoremove \
+                'apk prunes unused dependencies during normal transactions; there is no orphan list to purge.'
+            return 0
+            ;;
     esac
     return "$rc"
 }
 
 task_clean_cache() {
     [[ -n $FAMILY ]] || {
-        unsupported_family clean-cache 'apt/dnf'
+        unsupported_family clean-cache 'apt/dnf/pacman/zypper/apk'
         return 0
     }
     local rc=0
@@ -1261,6 +1525,34 @@ task_clean_cache() {
             # 'clean packages' keeps the repo metadata, so the next transaction
             # does not have to re-download every repomd.xml.
             run_cmd "$TASK_TIMEOUT" "$PKG_TOOL" clean packages || rc=$?
+            ;;
+        arch)
+            # paccache keeps the most recent version of each package, which
+            # leaves a downgrade path if an upgrade goes wrong. `pacman -Sc`
+            # keeps nothing but the currently-installed versions, so it is the
+            # fallback rather than the first choice. Neither touches the sync
+            # database, matching the rhel branch's 'clean packages'.
+            if have paccache; then
+                run_cmd "$TASK_TIMEOUT" paccache -rk1 || rc=$?
+            else
+                run_cmd "$TASK_TIMEOUT" pacman -Sc --noconfirm || rc=$?
+            fi
+            ;;
+        suse)
+            # Bare `clean` drops cached packages and keeps repository metadata,
+            # matching the rhel branch. `--all` would also drop the metadata and
+            # make the next transaction re-download every repo index.
+            run_cmd "$TASK_TIMEOUT" zypper --non-interactive clean || rc=$?
+            ;;
+        alpine)
+            # Only meaningful when a cache is configured; apk errors out when
+            # /etc/apk/cache is absent, which is the default on many installs
+            # and is not a failure of this task.
+            if [[ -e /etc/apk/cache ]]; then
+                run_cmd "$TASK_TIMEOUT" apk cache clean || rc=$?
+            else
+                log INFO 'No apk cache configured (/etc/apk/cache absent); nothing to clean'
+            fi
             ;;
     esac
     return "$rc"
@@ -1547,6 +1839,15 @@ lock_paths() {
         rhel)
             _out=(/var/lib/rpm/.rpm.lock)
             ;;
+        arch)
+            _out=(/var/lib/pacman/db.lck)
+            ;;
+        suse)
+            _out=(/var/run/zypp.pid /var/lib/rpm/.rpm.lock)
+            ;;
+        alpine)
+            _out=(/lib/apk/db/lock)
+            ;;
     esac
 }
 
@@ -1573,7 +1874,7 @@ pid_alive() {
 
 task_fix_locks() {
     [[ -n $FAMILY ]] || {
-        unsupported_family fix-locks 'apt/dnf'
+        unsupported_family fix-locks 'apt/dnf/pacman/zypper/apk'
         return 0
     }
 

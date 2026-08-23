@@ -104,6 +104,8 @@ COUNT_UNREADABLE=0
 # -- nothing was changed and nothing was missed that should have been changed --
 # but it is reported, because it means the tree moved under the run.
 COUNT_RACED=0
+# Out-parameter of filter_raced_paths; read immediately by each caller.
+DROPPED=0
 FAILURES=0
 YW='' BL='' RD='' GN='' CL=''
 
@@ -968,6 +970,26 @@ take_backup() {
     # Created under umask 0077 rather than created-then-chmod'ed: the snapshot
     # is a complete structural listing of somebody's home, and the chmod-after
     # form leaves it world-readable for the length of the walk.
+    # The same re-check the chmod batches get, for the same reason: getfacl -p
+    # follows symlinks, so a path swapped between the scan and here records the
+    # *target's* ownership and mode under the in-home name. That is a file
+    # outside the home smuggled into an undo file, and `setfacl --restore`
+    # would later write it back through the link.
+    #
+    # It also removes a denial of service. getfacl exits non-zero on a path it
+    # cannot stat, xargs turns that into 123, and this function treats that as
+    # a failed snapshot and aborts the whole run -- so before this, anyone who
+    # could write in the home could stop the run by pointing one entry at a
+    # dangling link. Dropped paths are not counted against COUNT_RACED: the
+    # chmod batches re-check independently and would count the same path twice.
+    if ! filter_raced_paths "$WORK_DIR/snap" "$WORK_DIR/snap.safe"; then
+        die "$EX_FAIL" "Could not write the symlink-checked snapshot list. Nothing was changed."
+    fi
+    if ! mv -f "$WORK_DIR/snap.safe" "$WORK_DIR/snap"; then
+        die "$EX_FAIL" "Could not stage the symlink-checked snapshot list. Nothing was changed."
+    fi
+    ((DROPPED)) && log WARN "$DROPPED path(s) became symlinks after the scan and are not in the snapshot."
+
     local rc=0 prev_umask
     prev_umask=$(umask)
     umask 0077
@@ -1045,24 +1067,35 @@ path_is_clean() {
     return 0
 }
 
+# Copies a NUL-separated path list, dropping any entry that now sits under a
+# symlink, and reports how many went in DROPPED.
+#
 # `src`/`dst` rather than `in`/`out`: `out` is the nameref array in
 # parse_id_spec, and reusing the name here makes shellcheck read this string
 # assignment as clobbering that array (SC2178/SC2128).
-drop_symlinks() {
-    local src=$1 dst=$2 p dropped=0
+filter_raced_paths() {
+    local src=$1 dst=$2 p
+    DROPPED=0
     CLEAN_CACHE=()
 
     while IFS= read -r -d '' p; do
         if ! path_is_clean "$p"; then
-            dropped=$((dropped + 1))
+            DROPPED=$((DROPPED + 1))
             continue
         fi
         printf '%s\0' "$p"
     done <"$src" >"$dst" || return 1
+    return 0
+}
 
-    if ((dropped)); then
-        log WARN "$dropped path(s) sit under a symlink that appeared after the scan and were not chmod'ed."
-        COUNT_RACED=$((COUNT_RACED + dropped))
+# The chmod-batch wrapper. Counts what it drops against the reported change
+# total, because a path dropped here is a change the run planned and did not
+# make.
+drop_symlinks() {
+    filter_raced_paths "$1" "$2" || return 1
+    if ((DROPPED)); then
+        log WARN "$DROPPED path(s) sit under a symlink that appeared after the scan and were not chmod'ed."
+        COUNT_RACED=$((COUNT_RACED + DROPPED))
     fi
     return 0
 }
