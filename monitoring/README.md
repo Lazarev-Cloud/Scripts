@@ -202,6 +202,11 @@ python3 prometheus_unified_metrics.py --no-collector gpu --no-collector smart
 Units follow Prometheus base-unit conventions: seconds, bytes, celsius, watts,
 and ratios in 0–1 rather than percentages.
 
+> **Replacing an older exporter on a host?** Three things changed that a
+> running deployment will notice, none of them detectable from the metrics
+> themselves. Read [Replacing an older install](#replacing-an-older-install)
+> before you upgrade.
+
 ### Exporter
 
 | Metric | Type | Labels |
@@ -449,6 +454,44 @@ time() - node_textfile_mtime_seconds{file="hostwatch.prom"} > 900
 - Concurrent scrapes are serialised per collector, so two Prometheus servers
   cannot make the exporter run two `smartctl` scans against the same disks at
   once.
+
+## Replacing an older install
+
+Only relevant if a host is already running the previous version of this
+exporter. On a new host, ignore this section.
+
+Three defaults changed, and each fails in a way the metrics cannot tell you
+about — the old series simply stop arriving, which reads identically to a host
+that went quiet.
+
+**Every metric was renamed.** The prefix is `hostwatch_` where it used to be
+`system_`, and the names underneath it follow Prometheus base-unit conventions
+rather than the old percentage-and-megabyte mix, so this is not a search and
+replace. Dashboards and alert rules referring to `system_*` go blank rather
+than erroring. Work through the table above and rewrite the queries before
+cutting a host over; `system_cpu_usage_percent` in particular has no direct
+replacement, because CPU is now a `hostwatch_cpu_seconds_total` counter that
+you `rate()` yourself — the query is under [the `host` collector](#host).
+
+**The default bind address is `127.0.0.1`, not `0.0.0.0`.** A remote Prometheus
+that used to scrape the host will get a connection refused. This is deliberate:
+the endpoint is unauthenticated, and an exporter should not become reachable
+from the whole network merely by being installed. Pass `--bind 0.0.0.0` (or set
+`LZC_EXPORTER_BIND`) to restore the old behaviour, and read
+[Scraping it](#scraping-it) first.
+
+**`prometheus_client` is now required**, and the exporter exits `3` with an
+install hint rather than starting without it. The old version installed
+`psutil` into the system interpreter by itself on first run; this one installs
+nothing, because doing that on a PEP 668 host — Debian 13, Proxmox VE 9 — can
+leave `apt` unable to reconcile its own `python3-*` packages. Use the venv that
+`setup_prometheus_exporter.sh` creates, or your distribution's
+`python3-prometheus-client`. `psutil` stays optional: without it the `host` and
+`sensors` collectors report `hostwatch_collector_up 0` and everything else
+keeps working.
+
+Re-running `setup_prometheus_exporter.sh` handles the venv and the unit file
+for you. It does not and cannot fix your dashboards.
 
 # The installer
 
