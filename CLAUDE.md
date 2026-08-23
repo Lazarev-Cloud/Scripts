@@ -7,16 +7,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Standalone system-maintenance scripts — Bash for Linux, PowerShell for Windows, one Python
 metrics exporter. Nothing imports anything else; each script is copied onto a host, or piped
 in over `curl`, and run as root/Administrator. There is no build step and no test suite. The
-only automated gate is `.github/workflows/lint.yml`.
+only automated gate is `.github/workflows/lint.yml`, which `./tests/run_checks.sh` mirrors
+locally.
 
 Read `CONTRIBUTING.md` before writing any script here — it is the normative style guide, and
 the conventions below are a summary of it, not a substitute.
 
 ## Verifying changes
 
-CI runs two linters, both pinned, with zero tolerance for findings. `bash -n`
-runs first because a parse error makes the shellcheck output much harder to
-read:
+Run `./tests/run_checks.sh` — it is the fastest way to know, and it reads the pinned
+linter versions out of the workflow so it cannot drift from CI. It also covers three
+things CI cannot: that every script answers `--help` with status 0 (ShellCheck reads code,
+it does not run it), that every runnable `*.sh` is committed `100755` (every README says
+`./script.sh`), and that every workflow and `_config.yml` is valid YAML (an invalid
+`dependabot.yml` is rejected whole and silently stops all updates). A check whose tool is
+missing reports as skipped, never as passed.
+
+The two CI runs, if you want them directly — `bash -n` first, because a parse error makes
+the ShellCheck output much harder to read:
 
 ```bash
 find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r -n1 -t bash -n
@@ -106,6 +114,16 @@ overwrite the real library that was prepended to the remote stream.
 overlapping the small `linux/*` scripts (`clean-logs`, `fix-apt-lock`, …). The standalone
 script is the copy-one-file route; this is the everything-in-one route. A behaviour change
 usually belongs in both.
+
+It is also the only script that dispatches across package families — debian, rhel, arch,
+suse, alpine, detected in that order from what is on `PATH` — so a new family means an arm
+in all seven `case $FAMILY` blocks, not one. Two rules there are load-bearing: no report
+path may refresh repository metadata (a health check must not mutate the host, which is why
+Arch uses `checkupdates` rather than `pacman -Sy`), and a task with no safe counterpart is
+skipped via `no_equivalent()` rather than approximated — SUSE and Alpine have no autoremove,
+and parsing zypper's human-readable table to build a purge argv is how an unattended root
+run removes the wrong thing. The per-family table is in that script's README.
+`update_upgrade.sh` stays APT-only by contrast; it is apt all the way down.
 
 **`monitoring/prometheus_unified_metrics.py`** — collector classes emitting through
 `prometheus_client`, served over stdlib `http.server`, or written as a node_exporter textfile.
