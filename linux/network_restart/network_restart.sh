@@ -50,7 +50,7 @@ LOCK_FILE="${LZC_NETWORK_RESTART_LOCK:-/run/lock/lzc-network-restart.lock}"
 ASSUME_YES="${LZC_NETWORK_RESTART_YES:-0}"
 FORCE="${LZC_NETWORK_RESTART_FORCE:-0}"
 DRY_RUN=0
-USE_COLOR=auto
+USE_COLOR="${LZC_NETWORK_RESTART_COLOR:-auto}"
 
 # --- Runtime state -----------------------------------------------------------
 APPLY=0

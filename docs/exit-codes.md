@@ -3,6 +3,11 @@
 Every script in this repository uses the same table. A wrapper, a cron job or a
 monitoring check can therefore treat them all identically.
 
+There is exactly one addition, and it is a Windows convention rather than a new
+invention: `ResetNetwork.ps1` also returns `3010`, which is what Windows itself
+uses for "the operation succeeded and needs a reboot to finish". Nothing else
+in the repository returns a code outside the table.
+
 | Code | Meaning | What to do |
 | ---: | --- | --- |
 | `0` | Success. | Nothing. |

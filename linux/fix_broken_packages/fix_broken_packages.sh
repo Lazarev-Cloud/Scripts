@@ -47,7 +47,7 @@ LOCK_PATHS="${LZC_FIX_BROKEN_PACKAGES_LOCK_PATHS:-/var/lib/dpkg/lock-frontend /v
 SAFE_PATH="${LZC_FIX_BROKEN_PACKAGES_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 RUN_LOCALE="${LZC_FIX_BROKEN_PACKAGES_LOCALE:-C}"
 DRY_RUN=0
-USE_COLOR=auto
+USE_COLOR="${LZC_FIX_BROKEN_PACKAGES_COLOR:-auto}"
 
 # --- Exit codes ---------------------------------------------------------------
 #

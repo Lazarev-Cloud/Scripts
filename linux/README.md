@@ -26,12 +26,12 @@ pass `--yes`. `-n`/`--dry-run` forces report-only.
 `clean-logs`, `clean-tmp`, `fix-packages`, `fix-locks`, `routine`.
 
 Every flag has an `LZC_<SCRIPT>_<SETTING>` environment variable, which is the
-practical route when piping a script in over `curl`. `--dry-run` and `--color`
-are the exceptions — every script has both flags, but not every script exposes
-them as variables. `--color` has one in `fix_apt_lock`, `fix_dnf_lock`,
-`fix_permissions` and `maintenance`; `--dry-run` has one in the first two and
-`maintenance`, while `fix_permissions` inverts it as
-`LZC_FIX_PERMISSIONS_APPLY`.
+practical route when piping a script in over `curl`. `--color` is settable that
+way in every script. `--dry-run` is the one exception: it has a variable in
+`fix_apt_lock`, `fix_dnf_lock` and `maintenance` only, and `fix_permissions`
+inverts it as `LZC_FIX_PERMISSIONS_APPLY`. Everywhere else `--dry-run` is
+flag-only, deliberately — a dry run is a decision you make per invocation, not
+a mode you leave switched on in an environment file.
 
 ## Installing them
 

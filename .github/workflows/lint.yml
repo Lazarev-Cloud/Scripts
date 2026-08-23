@@ -1,4 +1,8 @@
-# Lint gate for every script in the repo.
+# Lint gate for every shell and PowerShell script in the repo.
+#
+# Not Python: monitoring/prometheus_unified_metrics.py is checked by
+# tests/run_checks.sh locally and by CodeQL's Analyze (python) job, but nothing
+# here lints it. Say so rather than letting the header imply coverage.
 #
 # The whole repo currently reports ZERO findings from both linters. This
 # workflow exists so that stays true: any new finding fails the build.

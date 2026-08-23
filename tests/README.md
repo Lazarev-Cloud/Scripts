@@ -15,13 +15,13 @@ Read-only. It needs no root and changes nothing.
 | --- | :---: | --- |
 | `bash -n` | yes | Same file discovery as the workflow. |
 | `shellcheck` | yes | Warns when your local version differs from the pinned one. |
-| `py_compile` | yes | The monitoring exporter. |
+| `py_compile` | no | The monitoring exporter. CI has no Python lint job at all. |
 | YAML | no | Every workflow, plus `_config.yml`. |
 | `--help` | no | Every executable script must answer `--help` with status `0`. |
 | Executable bits | no | Every runnable `*.sh` must be committed `100755`. |
 | PSScriptAnalyzer | yes | Only when `pwsh` is present, and **indicative only** — see below. |
 
-The three CI cannot do are the point of running this locally.
+The four CI cannot do are the point of running this locally.
 
 **`--help`** executes each script. ShellCheck reads code; it does not run it, so
 a script that dies on an unset variable before printing anything is clean to
@@ -31,6 +31,10 @@ ShellCheck and broken to a user. This catches that.
 committed `100644` answers that with `Permission denied` on a fresh clone, and
 nothing else in the pipeline notices — this repository shipped exactly that bug
 once.
+
+**`py_compile`** is here and nowhere else: `lint.yml` lints shell and
+PowerShell only, so a syntax error in the exporter reaches `main` unless
+somebody ran this first.
 
 **PSScriptAnalyzer** runs under `pwsh` 7 here, while CI analyses under Windows
 PowerShell 5.1, which is what the scripts target. The two parse some constructs

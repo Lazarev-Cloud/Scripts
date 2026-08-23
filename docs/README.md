@@ -57,8 +57,9 @@ These hold across the Bash scripts:
   script's own lock from the package-manager lock it is inspecting.
   `install.sh` is the exception — it takes no lock.
 - **`main "$@"` is the last line of every executable script**, so a truncated
-  download never executes a partial program. (`lib/lzc-obs.sh` is a sourced
-  library and defines functions only.)
+  download never executes a partial program. (`lib/lzc-obs.sh` is sourced, not
+  executed: it defines functions and, as its last statement, normalises its own
+  `LZC_OBS_*` settings. It touches nothing else.)
 
 PowerShell scripts use the platform equivalents: `SupportsShouldProcess`, so
 `-WhatIf` previews and `-Confirm`/`-Force` gate the change; they are read-only

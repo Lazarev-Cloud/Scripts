@@ -83,7 +83,9 @@ Options:
 Environment:
   LZC_INSTALL_PREFIX          Same as --prefix.
   LZC_INSTALL_YES             Same as --yes. Accepts 1/true/yes/on.
-  LZC_INSTALL_COMPLETION_DIR  Override the bash-completion directory.
+  LZC_INSTALL_COMPLETION_DIR  Override the bash-completion directory. Supply
+                              the same value to --uninstall, or the file it
+                              wrote is left behind.
 
 Installed commands:
 $(printf '  %s\n' "${SCRIPTS[@]#*:}")
@@ -196,7 +198,7 @@ install_all() {
     # The library first: the scripts look for it and degrade silently if absent,
     # so installing it last would leave a window where telemetry is disabled.
     run install -m 0644 "$SOURCE_DIR/lib/lzc-obs.sh" "$LIB_DIR/lzc-obs.sh"
-    ok "library  -> $LIB_DIR/lzc-obs.sh"
+    ((DRY_RUN)) || ok "library  -> $LIB_DIR/lzc-obs.sh"
 
     local entry rel name missing=0
     for entry in "${SCRIPTS[@]}"; do
@@ -208,7 +210,7 @@ install_all() {
             continue
         fi
         run install -m 0755 "$SOURCE_DIR/$rel" "$BIN_DIR/$name"
-        ok "command  -> $BIN_DIR/$name"
+        ((DRY_RUN)) || ok "command  -> $BIN_DIR/$name"
     done
 
     write_completion
@@ -240,16 +242,26 @@ _lzc_complete() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
 
+    # mapfile rather than COMPREPLY=($(...)): the array-from-subshell form is
+    # SC2207, and this repository's bar is zero shellcheck findings. Being
+    # generated, this file is linted by neither CI nor tests/run_checks.sh, so
+    # nothing would catch it -- which is the more reason to write it correctly.
     case $prev in
-        --color) COMPREPLY=($(compgen -W 'auto always never' -- "$cur")); return ;;
-        --prefix|--log-file) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --color)
+            mapfile -t COMPREPLY < <(compgen -W 'auto always never' -- "$cur")
+            return
+            ;;
+        --prefix | --log-file)
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
     esac
 
     if [[ $cur == -* ]]; then
         local opts
         opts=$("${COMP_WORDS[0]}" --help 2>/dev/null |
             grep -oE '(^|[[:space:]])--[a-z][a-z-]*' | tr -d ' ' | sort -u)
-        COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+        mapfile -t COMPREPLY < <(compgen -W "$opts" -- "$cur")
     fi
 }
 COMPLETION
