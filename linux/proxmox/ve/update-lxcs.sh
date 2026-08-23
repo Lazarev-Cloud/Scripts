@@ -60,6 +60,7 @@ declare -a FAILED=()
 declare -a NEEDS_REBOOT=()
 declare -a NODES_OK=()
 declare -a NODES_FAILED=()
+declare -a NODES_SKIPPED=()
 SELF_PATH=''
 OBS_LIB_PATH=''
 COUNT_TOTAL=0
@@ -189,6 +190,8 @@ Options:
       --retries N           Update attempts per container (default: $RETRIES).
       --log-file PATH       Log file (default: $LOG_FILE).
       --color WHEN          auto | always | never (default: auto).
+      --logs-url URL        Ship logs here. See docs/observability.md.
+      --metrics-url URL     Ship run metrics here. Same.
   -V, --version             Print version and exit.
   -h, --help                Print this help and exit.
 
@@ -214,6 +217,18 @@ flag-only. Boolean variables accept 1/true/yes/on and 0/false/no/off:
   LZC_UPDATE_LXCS_RETRIES=2  LZC_UPDATE_LXCS_LOG=/var/log/lxc-updater.log
   LZC_UPDATE_LXCS_CLUSTER=1  LZC_UPDATE_LXCS_NODES=pve1,pve2
   LZC_UPDATE_LXCS_SSH_USER=root
+
+Timeouts and paths, all seconds unless noted, all minimum 1:
+  LZC_UPDATE_LXCS_LOCK=$LOCK_FILE
+  LZC_UPDATE_LXCS_LOG_MAX_BYTES=$LOG_MAX_BYTES   rotate the log past this size
+  LZC_UPDATE_LXCS_START_TIMEOUT=$START_TIMEOUT        wait for a container to boot
+  LZC_UPDATE_LXCS_READY_PROBE_TIMEOUT=$READY_PROBE_TIMEOUT    each readiness probe
+  LZC_UPDATE_LXCS_READY_POLL_INTERVAL=$READY_POLL_INTERVAL    between readiness probes
+  LZC_UPDATE_LXCS_SHUTDOWN_TIMEOUT=$SHUTDOWN_TIMEOUT     graceful shutdown before stop
+  LZC_UPDATE_LXCS_PROBE_TIMEOUT=$PROBE_TIMEOUT         in-guest probes (distro, df)
+  LZC_UPDATE_LXCS_RETRY_DELAY=$RETRY_DELAY           between update attempts (min 0)
+  LZC_UPDATE_LXCS_SSH_TIMEOUT=$SSH_TIMEOUT           SSH connect timeout
+  LZC_UPDATE_LXCS_SSH_OPTS=''         extra ssh options, whitespace separated
 
 Exit status:
   0    every selected container updated, or was skipped by choice
@@ -394,7 +409,7 @@ preflight() {
     # Rotate before opening so a long-lived node does not grow an unbounded log.
     local size
     if [[ -f $LOG_FILE ]]; then
-        size=$(wc -c <"$LOG_FILE" 2>/dev/null) || size=0
+        size=$(wc -c 2>/dev/null <"$LOG_FILE") || size=0
         if ((size > LOG_MAX_BYTES)); then
             mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
         fi
@@ -412,7 +427,11 @@ preflight() {
 
 acquire_lock() {
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
-    exec 9>"$LOCK_FILE" || die "$EX_LOCKED" "Cannot open lock file $LOCK_FILE"
+    # EX_PREREQ, not EX_LOCKED: "cannot open" is a permanent misconfiguration
+    # (unwritable /run/lock, missing directory), and 75 tells cron "transient,
+    # retry later", so a broken host would retry forever instead of being
+    # reported once. 75 is for a lock genuinely held by another run.
+    exec 9>"$LOCK_FILE" || die "$EX_PREREQ" "Cannot open lock file $LOCK_FILE"
     flock -n 9 || die "$EX_LOCKED" "Another $SCRIPT_NAME run holds $LOCK_FILE. Refusing to run concurrently."
     LOCK_HELD=1
 }
@@ -961,15 +980,28 @@ remote_payload() {
     fi
 
     printf 'set -uo pipefail\n'
+    # The exit-code constants first. Without them the remote parses fine and
+    # then dies on its first error path -- `die "$EX_LOCKED"` on a held lock --
+    # with "EX_LOCKED: unbound variable" under set -u, at exactly the moment it
+    # most needs to report cleanly.
+    declare -p EX_FAIL EX_USAGE EX_PREREQ EX_NOROOT \
+        EX_NOCONFIRM EX_LOCKED EX_INTERRUPT 2>/dev/null
+
+    # Every tunable parse_args normalises must appear here, or the remote dies
+    # inside _normalise_int before touching a container: `${!name}` on an unset
+    # name under set -u aborts immediately. READY_PROBE_TIMEOUT and
+    # READY_POLL_INTERVAL were missing, which broke piped cluster runs outright.
+    # Keep this list in step with the normalise loop in parse_args.
     declare -p SCRIPT_NAME SCRIPT_VERSION LOG_FILE LOG_MAX_BYTES LOCK_FILE \
         START_TIMEOUT SHUTDOWN_TIMEOUT UPDATE_TIMEOUT PROBE_TIMEOUT \
+        READY_PROBE_TIMEOUT READY_POLL_INTERVAL \
         RETRIES RETRY_DELAY SSH_USER SSH_TIMEOUT SSH_EXTRA_OPTS 2>/dev/null
 
     printf '%s\n' \
         'EXCLUDE_SPEC= INCLUDE_SPEC= NODES_SPEC= ASSUME_YES=1' \
         'SKIP_STOPPED=0 CLUSTER_MODE=0 DRY_RUN=0 USE_COLOR=never SELF_PATH=' \
         'declare -a EXCLUDED=() INCLUDED=() STARTED_BY_US=() FAILED=() NEEDS_REBOOT=()' \
-        'declare -a NODES_OK=() NODES_FAILED=()' \
+        'declare -a NODES_OK=() NODES_FAILED=() NODES_SKIPPED=()' \
         'COUNT_TOTAL=0 COUNT_UPDATED=0 COUNT_TEMPLATE=0 COUNT_EXCLUDED=0' \
         'LOG_READY=0 LOG_SINK=/dev/null LOCK_HELD=0' \
         "YW='' BL='' RD='' GN='' CL=''"
@@ -1002,6 +1034,14 @@ run_remote_node() {
         0)
             NODES_OK+=("$node")
             log SUCCESS "Node $node completed"
+            ;;
+        "$EX_LOCKED")
+            # Not a failure, and deliberately not counted as one: the node is
+            # already being updated by another run. Calling that a fault would
+            # page someone for the one outcome that needs no action, which is
+            # the whole reason 75 exists in the shared table.
+            NODES_SKIPPED+=("$node: already running the updater")
+            log INFO "Node $node: another run holds its lock; left alone"
             ;;
         255)
             NODES_FAILED+=("$node: unreachable over SSH")
@@ -1072,9 +1112,14 @@ run_cluster() {
 cluster_summary() {
     local item
     printf '\n'
-    log INFO "Cluster summary: ${#NODES_OK[@]} node(s) OK, ${#NODES_FAILED[@]} with problems"
+    log INFO "Cluster summary: ${#NODES_OK[@]} node(s) OK, ${#NODES_SKIPPED[@]} already running, ${#NODES_FAILED[@]} with problems"
     obs_metric lzc_lxc_nodes "${#NODES_OK[@]}" state=ok
+    obs_metric lzc_lxc_nodes "${#NODES_SKIPPED[@]}" state=locked
     obs_metric lzc_lxc_nodes "${#NODES_FAILED[@]}" state=failed
+    if ((${#NODES_SKIPPED[@]})); then
+        for item in "${NODES_SKIPPED[@]}"; do printf '  %s\n' "$item"; done
+        printf '\n'
+    fi
     if ((${#NODES_FAILED[@]})); then
         for item in "${NODES_FAILED[@]}"; do printf '  %s\n' "$item" >&2; done
         printf '\n'

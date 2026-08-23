@@ -243,9 +243,21 @@ def as_float(value: Any) -> Optional[float]:
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError, not just the obvious two: json.loads yields Python
+        # ints of arbitrary precision, so one drive reporting an absurd raw
+        # SMART attribute raises here. It is an ArithmeticError, so the old
+        # two-name tuple missed it, and the exception escaped as far as the
+        # collector guard -- taking every disk's series down with it and
+        # reporting hostwatch_collector_up 0 for the whole subsystem. This
+        # function's contract is per-field degradation; one bad field must
+        # cost that field only.
         return None
-    if result != result:  # NaN
+    if not math.isfinite(result):
+        # NaN and both infinities. NaN was already rejected; infinity was not,
+        # so a huge value serialized as +Inf. Prometheus accepts that token, so
+        # it broke nothing, but it contradicts _finite() -- which rejects both
+        # for CLI arguments -- and an infinite reading is not a measurement.
         return None
     return result
 

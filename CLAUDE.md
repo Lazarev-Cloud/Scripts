@@ -16,12 +16,13 @@ the conventions below are a summary of it, not a substitute.
 ## Verifying changes
 
 Run `./tests/run_checks.sh` — it is the fastest way to know, and it reads the pinned
-linter versions out of the workflow so it cannot drift from CI. It also covers three
+ShellCheck version out of the workflow so it cannot drift from CI. It also covers four
 things CI cannot: that every script answers `--help` with status 0 (ShellCheck reads code,
 it does not run it), that every runnable `*.sh` is committed `100755` (every README says
 `./script.sh`), and that every workflow and `_config.yml` is valid YAML (an invalid
-`dependabot.yml` is rejected whole and silently stops all updates). A check whose tool is
-missing reports as skipped, never as passed.
+`dependabot.yml` is rejected whole and silently stops all updates), and that the Python
+exporter compiles, which no CI job checks. A check whose tool is missing reports as
+skipped, never as passed.
 
 The two CI runs, if you want them directly — `bash -n` first, because a parse error makes
 the ShellCheck output much harder to read:
@@ -78,8 +79,8 @@ likely to be broken by an edit that only looks at one file.
 that must survive individual failures (`update-lxcs.sh`, `maintenance.sh`,
 `fix_permissions.sh`) uses `set -uo pipefail` and checks every fallible command explicitly. A
 linear script that should stop at the first problem uses `set -e`:
-`setup_prometheus_exporter.sh` and the two lock doctors use `set -Eeuo pipefail`,
-`install.sh` uses `set -euo pipefail`. Adding `set -e`
+`setup_prometheus_exporter.sh`, `network_restart.sh` and the two lock doctors use
+`set -Eeuo pipefail`; `install.sh` uses `set -euo pipefail`. Adding `set -e`
 to a script in the first group reintroduces bugs this repo has already fixed once: it aborted
 `update-lxcs.sh` before its own summary printed, because `((n++))` returns 1 when `n` is 0.
 Never write `((n++))` as a bare statement; use `n=$((n + 1))`.

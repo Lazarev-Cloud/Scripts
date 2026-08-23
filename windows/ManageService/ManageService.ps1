@@ -632,7 +632,13 @@ function Invoke-Main {
             }
         }
 
-        if (-not $service.CanStop -and $Action -eq 'Stop') {
+        # Restart stops the service too, so it needs the same precheck. Gating
+        # this on Stop alone meant a Restart of a service reporting CanStop
+        # false skipped the clean exit 2 and instead ran into the Stop-Service
+        # timeout, surfacing as a generic exit 1 -- while the help and the
+        # README both list "a service that cannot be stopped" under exit 2
+        # without qualifying it by action.
+        if (-not $service.CanStop -and $Action -in @('Stop', 'Restart')) {
             Write-Error -ErrorAction Continue -Message "Service '$($detail.Name)' reports that it cannot be stopped."
             $script:ExitCode = 2
             return

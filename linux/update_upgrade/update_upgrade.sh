@@ -50,7 +50,7 @@ ASSUME_YES="${LZC_UPDATE_UPGRADE_YES:-0}"
 SAFE_PATH="${LZC_UPDATE_UPGRADE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 RUN_LOCALE="${LZC_UPDATE_UPGRADE_LOCALE:-C}"
 DRY_RUN=0
-USE_COLOR=auto
+USE_COLOR="${LZC_UPDATE_UPGRADE_COLOR:-auto}"
 
 # --- Exit codes ---------------------------------------------------------------
 #

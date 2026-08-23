@@ -583,6 +583,71 @@ function Resolve-CleanTarget {
     return $full
 }
 
+function Get-SafeDescendant {
+    <#
+    .SYNOPSIS
+        Enumerates files or directories under a root without ever crossing a
+        reparse point.
+    .DESCRIPTION
+        Get-ChildItem -Recurse follows directory junctions and symlinked
+        directories on Windows PowerShell 5.1, so filtering reparse points out
+        of its results is no protection: the junction is walked, and the files
+        beneath it are ordinary files whose FullName still begins with the root,
+        so they pass both the containment test and the reparse-point test.
+        Deleting one then resolves through the junction and removes a file
+        outside the tree the caller asked to clean.
+
+        This walks explicitly and prunes any directory that is a reparse point,
+        so nothing underneath one is ever returned. Iterative rather than
+        recursive so a deep tree cannot exhaust the pipeline depth.
+    .OUTPUTS
+        System.IO.FileSystemInfo
+    #>
+    [CmdletBinding()]
+    [OutputType([System.IO.FileSystemInfo])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Root,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('File', 'Directory')]
+        [string] $Kind,
+
+        [Parameter()]
+        [ref] $UnreadableCount
+    )
+
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($Root)
+
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        $childError = @()
+        $children = @(Get-ChildItem -LiteralPath $current -Force `
+                -ErrorAction SilentlyContinue -ErrorVariable +childError)
+
+        if ($childError.Count -gt 0 -and $null -ne $UnreadableCount) {
+            $UnreadableCount.Value += $childError.Count
+        }
+
+        foreach ($child in $children) {
+            $isReparse = $child.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)
+            if ($child.PSIsContainer) {
+                if ($isReparse) {
+                    Write-Verbose -Message "Reparse point, not descending: $($child.FullName)"
+                    continue
+                }
+                $pending.Enqueue($child.FullName)
+                if ($Kind -eq 'Directory') { $child }
+            }
+            elseif ($Kind -eq 'File' -and -not $isReparse) {
+                $child
+            }
+        }
+    }
+}
+
 function Get-CleanCandidate {
     <#
     .SYNOPSIS
@@ -608,10 +673,12 @@ function Get-CleanCandidate {
     $prefix = $Root.TrimEnd('\') + '\'
     $enumerationError = @()
 
-    # SilentlyContinue is paired with -ErrorVariable and the count is reported
-    # below, so an unreadable subtree is surfaced rather than swallowed.
-    $all = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File `
-            -ErrorAction SilentlyContinue -ErrorVariable +enumerationError)
+    # Get-SafeDescendant rather than Get-ChildItem -Recurse: the latter walks
+    # through directory junctions, which is exactly the escape the DESCRIPTION
+    # promises this script does not permit. Unreadable subtrees are counted and
+    # reported rather than swallowed.
+    $unreadable = 0
+    $all = @(Get-SafeDescendant -Root $Root -Kind File -UnreadableCount ([ref] $unreadable))
 
     $eligible = [System.Collections.Generic.List[object]]::new()
     $tooNew = 0
@@ -639,7 +706,7 @@ function Get-CleanCandidate {
         File            = $eligible.ToArray()
         ByteCount       = $byte
         TooNewCount     = $tooNew
-        UnreadableCount = @($enumerationError).Count
+        UnreadableCount = $unreadable + @($enumerationError).Count
     }
 }
 
@@ -727,10 +794,12 @@ function Remove-EmptyDirectory {
     $prefix = $Root.TrimEnd('\') + '\'
     $removed = 0
 
-    $directory = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -ErrorAction SilentlyContinue) |
+    # Same reasoning as the file pass: a -Recurse walk would enter a junction
+    # and offer the directories inside it for removal, and filtering reparse
+    # points out of the results does not undo having descended into one.
+    $directory = @(Get-SafeDescendant -Root $Root -Kind Directory) |
         Where-Object {
-            $_.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
-            -not $_.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)
+            $_.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
         } |
         Sort-Object -Property { $_.FullName.Length } -Descending
 

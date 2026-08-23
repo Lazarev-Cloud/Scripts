@@ -47,7 +47,7 @@ CMD_TIMEOUT="${LZC_CLEAN_LOGS_TIMEOUT:-60}"
 LOCK_FILE="${LZC_CLEAN_LOGS_LOCK:-/run/lock/lzc-clean_logs.lock}"
 ASSUME_YES="${LZC_CLEAN_LOGS_YES:-0}"
 DRY_RUN=0
-USE_COLOR=auto
+USE_COLOR="${LZC_CLEAN_LOGS_COLOR:-auto}"
 
 # --- Safety invariants (not tunable, on purpose) -----------------------------
 

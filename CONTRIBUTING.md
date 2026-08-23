@@ -77,9 +77,9 @@ through a mode-0600 file or stdin. See `lib/lzc-obs.sh` for the pattern.
 | Thing | Rule |
 | --- | --- |
 | Exit codes | The shared table in [docs/exit-codes.md](docs/exit-codes.md). Do not invent new ones. |
-| Environment variables | `LZC_<FOLDER>_<OPTION>`, folder name uppercased. `env \| grep LZC_` should show a user everything they can set. |
+| Environment variables | `LZC_<PREFIX>_<OPTION>`. The prefix is the folder name uppercased for everything under `linux/<name>/`; where the folder name would be useless it is the tool's name instead — `LZC_UPDATE_LXCS_` (folder is `ve`), `LZC_EXPORTER_` (folder is `monitoring`), `LZC_OBS_` (the shared library). Pick one, document it in the script's README, and never mix two in one script. `env \| grep LZC_` should show a user everything they can set. |
 | Colour | Only when stdout is a TTY. Honour `NO_COLOR`. Offer `--color auto\|always\|never`. |
-| Locking | Any script that mutates state takes an `flock` on `/run/lock/lzc-<script>.lock` and exits 75 if held. |
+| Locking | Any script that mutates state takes an `flock` and exits 75 if held. `/run/lock/lzc-<script>.lock` for new scripts; `update-lxcs.sh` predates the convention and uses `/run/lock/lxc-updater.lock`. `install.sh` is the one mutating script with no lock. |
 | Output streams | Errors and warnings to stderr, normal output to stdout. |
 | Logs and metrics | Optional, via `lib/lzc-obs.sh`. See [docs/observability.md](docs/observability.md). |
 
@@ -98,10 +98,11 @@ The exit-code table still applies.
 <script> --dry-run                      # does it describe the right thing?
 ```
 
-`run_checks.sh` reads the pinned linter versions out of the workflow, so it
-cannot drift from CI. It also covers two things CI cannot: that every script
-answers `--help` with status 0, and that every runnable script is committed
-executable. Run the individual tools by hand if you prefer:
+`run_checks.sh` reads the pinned ShellCheck version out of the workflow, so it
+cannot drift from CI. It also covers four things CI cannot: that every script
+answers `--help` with status 0 and fits 80 columns, that every runnable script
+is committed executable, that the workflows and `_config.yml` are valid YAML,
+and that the Python exporter compiles. Run the individual tools by hand if you prefer:
 
 ```bash
 shellcheck -s bash <changed files>      # must be silent
