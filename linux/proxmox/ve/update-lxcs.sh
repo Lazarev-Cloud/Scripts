@@ -713,27 +713,80 @@ update_one() {
 
 # --- Interactive selection ---------------------------------------------------
 
+# Terminal geometry, for sizing the whiptail dialogs. whiptail clamps to the
+# real screen itself, so being approximate here is safe; what this prevents is
+# the opposite problem, a dialog hard-coded to 20 rows that stays 20 rows on a
+# 45-row terminal.
+term_size() {
+    local rows cols
+    rows=$(tput lines 2>/dev/null) || rows=''
+    cols=$(tput cols 2>/dev/null) || cols=''
+    [[ $rows =~ ^[0-9]+$ ]] && ((rows > 0)) || rows=24
+    [[ $cols =~ ^[0-9]+$ ]] && ((cols > 0)) || cols=80
+    printf '%s %s' "$rows" "$cols"
+}
+
 select_exclusions() {
     command -v whiptail >/dev/null 2>&1 || {
         log WARN "whiptail not installed; skipping the exclusion picker"
         return 0
     }
 
-    local menu=() id name width=30
+    local menu=() id name idw=0 namew=0
     while read -r id; do
         name=$(config_value "$id" hostname)
         [[ -n $name ]] || name="ct$id"
-        ((${#name} + 12 > width)) && width=$((${#name} + 12))
+        ((${#id} > idw)) && idw=${#id}
+        ((${#name} > namew)) && namew=${#name}
         menu+=("$id" "$name" OFF)
     done < <(list_container_ids)
 
-    ((${#menu[@]})) || return 0
+    local count=$((${#menu[@]} / 3))
+    ((count)) || return 0
+
+    local rows cols
+    read -r rows cols < <(term_size)
+
+    local title
+    title="Containers on $(hostname)"
+
+    # +8 is exact, and measured rather than guessed: top border, the prompt's
+    # blank/text/blank, a blank, the button row, a blank, bottom border. Any
+    # larger and whiptail leaves dead rows under the list -- the old fixed 20
+    # against a list height of 10 left three of them. Any smaller and it
+    # silently drops the prompt text instead of shrinking the box.
+    local listh=$count maxlist=$((rows - 10))
+    ((maxlist < 3)) && maxlist=3
+    ((listh > maxlist)) && listh=$maxlist
+    local height=$((listh + 8))
+
+    # whiptail draws its own scrollbar when the list overflows, so the count is
+    # the part it cannot show: "8 of 40" is a different decision from "8 of 9".
+    local text='Select containers to skip:'
+    ((listh < count)) && text="Select containers to skip ($count total):"
+    local prompt="\n$text\n"
+
+    # Wide enough for whichever is longest: a list row, the title, or the
+    # prompt. whiptail lays a checklist row out as two spaces, "[ ]", a space,
+    # the tag, two spaces, then the item, inside one column of border and one
+    # of padding each side -- the id and name widths plus 12, plus two more for
+    # the scrollbar when there is one. Sizing from the *measured* id width
+    # matters on a node whose VMIDs have run past four digits: the previous
+    # formula counted the name only, so those rows were silently clipped. And
+    # the prompt has to be counted too, or the very notice that says the list
+    # scrolled gets truncated mid-sentence.
+    local width=$((idw + namew + 12))
+    ((listh < count)) && width=$((width + 2))
+    ((width < ${#title} + 8)) && width=$((${#title} + 8))
+    ((width < ${#text} + 6)) && width=$((${#text} + 6))
+    ((width < 40)) && width=40
+    ((width > cols - 4)) && width=$((cols - 4))
 
     local raw
     raw=$(whiptail --backtitle "$SCRIPT_NAME" \
-        --title "Containers on $(hostname)" \
-        --checklist "\nSelect containers to skip:\n" \
-        20 "$width" 10 \
+        --title "$title" \
+        --checklist "$prompt" \
+        "$height" "$width" "$listh" \
         "${menu[@]}" 3>&1 1>&2 2>&3) || return 0
 
     local token
@@ -745,8 +798,17 @@ select_exclusions() {
 
 confirm() {
     if command -v whiptail >/dev/null 2>&1; then
+        local msg
+        msg="Update the LXC containers on $(hostname)?"
+        local rows cols
+        read -r rows cols < <(term_size)
+        # Sized to the message rather than fixed at 60: a node with a long
+        # fully-qualified hostname had the question wrapped or clipped.
+        local width=$((${#msg} + 8))
+        ((width < 40)) && width=40
+        ((width > cols - 4)) && width=$((cols - 4))
         whiptail --backtitle "$SCRIPT_NAME" --title "$SCRIPT_NAME" \
-            --yesno "Update the LXC containers on $(hostname)?" 10 60
+            --yesno "$msg" 8 "$width"
         return
     fi
     local reply
