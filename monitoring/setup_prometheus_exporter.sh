@@ -159,6 +159,8 @@ Usage:
 
 Options:
   -y, --yes                  Run unattended; skip all prompts.
+      --install              Install or converge. This is the default, so the
+                             flag exists only to be explicit in a script.
   -n, --dry-run              Print the plan and change nothing.
                              Works as non-root.
       --uninstall            Remove everything this script installs (see below).
@@ -1028,6 +1030,13 @@ install_tree() {
     [[ -n $content ]] ||
         die_with "$EX_USAGE" "The resolved dependency list is empty; check --requirements and LZC_EXPORTER_PIP_PACKAGES"
     render_file "$INSTALL_DIR/requirements.txt" 0644 root:root "$content"
+    # A changed dependency list is a change to what the service runs, so it
+    # counts toward the restart the same way the payload and the unit do.
+    # Without this, bumping a pinned version installed the new package into the
+    # venv and then left the long-lived process running the old one, reporting
+    # "already running with the current configuration".
+    ((FILE_CHANGED)) && NEEDS_RESTART=1
+    return 0
 }
 
 ensure_venv() {
@@ -1037,7 +1046,12 @@ ensure_venv() {
     local stamp="$VENV_DIR/.requirements.installed"
 
     log STEP "Preparing the Python virtual environment"
-    if [[ -x $VENV_PYTHON ]]; then
+    # Both the interpreter and pip, not just the interpreter: an interrupted
+    # first install leaves a venv whose python works and whose pip does not,
+    # and testing only the former reported "already present" and then died in
+    # the pip step below on every subsequent run. Re-creating a venv is cheap
+    # and idempotent; a permanently unrepairable install is not.
+    if [[ -x $VENV_PYTHON ]] && "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
         log INFO "Virtual environment already present at $VENV_DIR"
     else
         # Plain `python3 -m venv`: the bundled pip from ensurepip is installed
@@ -1097,6 +1111,12 @@ ensure_venv() {
     # because a stamp that never appears means every run pays for pip.
     install -m 0644 -o root -g root "$INSTALL_DIR/requirements.txt" "$stamp" ||
         log WARN "Could not record $stamp; the next run will re-run pip"
+
+    # pip actually ran, so the venv is not what the running process imported.
+    # This is what makes --force-pip mean something on its own: without it the
+    # flag reinstalled the dependencies and never restarted the service, so the
+    # old modules stayed loaded until some unrelated future restart.
+    NEEDS_RESTART=1
 }
 
 # The venv is built by root but read by an unprivileged service account. A root
@@ -1501,6 +1521,20 @@ remove_service_account() {
     uid=$(id -u "$SERVICE_USER" 2>/dev/null) || return 0
     if ((uid == 0)) || ((uid >= 1000)); then
         log WARN "Not removing '$SERVICE_USER' (uid $uid): it does not look like a system account this script created"
+        return 0
+    fi
+
+    # Provenance, not just a uid range. The uid test alone would happily remove
+    # any system account in 1..999 that --user happened to name -- `daemon`,
+    # `systemd-network` -- which is not what "an account this script created"
+    # means. The account this script creates has this install directory as its
+    # home and a nologin shell; anything else is somebody else's.
+    local home shell
+    home=$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6) || home=''
+    shell=$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f7) || shell=''
+    if [[ $home != "$INSTALL_DIR" && $home != /nonexistent ]] ||
+        [[ $shell != *nologin && $shell != *false ]]; then
+        log WARN "Not removing '$SERVICE_USER': home '$home' and shell '$shell' do not match an account this installer creates"
         return 0
     fi
 
