@@ -45,10 +45,11 @@ updates:
     # releases are common enough, and nothing in this repo is urgent enough to
     # want day-zero. Security updates ignore this.
     #
-    # `default-days` only. The semver-specific keys (semver-major-days and its
-    # siblings) are supported for neither of the two ecosystems in this file,
-    # and Dependabot rejects the whole config rather than the one key -- an
-    # invalid file means no updates at all, and it fails quietly.
+    # `default-days` only: github-actions is the one ecosystem here that does
+    # not support the semver-specific keys, and Dependabot rejects the whole
+    # config rather than the offending key -- so an invalid file means no
+    # updates at all, reported only on the config check. The pip block keeps
+    # its semver-major-days, which pip does support.
     cooldown:
       default-days: 3
 
@@ -70,9 +71,9 @@ updates:
           - patch
           - minor
 
-    # default-days only here too; see the github-actions block above.
     cooldown:
       default-days: 3
+      semver-major-days: 7
 
 # Pins Dependabot cannot see. Check these by hand:
 #

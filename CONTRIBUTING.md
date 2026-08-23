@@ -49,11 +49,18 @@ library validates the same way but *warns and falls back to the default*
 instead of exiting, because it does not own the caller's exit status.
 
 **A sourced library must not be able to abort its caller.** Every entry point
-returns 0 and every fallible command inside it is handled at the call site.
-`return 0` at the end of the function is not enough — under `set -e` the shell
-exits at the failing command and never reaches it. `lib/lzc-obs.sh` is the
-worked example: it runs inside root maintenance scripts, so a dead log
+returns 0 — except a predicate, whose whole job is to return 1, and which must
+be documented as one — and every fallible command inside it is handled at the
+call site. `return 0` at the end of the function is not enough: under `set -e`
+the shell exits at the failing command and never reaches it. `lib/lzc-obs.sh`
+is the worked example. It runs inside root maintenance scripts, so a dead log
 collector must cost a warning on stderr and nothing else.
+
+**Never dereference an unvalidated variable name.** `${!name}` is not a lookup:
+bash parses the value as a variable reference, so a non-identifier is a fatal
+expansion error and an array subscript inside it is evaluated as code. Anything
+that takes the *name* of a variable — which is how secrets are passed here —
+must check it against `^[A-Za-z_][A-Za-z0-9_]*$` first.
 
 **Anything that can hang gets a `timeout`.** And a timeout value must be at
 least 1: `timeout 0` means *no limit*, which silently removes the protection.
@@ -95,12 +102,20 @@ bash -n <changed files>                 # must be silent
 For PowerShell:
 
 ```powershell
-Invoke-ScriptAnalyzer -Path <file> -Severity Error,Warning
+Invoke-ScriptAnalyzer -Path <file> -Severity Error,Warning,Information
 ```
 
 Update the `README.md` next to the script in the same commit. Docs describe the
 current state only — no changelog entries, no "previously this was called X".
 That is what git history is for.
+
+The one exception is a change that breaks an already-*deployed* installation in
+a way it cannot detect: a renamed metric, a moved default, a new hard
+dependency. "Your dashboards are about to go blank" is not history, it is the
+operating instruction for the upgrade, and a git log nobody reads is the wrong
+place for it. Give it its own heading, scope it to people upgrading, and delete
+it once that migration is behind everyone. `monitoring/README.md` has the
+worked example.
 
 ## Testing without the target platform
 

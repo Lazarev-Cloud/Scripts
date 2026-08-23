@@ -12,10 +12,12 @@
 #
 # Design rules this file obeys, because it runs inside root maintenance scripts:
 #   * Shipping NEVER changes the outcome of the calling script. Every network
-#     path is failure-tolerant and reports at most a warning, every obs_*
-#     entry point returns 0, and a malformed setting warns and falls back to
-#     its default instead of exiting. A caller running under `set -e` cannot
-#     be aborted by anything in here.
+#     path is failure-tolerant and reports at most a warning, and a malformed
+#     setting warns and falls back to its default instead of exiting. Every
+#     obs_* entry point returns 0, with one deliberate exception: obs_enabled
+#     is a predicate, and returns 1 when shipping is not configured. Call it
+#     as a condition, never bare. A caller under `set -e` cannot be aborted by
+#     anything in here.
 #   * No endpoint is hardcoded. If LZC_LOGS_URL / LZC_METRICS_URL are unset,
 #     every function here is an inert no-op.
 #   * Credentials are never passed on a command line. curl argv is world-visible
@@ -133,7 +135,11 @@ _obs_norm_int() {
         printf -v "$name" '%s' "$default"
         return 0
     fi
-    if [[ ! ${!name} =~ ^[0-9]+$ ]]; then
+    # Bounded to nine digits, not just "digits": $((10#...)) wraps silently on
+    # a value past 2^63, so a 20-digit LZC_OBS_TIMEOUT would sail through the
+    # minimum-1 check as a huge positive number and hand curl an effectively
+    # unlimited --max-time -- the exact outcome the minimum exists to prevent.
+    if [[ ! ${!name} =~ ^[0-9]{1,9}$ ]]; then
         _obs_config_warn "$name must be a whole number, got '${!name}'; using $default"
         printf -v "$name" '%s' "$default"
         return 0
@@ -203,7 +209,16 @@ obs_init() {
     obs_enabled || return 0
 
     [[ -n $LZC_OBS_JOB ]] || LZC_OBS_JOB=${1:-lzc-script}
-    [[ -n $LZC_OBS_INSTANCE ]] || LZC_OBS_INSTANCE=$(hostname -s 2>/dev/null || hostname)
+    # $HOSTNAME last, and it is not decoration: bash always sets it, whereas
+    # both hostname calls fail together on a minimal container with no
+    # net-tools and no coreutils hostname. Without the fallback the assignment
+    # fails and takes a `set -e` caller with it -- and cluster mode clears
+    # LZC_OBS_INSTANCE for every remote node, so that path is the common one,
+    # not the exotic one.
+    if [[ -z $LZC_OBS_INSTANCE ]]; then
+        LZC_OBS_INSTANCE=$(hostname -s 2>/dev/null || hostname 2>/dev/null) || LZC_OBS_INSTANCE=''
+        [[ -n $LZC_OBS_INSTANCE ]] || LZC_OBS_INSTANCE=${HOSTNAME:-unknown}
+    fi
 
     if ! command -v curl >/dev/null 2>&1; then
         _obs_warn "curl not found; remote log and metric shipping disabled"
@@ -217,10 +232,31 @@ obs_init() {
 }
 
 # Credentials go into a 0600 curl config file, never onto the command line.
+# Reads the value of the variable *named* by $1, on stdout.
+#
+# The name is validated first, and that is not a formality. `${!name}` is not a
+# plain lookup: bash parses the value as a variable reference, so a name that
+# is not an identifier is a fatal expansion error -- `LZC_OBS_TOKEN_ENV=my-token`,
+# which is exactly what someone writes by hand, kills the calling script with
+# "my-token: invalid variable name" even under `set -uo pipefail`. Worse, bash
+# evaluates an array subscript inside that reference, so a value of
+# `x[$(rm -rf /)]` executes the substitution. This library is sourced by scripts
+# running as root, and its settings arrive from cron files, unit files and MDM
+# payloads; a telemetry variable must not be a code path.
+_obs_env_value() {
+    local name=$1
+    [[ -n $name ]] || return 0
+    if [[ ! $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        _obs_config_warn "ignoring '$name': expected the NAME of an environment variable, not a value"
+        return 0
+    fi
+    printf '%s' "${!name:-}"
+}
+
 _obs_setup_auth() {
     local token='' password=''
-    [[ -n ${LZC_OBS_TOKEN_ENV:-} ]] && token=${!LZC_OBS_TOKEN_ENV:-}
-    [[ -n ${LZC_OBS_PASSWORD_ENV:-} ]] && password=${!LZC_OBS_PASSWORD_ENV:-}
+    token=$(_obs_env_value "${LZC_OBS_TOKEN_ENV:-}")
+    password=$(_obs_env_value "${LZC_OBS_PASSWORD_ENV:-}")
     [[ -n $token || -n $password ]] || return 0
 
     _obs_auth_cfg=$(mktemp 2>/dev/null) || {
@@ -230,11 +266,22 @@ _obs_setup_auth() {
     }
     chmod 600 "$_obs_auth_cfg" 2>/dev/null || true
 
+    # Checked: an unwritable config file would otherwise leave curl reading a
+    # truncated or empty one and shipping unauthenticated without saying so.
     if [[ -n $token ]]; then
-        printf 'header = "Authorization: Bearer %s"\n' "$token" >"$_obs_auth_cfg"
+        printf 'header = "Authorization: Bearer %s"\n' "$token" >"$_obs_auth_cfg" || {
+            _obs_warn "cannot write the credentials file; shipping unauthenticated"
+            rm -f "$_obs_auth_cfg"
+            _obs_auth_cfg=''
+        }
     else
-        printf 'user = "%s:%s"\n' "${LZC_OBS_USER:-}" "$password" >"$_obs_auth_cfg"
+        printf 'user = "%s:%s"\n' "${LZC_OBS_USER:-}" "$password" >"$_obs_auth_cfg" || {
+            _obs_warn "cannot write the credentials file; shipping unauthenticated"
+            rm -f "$_obs_auth_cfg"
+            _obs_auth_cfg=''
+        }
     fi
+    return 0
 }
 
 # Call from the script's EXIT trap.
@@ -460,6 +507,11 @@ obs_flush_metrics() {
 obs_finish() {
     obs_enabled || return 0
     local rc=${1:-0} now
+    # Validated for the same reason every other number here is: `$((rc == 0))`
+    # on a non-numeric rc is an unbound-variable abort, and obs_finish is
+    # called from EXIT traps, where the argument is whatever `$?` happened to
+    # be -- or, if a caller gets it wrong, whatever it passed instead.
+    [[ $rc =~ ^-?[0-9]{1,9}$ ]] || rc=0
     now=$(_obs_epoch)
 
     if [[ -n $LZC_METRICS_URL ]]; then
@@ -478,4 +530,11 @@ obs_finish() {
 # The one statement this file executes at source time. It assigns nothing
 # outside its own LZC_OBS_* settings, so a script that sources this library and
 # never calls obs_init still cannot be killed by a mistyped telemetry variable.
-_obs_normalise_settings
+#
+# `|| true` because this is now the file's last statement and therefore its
+# source status. update-lxcs.sh does `. "$lib" || return 0`, so a non-zero here
+# would silently abandon the library it just loaded -- no OBS_LIB_PATH, no
+# inlining into the cluster ssh stream, no obs_init, and no error to say so.
+# It must be `|| true` rather than `return 0`: this file is also cat'd into an
+# ssh stream, where a top-level `return` is an error.
+_obs_normalise_settings || true

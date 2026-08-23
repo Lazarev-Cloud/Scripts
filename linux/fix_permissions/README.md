@@ -320,15 +320,23 @@ this appears" pass the pattern twice:
   Linux has no `lchmod`, and `chmod` follows a symlink named on its command
   line, so a user who can write in their own home can in principle swap a
   listed regular file for a link to `/etc/shadow` and have root `chmod` the
-  target instead. Each `chmod` batch is therefore re-checked for symlinks
-  immediately before it is applied, which cuts the window from the length of
-  the report and the confirmation prompt — potentially minutes — down to the
-  interval between that check and `chmod`'s own path resolution. Closing the
-  last gap needs `openat(O_NOFOLLOW)` and `fchmod`, which a shell script cannot
-  call, so for a genuinely hostile user the rule stands: run this when they
-  have no processes running. Anything dropped by the re-check is reported, not
-  skipped quietly. Ownership changes were never affected — those use `chown -h`
-  throughout.
+  target instead. Each `chmod` batch is therefore re-checked immediately before
+  it is applied, and the check covers **every path component below the home**,
+  not just the last one — swapping an ancestor redirects a `chmod` exactly as
+  well as swapping the file, so a leaf-only check would be no defence at all.
+  That cuts the window from the length of the report and the confirmation
+  prompt — potentially minutes — down to the interval between the check and
+  `chmod`'s own path resolution. Closing that last gap needs
+  `openat(O_NOFOLLOW)` and `fchmod`, which a shell script cannot call, so for a
+  genuinely hostile user the rule stands: run this when they have no processes
+  running. Anything dropped by the re-check is reported, not skipped quietly.
+  Ownership changes were never affected — those use `chown -h` throughout.
+
+  The `getfacl` snapshot is taken before this re-check and does follow symlinks,
+  so a path swapped during that step records the target's ownership and mode
+  under the in-home name. The snapshot is a superset of what is actually
+  changed, so it never misses an undo; but a `setfacl --restore` run against a
+  home that was being tampered with is not trustworthy on its own.
 - The snapshot records ownership and permission bits for the files and
   directories being changed. It does not record file contents, ACLs beyond the
   base entries, extended attributes, symlinks, or the other inode types

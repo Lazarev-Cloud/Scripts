@@ -121,6 +121,17 @@ function, because `set -e` aborts at the failing command itself and never
 reaches it. A dead collector cannot take a `set -Eeuo pipefail` script down
 with it.
 
+`obs_enabled` is the one deliberate exception: it is a predicate and returns 1
+when no endpoint is configured, which is the whole point of it. Call it as a
+condition — `obs_enabled || return 0` — never bare.
+
+Settings are validated the same way. `LZC_OBS_TOKEN_ENV` and
+`LZC_OBS_PASSWORD_ENV` are checked against the shell identifier grammar before
+they are dereferenced, because `${!name}` is not a plain lookup: bash parses the
+value as a variable reference, so `LZC_OBS_TOKEN_ENV=my-token` would be a fatal
+expansion error, and an array subscript inside the value would be *evaluated*.
+A value that is not a variable name is ignored with a warning.
+
 ## Adding it to your own script
 
 ```bash

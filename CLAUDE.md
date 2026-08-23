@@ -14,10 +14,12 @@ the conventions below are a summary of it, not a substitute.
 
 ## Verifying changes
 
-CI runs exactly these two, pinned, with zero tolerance for findings:
+CI runs two linters, both pinned, with zero tolerance for findings. `bash -n`
+runs first because a parse error makes the shellcheck output much harder to
+read:
 
 ```bash
-find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r -n1 bash -n
+find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r -n1 -t bash -n
 find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r shellcheck -s bash
 ```
 
@@ -67,8 +69,9 @@ likely to be broken by an edit that only looks at one file.
 **Two error models, and each script says which it uses in a header comment.** A batch driver
 that must survive individual failures (`update-lxcs.sh`, `maintenance.sh`,
 `fix_permissions.sh`) uses `set -uo pipefail` and checks every fallible command explicitly. A
-linear script that should stop at the first problem (`install.sh`,
-`setup_prometheus_exporter.sh`, the lock doctors) uses `set -Eeuo pipefail`. Adding `set -e`
+linear script that should stop at the first problem uses `set -e`:
+`setup_prometheus_exporter.sh` and the two lock doctors use `set -Eeuo pipefail`,
+`install.sh` uses `set -euo pipefail`. Adding `set -e`
 to a script in the first group reintroduces bugs this repo has already fixed once: it aborted
 `update-lxcs.sh` before its own summary printed, because `((n++))` returns 1 when `n` is 0.
 Never write `((n++))` as a bare statement; use `n=$((n + 1))`.
@@ -79,11 +82,13 @@ anything else with exit 2; numbers go through `10#` so `08` is decimal. Skipping
 the obvious spelling crashing the script.
 
 **`lib/lzc-obs.sh` may never abort its caller.** It is sourced inside root maintenance
-scripts, so every `obs_*` entry point returns 0, every `curl` inside it is `|| true` at the
-call site, and a malformed setting warns and falls back to its default rather than exiting.
-`return 0` at the end of a function is not sufficient: under `set -e` the shell exits at the
-failing command and never reaches it. This is the one place in the repo where a bad setting
-does not exit 2.
+scripts, so every `obs_*` entry point returns 0 — bar `obs_enabled`, a predicate — every
+`curl` inside it is `|| true` at the call site, and a malformed setting warns and falls back
+to its default rather than exiting. `return 0` at the end of a function is not sufficient:
+under `set -e` the shell exits at the failing command and never reaches it. This is the one
+place in the repo where a bad setting does not exit 2. Variable *names* taken from config
+(`LZC_OBS_TOKEN_ENV`) are validated before `${!name}` touches them — that expansion evaluates
+array subscripts, so an unchecked one is a code path.
 
 ## The three substantial programs
 

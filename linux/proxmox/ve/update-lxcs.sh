@@ -863,8 +863,20 @@ _obs_remote_env() {
     # The credential itself, under the name the configuration points at. It
     # travels inside the encrypted SSH stream and never reaches a command line,
     # a process list, or a file on either node.
+    #
+    # The name is checked against the identifier grammar first. Unlike the loop
+    # above, which walks a literal list, these two come from user configuration,
+    # and `${!v}` is not a plain lookup: bash parses the value as a variable
+    # reference, so a non-identifier is a fatal expansion error that kills this
+    # script mid-fleet-update, and an array subscript inside it is *evaluated*
+    # -- `LZC_OBS_TOKEN_ENV='x[$(...)]'` would run the substitution as root.
     for v in "${LZC_OBS_TOKEN_ENV:-}" "${LZC_OBS_PASSWORD_ENV:-}"; do
-        [[ -n $v && -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
+        [[ -n $v ]] || continue
+        if [[ ! $v =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            log WARN "Ignoring '$v': expected the NAME of an environment variable, not a value."
+            continue
+        fi
+        [[ -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
     done
 
     # Cleared so each node reports under its own instance label.

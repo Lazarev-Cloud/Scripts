@@ -990,34 +990,78 @@ take_backup() {
 # Re-checks a chmod batch for symlinks immediately before it is applied.
 #
 # The scan already classifies symlinks out of the chmod lists, but the scan and
-# the apply are separated by the report, and by an interactive confirmation that
-# can sit there for minutes. `chmod` follows symlinks given on the command line
-# and has no --no-dereference, so without this the owner of the home -- the one
-# person guaranteed to be able to write in it -- can replace a listed regular
-# file with a link to /etc/shadow after the plan is printed and have root chmod
-# the target instead. `chown -h` is already immune; chmod is what needs this.
+# the apply are separated by the report and by a confirmation prompt that can
+# sit there for minutes. `chmod` follows symlinks and has no --no-dereference,
+# so without this the owner of the home -- the one person guaranteed to be able
+# to write in it -- can replace a listed path with a link to /etc/shadow after
+# the plan is printed and have root chmod the target instead. `chown -h` is
+# already immune; chmod is what needs this.
 #
-# This narrows the window from "the length of the whole report and prompt" to
-# the interval between this lstat and chmod's own path resolution. That last
-# gap cannot be closed from a shell script: it needs openat(O_NOFOLLOW) and
-# fchmod, which bash has no way to call. A path dropped here is reported rather
-# than skipped quietly -- it means the tree changed mid-run, which is worth
-# knowing about whether or not anyone was attacking.
+# Every component below HOME_DIR is checked, not just the leaf. Checking the
+# leaf alone is not a partial defence, it is no defence: swapping an ancestor
+# achieves exactly the same thing, because chmod resolves the whole path. With
+# `.ssh` replaced by a link to /etc, a leaf-only check drops `.ssh` from the
+# directory batch and then happily chmods 00600 over /etc/passwd via the
+# untouched `.ssh/passwd` entry in the file batch.
+#
+# HOME_DIR itself is not re-checked: it was canonicalised and run through the
+# deny list before the scan, and an attacker who can swap the home directory
+# out from under root has already won by other means.
+#
+# What this does NOT do is close the race completely. Between the last check
+# here and chmod's own path resolution there is still a window, and closing it
+# needs openat(O_NOFOLLOW) plus fchmod, which a shell script cannot call. What
+# it removes is the part an attacker can actually aim at: the minutes of report
+# and prompt during which the plan is public and nothing is being applied yet.
+# A path dropped here is reported rather than skipped quietly -- it means the
+# tree moved mid-run, which is worth knowing whether or not anyone is attacking.
+
+# Memoised per drop_symlinks call, because sibling files share ancestors and
+# re-lstat'ing every component of every path is otherwise the slowest thing in
+# the apply phase. Reset per call, never reused across batches: a cache that
+# outlived the batch would reintroduce the very staleness this function exists
+# to remove.
+declare -A CLEAN_CACHE=()
+
+path_is_clean() {
+    local p=$1 prefix=$HOME_DIR rest
+    [[ $p == "$HOME_DIR" ]] && return 0
+    [[ $p == "$HOME_DIR"/* ]] || return 1
+    rest=${p#"$HOME_DIR"/}
+
+    while :; do
+        prefix+=/${rest%%/*}
+        if [[ -n ${CLEAN_CACHE[$prefix]:-} ]]; then
+            [[ ${CLEAN_CACHE[$prefix]} == 1 ]] || return 1
+        elif [[ -L $prefix ]]; then
+            CLEAN_CACHE[$prefix]=0
+            return 1
+        else
+            CLEAN_CACHE[$prefix]=1
+        fi
+        [[ $rest == */* ]] || break
+        rest=${rest#*/}
+    done
+    return 0
+}
+
 # `src`/`dst` rather than `in`/`out`: `out` is the nameref array in
 # parse_id_spec, and reusing the name here makes shellcheck read this string
 # assignment as clobbering that array (SC2178/SC2128).
 drop_symlinks() {
     local src=$1 dst=$2 p dropped=0
+    CLEAN_CACHE=()
+
     while IFS= read -r -d '' p; do
-        if [[ -L $p ]]; then
+        if ! path_is_clean "$p"; then
             dropped=$((dropped + 1))
             continue
         fi
         printf '%s\0' "$p"
-    done <"$src" >"$dst"
+    done <"$src" >"$dst" || return 1
 
     if ((dropped)); then
-        log WARN "$dropped path(s) became symlinks between the scan and the apply and were not chmod'ed."
+        log WARN "$dropped path(s) sit under a symlink that appeared after the scan and were not chmod'ed."
         COUNT_RACED=$((COUNT_RACED + dropped))
     fi
     return 0
@@ -1068,30 +1112,52 @@ apply_changes() {
     fi
 
     if ((DO_CHMOD)); then
-        # Every chmod list is re-checked for symlinks first; see drop_symlinks.
-        local batch
-        for batch in dirs files pdirs pfiles; do
-            [[ -s $WORK_DIR/$batch ]] || continue
-            drop_symlinks "$WORK_DIR/$batch" "$WORK_DIR/$batch.safe"
-            mv -f "$WORK_DIR/$batch.safe" "$WORK_DIR/$batch"
-        done
-
-        run_batch "$WORK_DIR/dirs" 'chmod directories' chmod "$dir_spec" ||
+        # Five digits on the private batches, not four, and not by accident:
+        # GNU chmod leaves the setuid/setgid bits of a *directory* alone for a
+        # numeric mode shorter than five digits, so `chmod 0700` on a setgid
+        # .ssh/ is a no-op for that bit. compute_mode predicts 0700 with the
+        # special bits cleared, so a four-digit mode here makes the dry run lie
+        # and the run never converge -- every re-run reports the same path
+        # again. Do not shorten.
+        apply_chmod_batch dirs 'chmod directories' "$dir_spec" ||
             FAILURES=$((FAILURES + 1))
-        run_batch "$WORK_DIR/files" 'chmod files' chmod "$file_spec" ||
+        apply_chmod_batch files 'chmod files' "$file_spec" ||
             FAILURES=$((FAILURES + 1))
-        # Five digits, not four, and not by accident: GNU chmod leaves the
-        # setuid/setgid bits of a *directory* alone for a numeric mode shorter
-        # than five digits, so `chmod 0700` on a setgid .ssh/ is a no-op for
-        # that bit. compute_mode predicts 0700 with the special bits cleared,
-        # so a four-digit mode here makes the dry run lie and the run never
-        # converge -- every re-run reports the same path again. Do not shorten.
-        run_batch "$WORK_DIR/pdirs" 'chmod private directories' chmod 00700 ||
+        apply_chmod_batch pdirs 'chmod private directories' 00700 ||
             FAILURES=$((FAILURES + 1))
-        run_batch "$WORK_DIR/pfiles" 'chmod private files' chmod 00600 ||
+        apply_chmod_batch pfiles 'chmod private files' 00600 ||
             FAILURES=$((FAILURES + 1))
     fi
     return 0
+}
+
+# One chmod batch: re-check it for symlinks, then apply it.
+#
+# The re-check happens here rather than in a loop over all four batches up
+# front, because a batch's check has to be adjacent to its own chmod. Filtering
+# everything first and applying afterwards would separate the private-file
+# check from the private-file chmod by the whole of the directory and file
+# batches -- each bounded by APPLY_TIMEOUT, 1800s by default -- which is the
+# same multi-minute window this is supposed to remove, aimed squarely at .ssh
+# and .gnupg.
+apply_chmod_batch() {
+    local batch=$1 label=$2 spec=$3
+    [[ -s $WORK_DIR/$batch ]] || return 0
+
+    if ! drop_symlinks "$WORK_DIR/$batch" "$WORK_DIR/$batch.safe"; then
+        log ERROR "$label: could not write the symlink-checked list; nothing in this batch was changed."
+        return 1
+    fi
+    # Checked, because the alternative is applying the unfiltered list: the
+    # filtered paths are in .safe, and a failed mv leaves the original in place
+    # with COUNT_RACED already incremented. That would perform exactly the
+    # attack this function exists to prevent and report it as skipped.
+    if ! mv -f "$WORK_DIR/$batch.safe" "$WORK_DIR/$batch"; then
+        log ERROR "$label: could not stage the symlink-checked list; nothing in this batch was changed."
+        return 1
+    fi
+
+    run_batch "$WORK_DIR/$batch" "$label" chmod "$spec"
 }
 
 # --- Lifecycle ---------------------------------------------------------------
