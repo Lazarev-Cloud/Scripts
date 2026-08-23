@@ -6,12 +6,16 @@
 # License: MIT
 # Origin:  https://github.com/Lazarev-Cloud/Scripts
 #
-# This file is sourced, never executed. It defines obs_* functions and touches
-# nothing else, so a script that sources it keeps full control of its own flow.
+# This file is sourced, never executed. It defines obs_* functions and, at
+# source time, normalises its own LZC_OBS_* settings -- nothing else. A script
+# that sources it keeps full control of its own flow.
 #
 # Design rules this file obeys, because it runs inside root maintenance scripts:
 #   * Shipping NEVER changes the outcome of the calling script. Every network
-#     path is failure-tolerant and reports at most a warning.
+#     path is failure-tolerant and reports at most a warning, every obs_*
+#     entry point returns 0, and a malformed setting warns and falls back to
+#     its default instead of exiting. A caller running under `set -e` cannot
+#     be aborted by anything in here.
 #   * No endpoint is hardcoded. If LZC_LOGS_URL / LZC_METRICS_URL are unset,
 #     every function here is an inert no-op.
 #   * Credentials are never passed on a command line. curl argv is world-visible
@@ -32,10 +36,16 @@
 #   LZC_OBS_USER        Username for basic auth.
 #   LZC_OBS_PASSWORD_ENV NAME of the env var holding the password. Not the password.
 #   LZC_OBS_TENANT      VictoriaLogs AccountID:ProjectID, e.g. "1:0".
-#   LZC_OBS_TIMEOUT     Per-request timeout in seconds (10).
-#   LZC_OBS_INSECURE    1 to accept self-signed TLS.
-#   LZC_OBS_BUFFER      Buffered log lines before an automatic flush (500).
-#   LZC_OBS_DEBUG       1 to print the payloads instead of sending them.
+#   LZC_OBS_TIMEOUT     Per-request timeout in seconds (10, minimum 1).
+#   LZC_OBS_CONNECT_TIMEOUT  Connect timeout in seconds (5, minimum 1).
+#   LZC_OBS_RETRIES     curl retry attempts per request (1, minimum 0).
+#   LZC_OBS_INSECURE    Accept self-signed TLS (off).
+#   LZC_OBS_BUFFER      Buffered log lines before an automatic flush (500, min 1).
+#   LZC_OBS_DEBUG       Print the payloads instead of sending them (off).
+#
+# The numeric settings accept a whole number; the boolean ones accept
+# 1/true/yes/on and 0/false/no/off, case-insensitively. Anything else warns on
+# stderr and falls back to the default shown above -- see "Setting validation".
 
 # Guard against double-sourcing.
 [[ -n ${_LZC_OBS_LOADED:-} ]] && return 0
@@ -78,6 +88,81 @@ _obs_warn() {
     printf '[obs] %s\n' "$(printf '%s' "$*" | tr '\n' ' ' | tr -s ' ')" >&2
 }
 
+# Separate from _obs_warn, which is deliberately once-per-run: that budget
+# exists to stop a dead collector emitting a line per retry. A bad setting is a
+# fixed, tiny set that cannot flood, and silently reporting only the first of
+# three typos would be worse than the noise.
+_obs_config_warn() {
+    printf '[obs] %s\n' "$*" >&2
+}
+
+# --- Setting validation ------------------------------------------------------
+#
+# Every numeric and boolean knob is normalised before anything does arithmetic
+# on it. Without this, LZC_OBS_DEBUG=true reaches `(( ))` as a bare word and,
+# under the `set -u` that every caller in this repository uses, aborts the
+# whole maintenance run with "true: unbound variable" -- the exact failure
+# CONTRIBUTING.md names, and the exact opposite of this file's first design
+# rule.
+#
+# A bad value warns and falls back to the default rather than exiting. That is
+# the one place this library deliberately differs from the scripts, which
+# reject a bad setting with exit 2: a typo in a telemetry variable must never
+# be able to fail a root maintenance run that would otherwise have succeeded.
+
+_obs_norm_bool() {
+    local name=$1 default=$2
+    case ${!name:-} in
+        '') printf -v "$name" '%s' "$default" ;;
+        *)
+            case ${!name,,} in
+                1 | true | yes | on) printf -v "$name" '%s' 1 ;;
+                0 | false | no | off) printf -v "$name" '%s' 0 ;;
+                *)
+                    _obs_config_warn "$name must be true or false, got '${!name}'; using $default"
+                    printf -v "$name" '%s' "$default"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_obs_norm_int() {
+    local name=$1 default=$2 min=$3 value
+    if [[ -z ${!name:-} ]]; then
+        printf -v "$name" '%s' "$default"
+        return 0
+    fi
+    if [[ ! ${!name} =~ ^[0-9]+$ ]]; then
+        _obs_config_warn "$name must be a whole number, got '${!name}'; using $default"
+        printf -v "$name" '%s' "$default"
+        return 0
+    fi
+    # 10# forces base ten: a zero-padded value such as 08 is otherwise read as
+    # an invalid octal literal and aborts the arithmetic.
+    value=$((10#${!name}))
+    if ((value < min)); then
+        _obs_config_warn "$name must be at least $min, got '${!name}'; using $default"
+        value=$default
+    fi
+    printf -v "$name" '%s' "$value"
+}
+
+# Idempotent, and called twice on purpose: once when this file is sourced, so a
+# caller that never reaches obs_init is still safe, and again from obs_init, so
+# a value assigned from a flag parsed after the source is normalised too. The
+# second pass sees an already-normalised value and says nothing.
+_obs_normalise_settings() {
+    # Minimum 1 on the timeouts, not 0: curl reads 0 as "no limit", which
+    # silently removes the very bound these settings exist to provide.
+    _obs_norm_int LZC_OBS_TIMEOUT 10 1
+    _obs_norm_int LZC_OBS_CONNECT_TIMEOUT 5 1
+    _obs_norm_int LZC_OBS_RETRIES 1 0
+    _obs_norm_int LZC_OBS_BUFFER 500 1
+    _obs_norm_bool LZC_OBS_INSECURE 0
+    _obs_norm_bool LZC_OBS_DEBUG 0
+}
+
 _obs_now_rfc3339() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
@@ -111,6 +196,10 @@ _obs_prom_escape() {
 
 # obs_init [job_name]
 obs_init() {
+    # Before the obs_enabled check, not after: a script that sets a knob from a
+    # flag it parsed after sourcing this file must still get a validated value,
+    # whether or not shipping turns out to be configured.
+    _obs_normalise_settings
     obs_enabled || return 0
 
     [[ -n $LZC_OBS_JOB ]] || LZC_OBS_JOB=${1:-lzc-script}
@@ -263,25 +352,31 @@ obs_flush_logs() {
     _obs_log_buf=''
     _obs_buffered=0
 
+    # Every _obs_post is `|| true`, and not only because this function returns
+    # 0 below: under `set -e` -- the documented error model for the linear
+    # scripts in this repository -- the shell aborts at the failing command
+    # itself, long before any `return` at the end of the function is reached.
+    # A dead collector must cost a warning on stderr and nothing else.
     case $LZC_LOGS_FORMAT in
         jsonline)
-            _obs_post "$(_obs_logs_url)" 'application/stream+json' "$payload"
+            _obs_post "$(_obs_logs_url)" 'application/stream+json' "$payload" || true
             ;;
         elasticsearch)
             local bulk='' l
             while IFS= read -r l; do
                 [[ -n $l ]] && bulk+='{"create":{}}'$'\n'"$l"$'\n'
             done <<<"$payload"
-            _obs_post "$LZC_LOGS_URL" 'application/json' "$bulk"
+            _obs_post "$LZC_LOGS_URL" 'application/json' "$bulk" || true
             ;;
         loki)
-            _obs_post "$LZC_LOGS_URL" 'application/json' "$(_obs_loki_payload "$payload")"
+            _obs_post "$LZC_LOGS_URL" 'application/json' "$(_obs_loki_payload "$payload")" || true
             ;;
         *)
             _obs_warn "unknown LZC_LOGS_FORMAT '$LZC_LOGS_FORMAT'; expected jsonline, elasticsearch or loki"
-            return 1
             ;;
     esac
+
+    return 0
 }
 
 # Wraps buffered NDJSON into a single Loki push request.
@@ -353,7 +448,9 @@ obs_flush_metrics() {
         url="${url%/}/metrics/job/${LZC_OBS_JOB}/instance/${LZC_OBS_INSTANCE}"
     fi
 
-    _obs_post "$url" 'text/plain' "$payload"
+    # Always 0, for the same reason as obs_flush_logs.
+    _obs_post "$url" 'text/plain' "$payload" || true
+    return 0
 }
 
 # --- Run summary -------------------------------------------------------------
@@ -377,3 +474,8 @@ obs_finish() {
     obs_cleanup
     return 0
 }
+
+# The one statement this file executes at source time. It assigns nothing
+# outside its own LZC_OBS_* settings, so a script that sources this library and
+# never calls obs_init still cannot be killed by a mistyped telemetry variable.
+_obs_normalise_settings

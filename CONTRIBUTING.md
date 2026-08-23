@@ -44,6 +44,16 @@ top level.
 Without that, `LZC_FOO_YES=true` reaches `(( ))` as a bare word and dies with
 `true: unbound variable` — a crash a user hits by writing the obvious thing.
 Normalise numbers through `10#` so `08` is decimal rather than invalid octal.
+This applies to a sourced library as much as to a script, with one change: a
+library validates the same way but *warns and falls back to the default*
+instead of exiting, because it does not own the caller's exit status.
+
+**A sourced library must not be able to abort its caller.** Every entry point
+returns 0 and every fallible command inside it is handled at the call site.
+`return 0` at the end of the function is not enough — under `set -e` the shell
+exits at the failing command and never reaches it. `lib/lzc-obs.sh` is the
+worked example: it runs inside root maintenance scripts, so a dead log
+collector must cost a warning on stderr and nothing else.
 
 **Anything that can hang gets a `timeout`.** And a timeout value must be at
 least 1: `timeout 0` means *no limit*, which silently removes the protection.

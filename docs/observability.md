@@ -75,11 +75,21 @@ time() - lzc_script_last_run_timestamp_seconds > 86400
 | `LZC_OBS_TENANT` | VictoriaLogs `AccountID:ProjectID`, e.g. `1:0`. |
 | `LZC_OBS_TOKEN_ENV` | **Name** of the variable holding a bearer token. |
 | `LZC_OBS_USER`, `LZC_OBS_PASSWORD_ENV` | Basic auth; again the variable *name*. |
-| `LZC_OBS_TIMEOUT`, `LZC_OBS_CONNECT_TIMEOUT` | Per-request limits (10s, 5s). |
-| `LZC_OBS_RETRIES` | Retries per request (1). |
-| `LZC_OBS_INSECURE` | `1` accepts self-signed TLS. |
-| `LZC_OBS_BUFFER` | Log lines buffered before a flush (500). |
-| `LZC_OBS_DEBUG` | `1` prints payloads instead of sending them. |
+| `LZC_OBS_TIMEOUT`, `LZC_OBS_CONNECT_TIMEOUT` | Per-request limits (10s, 5s; minimum 1). |
+| `LZC_OBS_RETRIES` | Retries per request (1; minimum 0). |
+| `LZC_OBS_INSECURE` | Accept self-signed TLS (off). |
+| `LZC_OBS_BUFFER` | Log lines buffered before a flush (500; minimum 1). |
+| `LZC_OBS_DEBUG` | Print payloads instead of sending them (off). |
+
+The booleans accept `1/true/yes/on` and `0/false/no/off`, case-insensitively;
+the numeric ones accept a whole number. A value that is neither prints a
+warning naming the variable and falls back to the default in the table.
+
+This is the one place in the repository where a bad setting does **not** exit
+`2`. Everywhere else, an unparseable value is a usage error and the script
+refuses to run. Here it cannot be: the library is loaded inside root
+maintenance scripts, and a typo in a telemetry variable must not be able to
+fail a run that would otherwise have succeeded.
 
 ## Credentials
 
@@ -103,6 +113,13 @@ An unreachable collector produces **one** warning line on stderr and the script
 carries on. It does not retry for minutes, does not change the exit code, and
 does not repeat the warning for every batch. Observability that can break the
 thing it observes is worse than no observability.
+
+That holds under `set -e` too, which is the part that is easy to get wrong.
+Every `obs_*` entry point returns 0, and every `curl` inside them is `|| true`
+at the call site — not merely swallowed by a `return 0` at the end of the
+function, because `set -e` aborts at the failing command itself and never
+reaches it. A dead collector cannot take a `set -Eeuo pipefail` script down
+with it.
 
 ## Adding it to your own script
 
